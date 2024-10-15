@@ -9,7 +9,7 @@ revm = "14.0.0"
 fastrace = "0.7"
 
 # Alloy
-alloy-chains = "0.1.38"
+alloy-chains = "0.1.18"
 
 # async
 tokio = { version = "1.39", features = ["sync", "macros", "time", "rt-multi-thread"] }
