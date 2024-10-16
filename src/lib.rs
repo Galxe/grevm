@@ -1,6 +1,5 @@
 use lazy_static::lazy_static;
-use revm::primitives::{Address, EVMError, EVMResultGeneric, ExecutionResult, U256};
-use revm::TransitionAccount;
+use revm::primitives::{Address, EVMError, EVMResultGeneric, EvmState, ExecutionResult, U256};
 use std::cmp::min;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,13 +12,14 @@ mod storage;
 mod tx_dependency;
 
 lazy_static! {
-    static ref CPU_CORES: usize = thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    static ref CPU_CORES: usize =
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 }
 
 lazy_static! {
     static ref GREVM_RUNTIME: Runtime = Builder::new_multi_thread()
         // .worker_threads(1) // for debug
-        .worker_threads(thread::available_parallelism().map(|n| n.get() * 2).unwrap_or(8))
+        .worker_threads(std::thread::available_parallelism().map(|n| n.get() * 2).unwrap_or(8))
         .thread_name("grevm-tokio-runtime")
         .enable_all()
         .build()
@@ -75,7 +75,7 @@ pub struct ResultAndTransition {
     /// Status of execution
     pub result: Option<ExecutionResult>,
     /// State that got updated
-    pub transition: Vec<(Address, TransitionAccount)>,
+    pub transition: EvmState,
     /// Rewards to miner
     pub rewards: u128,
 }

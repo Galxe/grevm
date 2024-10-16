@@ -156,7 +156,12 @@ where
                     if read_set.is_disjoint(&update_write_set) {
                         self.read_set.push(read_set);
                         self.write_set.push(write_set);
-                        evm.db_mut().temporary_commit_transition(&execute_state.transition);
+                        // All accounts should be present inside cache.
+                        for address in execute_state.transition.keys() {
+                            // FIXME(gravity): error handling
+                            let _ = evm.db_mut().load_cache_account(*address);
+                        }
+                        evm.db_mut().temporary_commit(&execute_state.transition);
                         self.execute_results.push(Ok(execute_state));
                         should_rerun = false;
                         self.metrics.reusable_tx_cnt += 1;
@@ -182,10 +187,10 @@ where
                             result_and_state.state.remove(&self.coinbase);
                         }
                         // temporary commit to cache_db, to make use the remaining txs can read the updated data
-                        let transition = evm.db_mut().temporary_commit(result_and_state.state);
+                        evm.db_mut().temporary_commit(&result_and_state.state);
                         self.execute_results.push(Ok(ResultAndTransition {
                             result: Some(result_and_state.result),
-                            transition,
+                            transition: result_and_state.state,
                             rewards: rewards.unwrap_or(0),
                         }));
                     }

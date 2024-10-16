@@ -9,20 +9,19 @@ use crate::hint::ParallelExecutionHints;
 use crate::partition::{
     OrderedVectorExt, PartitionExecutor, PreRoundContext, PreUnconfirmedContext,
 };
-use crate::storage::SchedulerDB;
+use crate::storage::{SchedulerDB, StateCache};
 use crate::tx_dependency::{DependentTxsVec, TxDependency};
 use crate::{
-    fork_join_util, GrevmError, LocationAndType, PartitionId, TxId, CPU_CORES, GREVM_RUNTIME,
-    MAX_NUM_ROUND,
+    fork_join_util, GrevmError, LocationAndType, TxId, CPU_CORES, GREVM_RUNTIME, MAX_NUM_ROUND,
 };
 
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, gauge};
 use revm::db::states::bundle_state::BundleRetention;
 use revm::db::BundleState;
 use revm::primitives::{
     AccountInfo, Address, Bytecode, EVMError, Env, ExecutionResult, SpecId, TxEnv, B256, U256,
 };
-use revm::{CacheState, DatabaseRef, EvmBuilder};
+use revm::{DatabaseRef, EvmBuilder};
 
 pub struct ExecuteMetrics {
     /// Number of times parallel execution is called.
@@ -460,12 +459,20 @@ where
         // update and pruning tx dependencies
         self.update_and_pruning_dependency();
 
-        let partition_state: Vec<CacheState> = self
+        let partition_state: Vec<StateCache> = self
             .partition_executors
             .iter()
             .map(|executor| {
                 let mut executor = executor.write().unwrap();
-                std::mem::take(&mut executor.partition_db.cache)
+                let mut cache = std::mem::take(&mut executor.partition_db.cache);
+                if !executor.partition_db.miner_involved {
+                    // Remove miner account in partitions that only treat it as a reward account.
+                    // We have preload it into scheduler state cache, and will handle rewards
+                    // separately. Only when miner account participates in the transactions should
+                    // it be merged into the scheduler state cache.
+                    cache.accounts.remove(&self.coinbase);
+                }
+                cache
             })
             .collect();
 
@@ -475,14 +482,40 @@ where
         drop(span);
         let database = Arc::get_mut(&mut self.database).unwrap();
 
-        Self::merge_not_modified_state(&mut database.cache, partition_state);
+        if self.num_finality_txs == self.txs.len() {
+            // Merge partition state to scheduler directly if there are no conflicts in the entire
+            // partition.
+            let span = Span::enter_with_local_parent("directly merge accounts");
+            for state in partition_state {
+                database.cache.merge_accounts(state);
+            }
+
+            let mut rewards: u128 = 0;
+            for ctx in finality_txs.into_values() {
+                rewards += ctx.execute_state.rewards;
+                self.results.push(ctx.execute_state.result.unwrap());
+            }
+            database
+                .increment_balances(vec![(self.coinbase, rewards)])
+                .map_err(|err| GrevmError::EvmError(EVMError::Database(err)))?;
+
+            self.metrics.validate_time.increment(start.elapsed().as_nanos() as u64);
+            return Ok(());
+        }
+
+        // Must merge loaded state to database cache before commit changes
+        let span = Span::enter_with_local_parent("merge loaded state");
+        for state in partition_state {
+            database.cache.merge_loaded_state(state);
+        }
+        std::mem::drop(span);
 
         let span = Span::enter_with_local_parent("commit transition to scheduler db");
         let mut rewards: u128 = 0;
         for ctx in finality_txs.into_values() {
             rewards += ctx.execute_state.rewards;
             self.results.push(ctx.execute_state.result.unwrap());
-            database.commit_transition(ctx.execute_state.transition);
+            database.commit(&ctx.execute_state.transition);
         }
         // Each transaction updates three accounts: from, to, and coinbase.
         // If every tx updates the coinbase account, it will cause conflicts across all txs.
@@ -496,27 +529,6 @@ where
 
         self.metrics.validate_time.increment(start.elapsed().as_nanos() as u64);
         Ok(())
-    }
-
-    /// Merge not modified state from partition to scheduler. These data are just loaded from
-    /// database, so we can merge them to state as original value for next round.
-    #[fastrace::trace]
-    fn merge_not_modified_state(state: &mut CacheState, partition_state: Vec<CacheState>) {
-        for partition in partition_state {
-            // merge account state that is not modified
-            for (address, account) in partition.accounts {
-                if account.status.is_not_modified() && state.accounts.get(&address).is_none() {
-                    state.accounts.insert(address, account);
-                }
-            }
-
-            // merge contract code
-            for (hash, code) in partition.contracts {
-                if state.contracts.get(&hash).is_none() {
-                    state.contracts.insert(hash, code);
-                }
-            }
-        }
     }
 
     #[fastrace::trace]
@@ -539,7 +551,7 @@ where
             }
             match evm.transact() {
                 Ok(result_and_state) => {
-                    evm.db_mut().commit(result_and_state.state);
+                    evm.db_mut().commit(&result_and_state.state);
                     self.results.push(result_and_state.result);
                 }
                 Err(err) => return Err(GrevmError::EvmError(err)),
@@ -562,12 +574,17 @@ where
             // MUST drop the `PartitionExecutor::scheduler_db` before get mut
             this.partition_executors.clear();
             let database = Arc::get_mut(&mut this.database).unwrap();
-            database.merge_transitions(BundleRetention::Reverts);
-            ExecuteOutput {
-                state: std::mem::take(&mut database.bundle_state),
-                results: std::mem::take(&mut this.results),
-            }
+            let state = database.create_bundle_state(BundleRetention::Reverts);
+            ExecuteOutput { state, results: std::mem::take(&mut this.results) }
         };
+
+        {
+            // Preload coinbase account
+            let db = Arc::get_mut(&mut self.database).unwrap();
+            let _ = db
+                .load_cache_account(self.coinbase)
+                .map_err(|err| GrevmError::EvmError(EVMError::Database(err)))?;
+        }
 
         if self.txs.len() < self.num_partitions && !force_parallel {
             self.execute_remaining_sequential()?;
