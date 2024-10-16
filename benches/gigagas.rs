@@ -31,7 +31,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let db = Arc::new(db);
 
     let mut group = c.benchmark_group(name);
-    group.bench_function("Sequential", |b| {
+    group.bench_function("Origin Sequential", |b| {
         b.iter(|| {
             common::execute_revm_sequential(
                 black_box(db.clone()),
@@ -51,7 +51,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
                 black_box(db.clone()),
                 black_box(txs.clone()),
             );
-            executor.adaptive_execute()
+            executor.parallel_execute()
         })
     });
     group.bench_function("Grevm Sequential", |b| {
@@ -64,7 +64,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
                 black_box(db.clone()),
                 black_box(txs.clone()),
             );
-            executor.sequential_execute()
+            executor.force_sequential_execute()
         })
     });
     group.finish();

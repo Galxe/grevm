@@ -39,13 +39,15 @@ enum LocationAndType {
     Code(Address),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum TransactionStatus {
-    Initial,     // tx that has not yet been run once
-    Unconfirmed, // tx that is validated but not the continuous ID
-    Pending,     // tx that is pending to wait other txs ready
-    Conflict,    // tx that is conflicted and need to rerun
-    Finality,    // tx that is validated and is the continuous ID
+    Initial,        // tx that has not yet been run once
+    Executed,       // tx that are executed
+    Unconfirmed,    // tx that is validated but not the continuous ID
+    Pending,        // tx that is pending to wait other txs ready
+    Conflict,       // tx that is conflicted and need to rerun
+    SkipValidation, // tx that can skip validate
+    Finality,       // tx that is validated and is the continuous ID
 }
 
 pub struct PartitionIndex {

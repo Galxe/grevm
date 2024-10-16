@@ -109,7 +109,7 @@ pub fn compare_evm_execute<DB>(
     let db = Arc::new(db);
     let start = Instant::now();
     let sequential = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
-    let sequential_result = sequential.sequential_execute();
+    let sequential_result = sequential.force_sequential_execute();
     println!("Grevm sequential execute time: {}ms", start.elapsed().as_millis());
 
     let mut parallel_result = Err(GrevmError::UnreachableError(String::from("Init")));
@@ -117,11 +117,8 @@ pub fn compare_evm_execute<DB>(
         let start = Instant::now();
         let mut parallel =
             GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
-        if !with_hints {
-            parallel.clean_dependency();
-        }
-        parallel.set_num_partitions(23); // set determined partitions
-        parallel_result = parallel.evm_execute(Some(false));
+        // set determined partitions
+        parallel_result = parallel.force_parallel_execute(with_hints, Some(23));
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
 
         let snapshot = recorder.snapshotter().snapshot();

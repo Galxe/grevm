@@ -42,6 +42,7 @@ fn native_gigagas() {
             ("grevm.conflict_tx_cnt", DebugValue::Counter(0)),
             ("grevm.unconfirmed_tx_cnt", DebugValue::Counter(0)),
             ("grevm.reusable_tx_cnt", DebugValue::Counter(0)),
+            ("grevm.skip_validation_cnt", DebugValue::Counter(block_size as u64)),
             ("grevm.partition_num_tx_diff", DebugValue::Gauge(1.0.into())),
         ]
         .into_iter()
@@ -79,6 +80,7 @@ fn native_transfers_independent() {
             ("grevm.conflict_tx_cnt", DebugValue::Counter(0)),
             ("grevm.unconfirmed_tx_cnt", DebugValue::Counter(0)),
             ("grevm.reusable_tx_cnt", DebugValue::Counter(0)),
+            ("grevm.skip_validation_cnt", DebugValue::Counter(block_size as u64)),
             ("grevm.partition_num_tx_diff", DebugValue::Gauge(1.0.into())),
         ]
         .into_iter()

@@ -1,4 +1,4 @@
-use crate::LocationAndType;
+use crate::{LocationAndType, LocationSet};
 use revm::db::states::bundle_state::BundleRetention;
 use revm::db::states::CacheAccount;
 use revm::db::{BundleState, PlainAccount};
@@ -260,7 +260,7 @@ pub(crate) struct PartitionDB<DB> {
     /// Does the miner participate in the transaction
     pub miner_involved: bool,
     /// Record the read set of current tx, will be consumed after the execution of each tx
-    tx_read_set: HashSet<LocationAndType>,
+    tx_read_set: LocationSet,
 }
 
 impl<DB> PartitionDB<DB> {
@@ -276,15 +276,12 @@ impl<DB> PartitionDB<DB> {
     }
 
     /// consume the read set after evm.transact() for each tx
-    pub(crate) fn take_read_set(&mut self) -> HashSet<LocationAndType> {
+    pub(crate) fn take_read_set(&mut self) -> LocationSet {
         core::mem::take(&mut self.tx_read_set)
     }
 
     /// Generate the write set after evm.transact() for each tx
-    pub(crate) fn generate_write_set(
-        &self,
-        changes: &EvmState,
-    ) -> (HashSet<LocationAndType>, Option<u128>) {
+    pub(crate) fn generate_write_set(&self, changes: &EvmState) -> (LocationSet, Option<u128>) {
         let mut rewards: Option<u128> = None;
         let mut write_set = HashSet::new();
         for (address, account) in changes {

@@ -1,19 +1,17 @@
 use fastrace::Span;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::DerefMut;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::hint::ParallelExecutionHints;
-use crate::partition::{
-    OrderedVectorExt, PartitionExecutor, PreRoundContext, PreUnconfirmedContext,
-};
+use crate::partition::{OrderedVectorExt, PartitionExecutor};
 use crate::storage::SchedulerDB;
 use crate::tx_dependency::{DependentTxsVec, TxDependency};
 use crate::{
-    fork_join_util, GrevmError, LocationAndType, PartitionId, TxId, CPU_CORES, GREVM_RUNTIME,
-    MAX_NUM_ROUND,
+    fork_join_util, GrevmError, LocationAndType, PartitionId, ResultAndTransition,
+    TransactionStatus, TxId, CPU_CORES, GREVM_RUNTIME, MAX_NUM_ROUND,
 };
 
 use metrics::{counter, gauge, histogram};
@@ -44,6 +42,8 @@ pub struct ExecuteMetrics {
     unconfirmed_tx_cnt: metrics::Counter,
     /// Number of reusable transactions.
     reusable_tx_cnt: metrics::Counter,
+    /// Number of transactions that skip validation
+    skip_validation_cnt: metrics::Counter,
 
     /// Number of concurrent partitions.
     concurrent_partition_num: metrics::Gauge,
@@ -57,9 +57,15 @@ pub struct ExecuteMetrics {
     /// Time taken to partition transactions(in nanoseconds).
     partition_tx_time: metrics::Counter,
     /// Time taken to validate transactions(in nanoseconds).
+    parallel_execute_time: metrics::Counter,
+    /// Time taken to execute
     validate_time: metrics::Counter,
-    /// Size of the write set.
-    write_set_size: metrics::Counter,
+    /// Time taken to merge write set.
+    merge_write_set_time: metrics::Counter,
+    /// Time taken to commit transition
+    commit_transition_time: metrics::Counter,
+    /// Time taken to build output(in nanoseconds).
+    build_output_time: metrics::Counter,
 }
 
 impl Default for ExecuteMetrics {
@@ -74,13 +80,17 @@ impl Default for ExecuteMetrics {
             conflict_tx_cnt: counter!("grevm.conflict_tx_cnt"),
             unconfirmed_tx_cnt: counter!("grevm.unconfirmed_tx_cnt"),
             reusable_tx_cnt: counter!("grevm.reusable_tx_cnt"),
+            skip_validation_cnt: counter!("grevm.skip_validation_cnt"),
             concurrent_partition_num: gauge!("grevm.concurrent_partition_num"),
             partition_et_diff: gauge!("grevm.partition_execution_time_diff"),
             partition_tx_diff: gauge!("grevm.partition_num_tx_diff"),
             parse_hints_time: counter!("grevm.parse_hints_time"),
             partition_tx_time: counter!("grevm.partition_tx_time"),
+            parallel_execute_time: counter!("grevm.parallel_execute_time"),
             validate_time: counter!("grevm.validate_time"),
-            write_set_size: counter!("grevm.write_set_size"),
+            merge_write_set_time: counter!("grevm.merge_write_set_time"),
+            commit_transition_time: counter!("grevm.commit_transition_time"),
+            build_output_time: counter!("grevm.build_output_time"),
         }
     }
 }
@@ -92,13 +102,33 @@ pub struct ExecuteOutput {
     pub results: Vec<ExecutionResult>,
 }
 
+pub type LocationSet = HashSet<LocationAndType>;
+
+#[derive(Clone)]
+pub struct TxState {
+    pub tx_status: TransactionStatus,
+    pub read_set: LocationSet,
+    pub write_set: LocationSet,
+    pub execute_result: ResultAndTransition,
+}
+
+impl TxState {
+    pub fn new() -> Self {
+        Self {
+            tx_status: TransactionStatus::Initial,
+            read_set: HashSet::new(),
+            write_set: HashSet::new(),
+            execute_result: ResultAndTransition::default(),
+        }
+    }
+}
+
+pub type SharedTxStates = Arc<Vec<TxState>>;
+
 pub struct GrevmScheduler<DB>
 where
     DB: DatabaseRef,
 {
-    // The number of transactions in the tx batch size.
-    tx_batch_size: usize,
-
     spec_id: SpecId,
     env: Env,
     coinbase: Address,
@@ -106,9 +136,9 @@ where
 
     database: Arc<SchedulerDB<DB>>,
 
-    parallel_execution_hints: ParallelExecutionHints,
-
     tx_dependencies: TxDependency,
+
+    tx_states: SharedTxStates,
 
     // number of partitions. maybe larger in the first round to increase concurrence
     num_partitions: usize,
@@ -117,10 +147,6 @@ where
     partition_executors: Vec<Arc<RwLock<PartitionExecutor<DB>>>>,
 
     num_finality_txs: usize,
-
-    // update after each round
-    pre_unconfirmed_txs: BTreeMap<TxId, PreUnconfirmedContext>,
-
     results: Vec<ExecutionResult>,
 
     metrics: ExecuteMetrics,
@@ -176,34 +202,27 @@ where
 impl<DB> GrevmScheduler<DB>
 where
     DB: DatabaseRef + Send + Sync + 'static,
-    DB::Error: Send + Sync + Clone,
+    DB::Error: Send + Sync,
 {
     pub fn new(spec_id: SpecId, env: Env, db: DB, txs: Vec<TxEnv>) -> Self {
         let coinbase = env.block.coinbase.clone();
-        let start = Instant::now();
-        let parallel_execution_hints = ParallelExecutionHints::new(&txs);
-        let tx_dependencies = TxDependency::new(&parallel_execution_hints);
-        let elapsed = start.elapsed().as_nanos();
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
-        let mut s = Self {
-            tx_batch_size: txs.len(),
+        let num_txs = txs.len();
+        Self {
             spec_id,
             env,
             coinbase,
             txs: Arc::new(txs),
             database: Arc::new(SchedulerDB::new(db)),
-            parallel_execution_hints,
-            tx_dependencies,
+            tx_dependencies: TxDependency::new(num_txs),
+            tx_states: Arc::new(vec![TxState::new(); num_txs]),
             num_partitions,
             partitioned_txs: vec![],
             partition_executors: vec![],
             num_finality_txs: 0,
-            pre_unconfirmed_txs: BTreeMap::new(),
-            results: Vec::new(),
+            results: Vec::with_capacity(num_txs),
             metrics: Default::default(),
-        };
-        s.metrics.parse_hints_time.increment(elapsed as u64);
-        s
+        }
     }
 
     #[fastrace::trace]
@@ -227,48 +246,24 @@ where
         self.metrics.partition_tx_time.increment(start.elapsed().as_nanos() as u64);
     }
 
-    pub fn set_num_partitions(&mut self, num_partitions: usize) {
-        self.num_partitions = num_partitions;
-    }
-
-    pub fn clean_dependency(&mut self) {
-        self.tx_dependencies.clean_dependency();
-    }
-
-    fn generate_partition_pre_context(&mut self) {
-        fork_join_util(self.num_partitions, Some(self.num_partitions), |_, _, part| {
-            let mut pre_unconfirmed_txs = HashMap::new();
-            for txid in &self.partitioned_txs[part] {
-                if let Some(ctx) = self.pre_unconfirmed_txs.get(txid) {
-                    pre_unconfirmed_txs.insert(*txid, ctx.clone());
-                }
-            }
-            if !pre_unconfirmed_txs.is_empty() {
-                let mut executor = self.partition_executors[part].write().unwrap();
-                executor.set_pre_round_ctx(Some(PreRoundContext { pre_unconfirmed_txs }));
-            }
-        });
-        // released pre_unconfirmed_txs
-        self.pre_unconfirmed_txs.clear();
-    }
-
     #[fastrace::trace]
     fn round_execute(&mut self) -> Result<(), GrevmError<DB::Error>> {
         self.metrics.parallel_execute_calls.increment(1);
         self.partition_executors.clear();
         for partition_id in 0..self.num_partitions {
-            let mut executor = PartitionExecutor::new(
+            let executor = PartitionExecutor::new(
                 self.spec_id.clone(),
                 partition_id,
                 self.env.clone(),
                 self.database.clone(),
                 self.txs.clone(),
+                self.tx_states.clone(),
                 self.partitioned_txs[partition_id].clone(),
             );
             self.partition_executors.push(Arc::new(RwLock::new(executor)));
         }
-        self.generate_partition_pre_context();
 
+        let start = Instant::now();
         GREVM_RUNTIME.block_on(async {
             let mut tasks = vec![];
             for executor in &self.partition_executors {
@@ -277,26 +272,29 @@ where
             }
             futures::future::join_all(tasks).await;
         });
+        self.metrics.parallel_execute_time.increment(start.elapsed().as_nanos() as u64);
 
         self.validate_transactions()
     }
 
     // merge write set after each round
     #[fastrace::trace]
-    fn merge_write_set(&mut self) -> HashMap<LocationAndType, BTreeSet<TxId>> {
+    fn merge_write_set(&mut self) -> (TxId, HashMap<LocationAndType, BTreeSet<TxId>>) {
+        let start = Instant::now();
         let mut merged_write_set: HashMap<LocationAndType, BTreeSet<TxId>> = HashMap::new();
-        let mut write_set_size = 0;
-        for executor in &self.partition_executors {
-            let executor = executor.read().unwrap();
-            for (txid, ws) in executor.assigned_txs.iter().zip(executor.write_set.iter()) {
-                write_set_size += ws.len();
-                for location in ws {
-                    merged_write_set.entry(location.clone()).or_default().insert(*txid);
+        let mut end_skip_id = self.num_finality_txs;
+        for txid in self.num_finality_txs..self.tx_states.len() {
+            let tx_state = &self.tx_states[txid];
+            if tx_state.tx_status == TransactionStatus::SkipValidation && end_skip_id == txid {
+                end_skip_id += 1;
+            } else {
+                for location in tx_state.write_set.iter() {
+                    merged_write_set.entry(location.clone()).or_default().insert(txid);
                 }
             }
         }
-        self.metrics.write_set_size.increment(write_set_size as u64);
-        merged_write_set
+        self.metrics.merge_write_set_time.increment(start.elapsed().as_nanos() as u64);
+        (end_skip_id, merged_write_set)
     }
 
     /// When validating the transaction status, the dependency relationship was updated.
@@ -328,67 +326,55 @@ where
         self.tx_dependencies.update_tx_dependency(new_dependency, num_finality_txs);
     }
 
-    /// verification of transaction state after each round
-    /// Because after each round execution, the read-write set is no longer updated.
-    /// We can check in parallel whether the read set is out of bounds.
     #[fastrace::trace]
-    fn validate_transactions(&mut self) -> Result<(), GrevmError<DB::Error>> {
-        let start = Instant::now();
-        let span = Span::enter_with_local_parent("generate unconfirmed txs");
+    fn generate_unconfirmed_txs(&mut self) {
+        let num_partitions = self.num_partitions;
+        let (end_skip_id, merged_write_set) = self.merge_write_set();
+        self.metrics.skip_validation_cnt.increment((end_skip_id - self.num_finality_txs) as u64);
+        fork_join_util(num_partitions, Some(num_partitions), |_, _, part| {
+            // Tx validate process:
+            // 1. Traverse the read set of each tx in each partition, and find the Range<TxId> less than tx in merged_write_set
+            // 2. conflict: 1) exist tx in Range<TxId> not belong to tx's partition; 2) exist tx in Range<TxId> is conflicted
+            let mut executor = self.partition_executors[part].write().unwrap();
+            let executor = executor.deref_mut();
 
-        GREVM_RUNTIME.block_on(async {
-            let mut tasks = vec![];
-            let merged_write_set = Arc::new(self.merge_write_set());
-            for executor in &self.partition_executors {
-                let executor = executor.clone();
-                let merged_write_set = merged_write_set.clone();
-                tasks.push(GREVM_RUNTIME.spawn(async move {
-                    // Tx validate process:
-                    // 1. Traverse the read set of each tx in each partition, and find the Range<TxId> less than tx in merged_write_set
-                    // 2. conflict: 1) exist tx in Range<TxId> not belong to tx's partition; 2) exist tx in Range<TxId> is conflicted
-                    let mut executor = executor.write().unwrap();
-                    let executor = executor.deref_mut();
+            #[allow(invalid_reference_casting)]
+            let tx_states =
+                unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
 
-                    for (index, rs) in executor.read_set.iter().enumerate() {
-                        let txid = executor.assigned_txs[index];
-                        let mut conflict = executor.execute_results[index].is_err();
-                        if conflict {
-                            // Transactions that fail in partition executor are in conflict state
-                            executor.conflict_txs.push(txid);
-                        }
-                        let mut updated_dependencies = BTreeSet::new();
-                        for location in rs {
-                            if let Some(written_txs) = merged_write_set.get(location) {
-                                if let Some(previous_txid) = written_txs.range(..txid).next_back() {
-                                    // update dependencies: previous_txid <- txid
-                                    updated_dependencies.insert(*previous_txid);
-                                    if !conflict
-                                        && (!executor.assigned_txs.has(previous_txid)
-                                            || executor.conflict_txs.has(previous_txid))
-                                    {
-                                        executor.conflict_txs.push(txid);
-                                        conflict = true;
-                                    }
+            for txid in executor.assigned_txs.iter() {
+                let txid = *txid;
+                let mut conflict = tx_states[txid].tx_status == TransactionStatus::Conflict;
+                let mut updated_dependencies = BTreeSet::new();
+                if txid >= end_skip_id {
+                    for location in tx_states[txid].read_set.iter() {
+                        if let Some(written_txs) = merged_write_set.get(location) {
+                            if let Some(previous_txid) = written_txs.range(..txid).next_back() {
+                                // update dependencies: previous_txid <- txid
+                                updated_dependencies.insert(*previous_txid);
+                                if !conflict
+                                    && (!executor.assigned_txs.has(previous_txid)
+                                        || tx_states[*previous_txid].tx_status
+                                            == TransactionStatus::Conflict)
+                                {
+                                    conflict = true;
                                 }
                             }
                         }
-                        executor.tx_dependency.push(updated_dependencies);
-                        if !conflict {
-                            executor.unconfirmed_txs.push((txid, index));
-                        }
                     }
-                    assert_eq!(
-                        executor.unconfirmed_txs.len() + executor.conflict_txs.len(),
-                        executor.assigned_txs.len()
-                    );
-                }));
+                }
+                executor.tx_dependency.push(updated_dependencies);
+                tx_states[txid].tx_status = if conflict {
+                    TransactionStatus::Conflict
+                } else {
+                    TransactionStatus::Unconfirmed
+                }
             }
-            futures::future::join_all(tasks).await;
         });
-        drop(span);
-        // find the continuous min txid
-        let span = Span::enter_with_local_parent("find the continuous min txid");
-        let mut unconfirmed_txs = BTreeMap::new();
+    }
+
+    #[fastrace::trace]
+    fn find_continuous_min_txid(&mut self) -> Result<usize, GrevmError<DB::Error>> {
         let mut min_execute_time = Duration::from_secs(u64::MAX);
         let mut max_execute_time = Duration::from_secs(0);
         for executor in &self.partition_executors {
@@ -397,69 +383,46 @@ where
             min_execute_time = min_execute_time.min(executor.metrics.execute_time);
             max_execute_time = max_execute_time.max(executor.metrics.execute_time);
             if executor.assigned_txs[0] == self.num_finality_txs {
-                if let Err(err) = &executor.execute_results[0] {
-                    return Err(GrevmError::EvmError(err.clone()));
-                }
-            }
-
-            let partition_unconfirmed_txs = std::mem::take(&mut executor.unconfirmed_txs);
-            let mut partition_execute_state = std::mem::take(&mut executor.execute_results);
-
-            for (txid, index) in partition_unconfirmed_txs.into_iter() {
-                match &mut partition_execute_state[index] {
-                    Ok(state) => {
-                        unconfirmed_txs.insert(
-                            txid,
-                            PreUnconfirmedContext {
-                                read_set: std::mem::take(&mut executor.read_set[index]),
-                                write_set: std::mem::take(&mut executor.write_set[index]),
-                                execute_state: std::mem::take(state),
-                            },
-                        );
-                    }
-                    Err(_) => {
-                        return Err(GrevmError::UnreachableError(String::from(
-                            "Should take failed transaction as conflict",
-                        )));
-                    }
+                if self.tx_states[self.num_finality_txs].tx_status == TransactionStatus::Conflict {
+                    return Err(GrevmError::EvmError(
+                        executor.error_txs.remove(&self.num_finality_txs).unwrap(),
+                    ));
                 }
             }
         }
+        let mut conflict_tx_cnt = 0;
+        let mut unconfirmed_tx_cnt = 0;
+        let mut finality_tx_cnt = 0;
         self.metrics.partition_et_diff.set((max_execute_time - min_execute_time).as_nanos() as f64);
-        if let Some((min_txid, _)) = unconfirmed_txs.first_key_value() {
-            if *min_txid != self.num_finality_txs {
-                // Most likely, the execution of the smallest transaction failed in evm.transact()
-                return Err(GrevmError::ExecutionError(String::from(
-                    "Discontinuous finality transaction ID",
-                )));
+        for txid in self.num_finality_txs..self.tx_states.len() {
+            match self.tx_states[txid].tx_status {
+                TransactionStatus::Unconfirmed => {
+                    if txid == self.num_finality_txs {
+                        self.num_finality_txs += 1;
+                        finality_tx_cnt += 1;
+                    } else {
+                        unconfirmed_tx_cnt += 1;
+                    }
+                }
+                TransactionStatus::Conflict => {
+                    conflict_tx_cnt += 1;
+                }
+                _ => {
+                    return Err(GrevmError::UnreachableError(String::from(
+                        "Wrong transaction status",
+                    )));
+                }
             }
-        } else {
-            return Err(GrevmError::ExecutionError(String::from(
-                "Can't finalize a transaction in an execution round",
-            )));
         }
-
-        for txid in unconfirmed_txs.keys() {
-            if *txid == self.num_finality_txs {
-                self.num_finality_txs += 1;
-            } else {
-                break;
-            }
-        }
-
-        drop(span);
-        self.pre_unconfirmed_txs = unconfirmed_txs.split_off(&self.num_finality_txs);
-        // Now `unconfirmed_txs` only contains the txs that are finality in this round
-        let finality_txs = unconfirmed_txs;
-        let conflict_tx_cnt =
-            self.txs.len() - self.num_finality_txs - self.pre_unconfirmed_txs.len();
         self.metrics.conflict_tx_cnt.increment(conflict_tx_cnt as u64);
-        self.metrics.unconfirmed_tx_cnt.increment(self.pre_unconfirmed_txs.len() as u64);
-        self.metrics.finality_tx_cnt.increment(finality_txs.len() as u64);
+        self.metrics.unconfirmed_tx_cnt.increment(unconfirmed_tx_cnt as u64);
+        self.metrics.finality_tx_cnt.increment(finality_tx_cnt as u64);
+        return Ok(finality_tx_cnt);
+    }
 
-        // update and pruning tx dependencies
-        self.update_and_pruning_dependency();
-
+    #[fastrace::trace]
+    fn commit_transition(&mut self, finality_tx_cnt: usize) -> Result<(), GrevmError<DB::Error>> {
+        let start = Instant::now();
         let partition_state: Vec<CacheState> = self
             .partition_executors
             .iter()
@@ -470,19 +433,20 @@ where
             .collect();
 
         // MUST drop the `PartitionExecutor::scheduler_db` before get mut
-        let span = Span::enter_with_local_parent("clear partition_executors");
         self.partition_executors.clear();
-        drop(span);
         let database = Arc::get_mut(&mut self.database).unwrap();
-
         Self::merge_not_modified_state(&mut database.cache, partition_state);
 
-        let span = Span::enter_with_local_parent("commit transition to scheduler db");
+        #[allow(invalid_reference_casting)]
+        let tx_states =
+            unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
         let mut rewards: u128 = 0;
-        for ctx in finality_txs.into_values() {
-            rewards += ctx.execute_state.rewards;
-            self.results.push(ctx.execute_state.result.unwrap());
-            database.commit_transition(ctx.execute_state.transition);
+        let start_txid = self.num_finality_txs - finality_tx_cnt;
+        for txid in start_txid..self.num_finality_txs {
+            rewards += tx_states[txid].execute_result.rewards;
+            database
+                .commit_transition(std::mem::take(&mut tx_states[txid].execute_result.transition));
+            self.results.push(tx_states[txid].execute_result.result.clone().unwrap());
         }
         // Each transaction updates three accounts: from, to, and coinbase.
         // If every tx updates the coinbase account, it will cause conflicts across all txs.
@@ -492,8 +456,21 @@ where
         database
             .increment_balances(vec![(self.coinbase, rewards)])
             .map_err(|err| GrevmError::EvmError(EVMError::Database(err)))?;
-        drop(span);
+        self.metrics.commit_transition_time.increment(start.elapsed().as_nanos() as u64);
+        Ok(())
+    }
 
+    /// verification of transaction state after each round
+    /// Because after each round execution, the read-write set is no longer updated.
+    /// We can check in parallel whether the read set is out of bounds.
+    #[fastrace::trace]
+    fn validate_transactions(&mut self) -> Result<(), GrevmError<DB::Error>> {
+        let start = Instant::now();
+        self.generate_unconfirmed_txs();
+        let finality_tx_cnt = self.find_continuous_min_txid()?;
+        // update and pruning tx dependencies
+        self.update_and_pruning_dependency();
+        self.commit_transition(finality_tx_cnt)?;
         self.metrics.validate_time.increment(start.elapsed().as_nanos() as u64);
         Ok(())
     }
@@ -549,29 +526,50 @@ where
     }
 
     #[fastrace::trace]
-    pub fn evm_execute(
+    fn build_output(&mut self) -> ExecuteOutput {
+        let start = Instant::now();
+        // MUST drop the `PartitionExecutor::scheduler_db` before get mut
+        self.partition_executors.clear();
+        let database = Arc::get_mut(&mut self.database).unwrap();
+        database.merge_transitions(BundleRetention::Reverts);
+        let output = ExecuteOutput {
+            state: std::mem::take(&mut database.bundle_state),
+            results: std::mem::take(&mut self.results),
+        };
+        self.metrics.build_output_time.increment(start.elapsed().as_nanos() as u64);
+        output
+    }
+
+    #[fastrace::trace]
+    fn parse_hints(&mut self) {
+        let start = Instant::now();
+        let hints = ParallelExecutionHints::new(self.tx_states.clone());
+        hints.parse_hints(self.txs.clone());
+        self.tx_dependencies.init_tx_dependency(self.tx_states.clone());
+        self.metrics.parse_hints_time.increment(start.elapsed().as_nanos() as u64);
+    }
+
+    #[fastrace::trace]
+    fn evm_execute(
         &mut self,
         force_sequential: Option<bool>,
+        with_hints: bool,
+        num_partitions: Option<usize>,
     ) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
+        if with_hints {
+            self.parse_hints();
+        }
+        if let Some(num_partitions) = num_partitions {
+            self.num_partitions = num_partitions;
+        }
+
         self.metrics.total_tx_cnt.increment(self.txs.len() as u64);
         let force_parallel = !force_sequential.unwrap_or(true); // adaptive false
         let force_sequential = force_sequential.unwrap_or(false); // adaptive false
-        self.results.reserve(self.txs.len());
-
-        let build_execute_output = |this: &mut Self| {
-            // MUST drop the `PartitionExecutor::scheduler_db` before get mut
-            this.partition_executors.clear();
-            let database = Arc::get_mut(&mut this.database).unwrap();
-            database.merge_transitions(BundleRetention::Reverts);
-            ExecuteOutput {
-                state: std::mem::take(&mut database.bundle_state),
-                results: std::mem::take(&mut this.results),
-            }
-        };
 
         if self.txs.len() < self.num_partitions && !force_parallel {
             self.execute_remaining_sequential()?;
-            return Ok(build_execute_output(self));
+            return Ok(self.build_output());
         }
 
         if !force_sequential {
@@ -595,18 +593,22 @@ where
             self.execute_remaining_sequential()?;
         }
 
-        Ok(build_execute_output(self))
-    }
-
-    pub fn adaptive_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
-        self.evm_execute(None)
+        Ok(self.build_output())
     }
 
     pub fn parallel_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
-        self.evm_execute(Some(false))
+        self.evm_execute(None, true, None)
     }
 
-    pub fn sequential_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
-        self.evm_execute(Some(true))
+    pub fn force_parallel_execute(
+        mut self,
+        with_hints: bool,
+        num_partitions: Option<usize>,
+    ) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
+        self.evm_execute(Some(false), with_hints, num_partitions)
+    }
+
+    pub fn force_sequential_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
+        self.evm_execute(Some(true), false, None)
     }
 }

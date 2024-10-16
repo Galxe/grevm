@@ -1,11 +1,8 @@
-use std::cmp::{min, Reverse};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-
-use dashmap::DashMap;
 use smallvec::SmallVec;
+use std::cmp::{min, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 
-use crate::hint::ParallelExecutionHints;
-use crate::{fork_join_util, LocationAndType, TxId};
+use crate::{fork_join_util, LocationAndType, SharedTxStates, TxId};
 
 pub(crate) type DependentTxsVec = SmallVec<[TxId; 1]>;
 
@@ -26,51 +23,29 @@ pub(crate) struct TxDependency {
 }
 
 impl TxDependency {
-    pub fn new(parallel_execution_hints: &ParallelExecutionHints) -> Self {
+    pub fn new(num_txs: usize) -> Self {
         TxDependency {
-            tx_dependency: Self::generate_tx_dependency(parallel_execution_hints),
+            tx_dependency: vec![DependentTxsVec::new(); num_txs],
             num_finality_txs: 0,
             tx_running_time: None,
             tx_weight: None,
         }
     }
 
-    pub fn clean_dependency(&mut self) {
-        let len = self.tx_dependency.len();
-        self.tx_dependency = vec![DependentTxsVec::new(); len];
-    }
-
     #[fastrace::trace]
-    fn generate_tx_dependency(
-        parallel_execution_hints: &ParallelExecutionHints,
-    ) -> Vec<DependentTxsVec> {
-        let write_set: DashMap<LocationAndType, BTreeSet<TxId>> = DashMap::new();
-        let num_txs = parallel_execution_hints.txs_hint.len();
-        fork_join_util(num_txs, None, |start_pos, end_pos, _| {
-            for pos in start_pos..end_pos {
-                for location in parallel_execution_hints.txs_hint[pos].write_set.iter() {
-                    write_set.entry(location.clone()).or_default().insert(pos);
+    pub fn init_tx_dependency(&mut self, tx_states: SharedTxStates) {
+        let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
+        for (txid, rw_set) in tx_states.iter().enumerate() {
+            let mut dependencies = &mut self.tx_dependency[txid];
+            for location in rw_set.read_set.iter() {
+                if let Some(previous) = last_write_tx.get(location) {
+                    dependencies.push(*previous);
                 }
             }
-        });
-
-        let mut tx_dependency = vec![DependentTxsVec::new(); num_txs];
-        fork_join_util(num_txs, None, |start_pos, end_pos, _| {
-            for pos in start_pos..end_pos {
-                #[allow(invalid_reference_casting)]
-                let dep_txs = unsafe {
-                    &mut *(&tx_dependency[pos] as *const DependentTxsVec as *mut DependentTxsVec)
-                };
-                for location in parallel_execution_hints.txs_hint[pos].read_set.iter() {
-                    if let Some(ws) = write_set.get(location) {
-                        if let Some(previous) = ws.range(..pos).next_back() {
-                            dep_txs.push(*previous);
-                        }
-                    }
-                }
+            for location in rw_set.write_set.iter() {
+                last_write_tx.insert(location.clone(), txid);
             }
-        });
-        tx_dependency
+        }
     }
 
     pub fn fetch_best_partitions(&mut self, partition_count: usize) -> Vec<Vec<TxId>> {

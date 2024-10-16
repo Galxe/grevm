@@ -1,17 +1,9 @@
 use revm::primitives::alloy_primitives::U160;
 use revm::primitives::ruint::UintTryFrom;
 use revm::primitives::{keccak256, Address, Bytes, TxEnv, TxKind, B256, U256};
-use smallvec::SmallVec;
+use std::sync::Arc;
 
-use crate::{fork_join_util, LocationAndType};
-
-type LocationVec = SmallVec<[LocationAndType; 2]>;
-
-enum RWType {
-    ReadOnly,
-    WriteOnly,
-    ReadWrite,
-}
+use crate::{fork_join_util, LocationAndType, SharedTxStates, TxState};
 
 enum ContractType {
     UNKNOWN,
@@ -52,54 +44,56 @@ impl From<u32> for ERC20Function {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct TxRWSet {
-    pub read_set: LocationVec,
-    pub write_set: LocationVec,
+enum RWType {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
 }
 
-impl Default for TxRWSet {
-    fn default() -> Self {
-        Self { read_set: LocationVec::new(), write_set: LocationVec::new() }
-    }
-}
-
-impl TxRWSet {
+impl TxState {
     pub(crate) fn insert_location(&mut self, location: LocationAndType, rw_type: RWType) {
         match rw_type {
             RWType::ReadOnly => {
-                self.read_set.push(location);
+                self.read_set.insert(location);
             }
             RWType::WriteOnly => {
-                self.write_set.push(location);
+                self.write_set.insert(location);
             }
             RWType::ReadWrite => {
-                self.read_set.push(location.clone());
-                self.write_set.push(location);
+                self.read_set.insert(location.clone());
+                self.write_set.insert(location);
             }
         }
     }
 }
 
 pub struct ParallelExecutionHints {
-    pub txs_hint: Vec<TxRWSet>,
+    tx_states: SharedTxStates,
 }
 
 impl ParallelExecutionHints {
+    pub fn new(tx_states: SharedTxStates) -> Self {
+        Self { tx_states }
+    }
+
     #[fastrace::trace]
-    pub(crate) fn new(txs: &Vec<TxEnv>) -> Self {
-        let mut hints = vec![TxRWSet::default(); txs.len()];
+    pub(crate) fn parse_hints(&self, txs: Arc<Vec<TxEnv>>) {
         fork_join_util(txs.len(), None, |start_txs, end_txs, _| {
+            #[allow(invalid_reference_casting)]
+            let hints =
+                unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
             for index in start_txs..end_txs {
                 let tx_env = &txs[index];
-                #[allow(invalid_reference_casting)]
-                let rw_set = unsafe { &mut *(&hints[index] as *const TxRWSet as *mut TxRWSet) };
+                let rw_set = &mut hints[index];
                 // Causing transactions that call the same contract to inevitably
                 // conflict with each other. Is this behavior reasonable?
                 // TODO(gaoxin): optimize contract account
                 rw_set.insert_location(LocationAndType::Basic(tx_env.caller), RWType::ReadWrite);
                 if let TxKind::Call(to_address) = tx_env.transact_to {
                     if !tx_env.data.is_empty() {
+                        rw_set
+                            .insert_location(LocationAndType::Basic(to_address), RWType::ReadOnly);
+                        rw_set.insert_location(LocationAndType::Code(to_address), RWType::ReadOnly);
                         ParallelExecutionHints::update_hints_with_contract_data(
                             tx_env.caller,
                             to_address,
@@ -114,8 +108,6 @@ impl ParallelExecutionHints {
                 }
             }
         });
-
-        ParallelExecutionHints { txs_hint: hints }
     }
 
     fn slot_from_indices<K, V>(slot: K, indices: Vec<V>) -> U256
@@ -142,18 +134,18 @@ impl ParallelExecutionHints {
         Self::slot_from_indices(slot, indices)
     }
 
-    #[fastrace::trace]
     fn update_hints_with_contract_data(
         caller: Address,
         contract_address: Address,
         code: Option<Bytes>,
         data: &Bytes,
-        tx_rw_set: &mut TxRWSet,
+        tx_rw_set: &mut TxState,
     ) {
         if code.is_none() && data.is_empty() {
             panic!("Unreachable error")
         }
         if data.len() < 4 || (data.len() - 4) % 32 != 0 {
+            tx_rw_set.insert_location(LocationAndType::Basic(contract_address), RWType::WriteOnly);
             // Invalid tx, or tx that triggers fallback CALL
             return;
         }
@@ -170,10 +162,12 @@ impl ParallelExecutionHints {
                         LocationAndType::Storage(contract_address, from_slot),
                         RWType::ReadWrite,
                     );
-                    tx_rw_set.insert_location(
-                        LocationAndType::Storage(contract_address, to_slot),
-                        RWType::ReadWrite,
-                    );
+                    if to_slot != from_slot {
+                        tx_rw_set.insert_location(
+                            LocationAndType::Storage(contract_address, to_slot),
+                            RWType::ReadWrite,
+                        );
+                    }
                 }
                 ERC20Function::TransferFrom => {
                     assert_eq!(parameters.len(), 3);
@@ -194,6 +188,7 @@ impl ParallelExecutionHints {
                         LocationAndType::Storage(contract_address, to_slot),
                         RWType::ReadWrite,
                     );
+                    // TODO(gaoxin): if from_slot == to_slot, what happened?
                     tx_rw_set.insert_location(
                         LocationAndType::Storage(contract_address, allowance_slot),
                         RWType::ReadWrite,
@@ -202,13 +197,13 @@ impl ParallelExecutionHints {
                 _ => {
                     tx_rw_set.insert_location(
                         LocationAndType::Basic(contract_address),
-                        RWType::ReadWrite,
+                        RWType::WriteOnly,
                     );
                 }
             },
             ContractType::UNKNOWN => {
                 tx_rw_set
-                    .insert_location(LocationAndType::Basic(contract_address), RWType::ReadWrite);
+                    .insert_location(LocationAndType::Basic(contract_address), RWType::WriteOnly);
             }
         }
     }

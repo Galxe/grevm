@@ -1,6 +1,9 @@
 use crate::storage::{PartitionDB, SchedulerDB};
-use crate::{GrevmResult, LocationAndType, PartitionId, ResultAndTransition, TxId};
-use revm::primitives::{Address, Env, SpecId, TxEnv, TxKind};
+use crate::{
+    LocationAndType, PartitionId, ResultAndTransition, SharedTxStates, TransactionStatus, TxId,
+    TxState,
+};
+use revm::primitives::{Address, EVMError, Env, ResultAndState, SpecId, TxEnv, TxKind};
 use revm::{DatabaseRef, EvmBuilder};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -29,29 +32,6 @@ impl<E: Ord> OrderedVectorExt<E> for Vec<E> {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct PreUnconfirmedContext {
-    pub read_set: HashSet<LocationAndType>,
-    pub write_set: HashSet<LocationAndType>,
-    pub execute_state: ResultAndTransition,
-}
-
-/// Record some status from the previous round,
-/// which can accelerate the execution of the current round
-#[derive(Default)]
-pub(crate) struct PreRoundContext {
-    pub pre_unconfirmed_txs: HashMap<TxId, PreUnconfirmedContext>,
-}
-
-impl PreRoundContext {
-    pub(crate) fn take_pre_unconfirmed_ctx(
-        &mut self,
-        txid: &TxId,
-    ) -> Option<PreUnconfirmedContext> {
-        self.pre_unconfirmed_txs.remove(txid)
-    }
-}
-
 pub(crate) struct PartitionExecutor<DB>
 where
     DB: DatabaseRef,
@@ -59,22 +39,16 @@ where
     spec_id: SpecId,
     env: Env,
     coinbase: Address,
-    pub partition_id: PartitionId,
+    partition_id: PartitionId,
+    tx_states: SharedTxStates,
+    txs: Arc<Vec<TxEnv>>,
 
     pub partition_db: PartitionDB<DB>,
-
-    txs: Arc<Vec<TxEnv>>,
     pub assigned_txs: Vec<TxId>,
-    pub read_set: Vec<HashSet<LocationAndType>>,
-    pub write_set: Vec<HashSet<LocationAndType>>,
 
-    pub execute_results: Vec<GrevmResult<DB::Error>>,
+    pub error_txs: HashMap<TxId, EVMError<DB::Error>>,
 
-    pub conflict_txs: Vec<TxId>,
-    pub unconfirmed_txs: Vec<(TxId, usize)>, // TxId and index
     pub tx_dependency: Vec<BTreeSet<TxId>>,
-
-    pub pre_round_ctx: Option<PreRoundContext>,
 
     pub metrics: PartitionMetrics,
 }
@@ -89,6 +63,7 @@ where
         env: Env,
         scheduler_db: Arc<SchedulerDB<DB>>,
         txs: Arc<Vec<TxEnv>>,
+        tx_states: SharedTxStates,
         assigned_txs: Vec<TxId>,
     ) -> Self {
         let coinbase = env.block.coinbase.clone();
@@ -98,35 +73,35 @@ where
             env,
             coinbase,
             partition_id,
-            partition_db,
+            tx_states,
             txs,
+            partition_db,
             assigned_txs,
-            read_set: vec![],
-            write_set: vec![],
-            execute_results: vec![],
-            conflict_txs: vec![],
-            unconfirmed_txs: vec![],
+            error_txs: HashMap::new(),
             tx_dependency: vec![],
-            pre_round_ctx: None,
             metrics: Default::default(),
         }
     }
 
-    pub(crate) fn set_pre_round_ctx(&mut self, pre_round_context: Option<PreRoundContext>) {
-        self.pre_round_ctx = pre_round_context;
-    }
-
     pub(crate) fn execute(&mut self) {
         let start = Instant::now();
+        let mut has_unconfirmed_tx = false;
         let mut update_write_set: HashSet<LocationAndType> = HashSet::new();
         let mut evm = EvmBuilder::default()
             .with_db(&mut self.partition_db)
             .with_spec_id(self.spec_id)
             .with_env(Box::new(self.env.clone()))
             .build();
+
+        #[allow(invalid_reference_casting)]
+        let tx_states =
+            unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
+
         for txid in &self.assigned_txs {
+            let txid = *txid;
+
             let mut miner_involved = false;
-            if let Some(tx) = self.txs.get(*txid) {
+            if let Some(tx) = self.txs.get(txid) {
                 *evm.tx_mut() = tx.clone();
                 // If the transaction includes the miner’s address,
                 // we need to record the miner’s address in both the write and read sets,
@@ -142,52 +117,64 @@ where
             } else {
                 panic!("Wrong transactions ID");
             }
-            let mut should_rerun = true;
-            if let Some(ctx) = self.pre_round_ctx.as_mut() {
-                if let Some(PreUnconfirmedContext { read_set, write_set, execute_state }) =
-                    ctx.take_pre_unconfirmed_ctx(txid)
-                {
-                    // The unconfirmed transactions from the previous round may not require repeated execution.
-                    // The verification process is as follows:
-                    // 1. create a write set(update_write_set) to store write_set of previous conflict tx
-                    // 2. if an unconfirmed tx rerun, store write_set to update_write_set
-                    // 3. when running an unconfirmed tx, take it's pre-round read_set to join with update_write_set
-                    // 4. if the intersection is None, the unconfirmed tx no need to rerun, otherwise rerun
-                    if read_set.is_disjoint(&update_write_set) {
-                        self.read_set.push(read_set);
-                        self.write_set.push(write_set);
-                        evm.db_mut().temporary_commit_transition(&execute_state.transition);
-                        self.execute_results.push(Ok(execute_state));
-                        should_rerun = false;
-                        self.metrics.reusable_tx_cnt += 1;
-                    }
+            let mut should_execute = true;
+            if tx_states[txid].tx_status == TransactionStatus::Unconfirmed {
+                has_unconfirmed_tx = true;
+                // The unconfirmed transactions from the previous round may not require repeated execution.
+                // The verification process is as follows:
+                // 1. create a write set(update_write_set) to store write_set of previous conflict tx
+                // 2. if an unconfirmed tx rerun, store write_set to update_write_set
+                // 3. when running an unconfirmed tx, take it's pre-round read_set to join with update_write_set
+                // 4. if the intersection is None, the unconfirmed tx no need to rerun, otherwise rerun
+                if tx_states[txid].read_set.is_disjoint(&update_write_set) {
+                    let transition = &tx_states[txid].execute_result.transition;
+                    evm.db_mut().temporary_commit_transition(transition);
+                    should_execute = false;
+                    self.metrics.reusable_tx_cnt += 1;
+                    tx_states[txid].tx_status = TransactionStatus::SkipValidation;
                 }
             }
-            if should_rerun {
+            if should_execute {
                 evm.db_mut().miner_involved = miner_involved;
                 let result = evm.transact();
                 match result {
                     Ok(mut result_and_state) => {
-                        // update read set
-                        self.read_set.push(evm.db_mut().take_read_set());
-                        // update write set
+                        let read_set = evm.db_mut().take_read_set();
                         let (write_set, rewards) =
                             evm.db().generate_write_set(&result_and_state.state);
-                        if self.pre_round_ctx.is_some() {
+                        if has_unconfirmed_tx {
                             update_write_set.extend(write_set.clone().into_iter());
                         }
-                        self.write_set.push(write_set);
+
+                        let mut skip_validation = true;
+                        if !read_set.is_subset(&tx_states[txid].read_set) {
+                            skip_validation = false;
+                        }
+                        if skip_validation && !write_set.is_subset(&tx_states[txid].write_set) {
+                            skip_validation = false;
+                        }
+
+                        let ResultAndState { result, mut state } = result_and_state;
                         if rewards.is_some() {
                             // remove miner's state if we handle rewards separately
-                            result_and_state.state.remove(&self.coinbase);
+                            state.remove(&self.coinbase);
                         }
                         // temporary commit to cache_db, to make use the remaining txs can read the updated data
-                        let transition = evm.db_mut().temporary_commit(result_and_state.state);
-                        self.execute_results.push(Ok(ResultAndTransition {
-                            result: Some(result_and_state.result),
-                            transition,
-                            rewards: rewards.unwrap_or(0),
-                        }));
+                        let transition = evm.db_mut().temporary_commit(state);
+                        tx_states[txid] = TxState {
+                            tx_status: if skip_validation {
+                                TransactionStatus::SkipValidation
+                            } else {
+                                TransactionStatus::Executed
+                            },
+                            read_set,
+                            write_set,
+                            execute_result: ResultAndTransition {
+                                result: Some(result),
+                                transition,
+                                rewards: rewards.unwrap_or(0),
+                            },
+                        };
                     }
                     Err(err) => {
                         // Due to parallel execution, transactions may fail (such as dependent transfers not yet received),
@@ -205,14 +192,18 @@ where
                             read_set.insert(LocationAndType::Basic(to));
                             write_set.insert(LocationAndType::Basic(to));
                         }
-                        self.read_set.push(read_set);
-                        self.write_set.push(write_set);
-                        self.execute_results.push(Err(err));
+
+                        tx_states[txid] = TxState {
+                            tx_status: TransactionStatus::Conflict,
+                            read_set,
+                            write_set,
+                            execute_result: ResultAndTransition::default(),
+                        };
+                        self.error_txs.insert(txid, err);
                     }
                 }
             }
         }
-        assert_eq!(self.assigned_txs.len(), self.execute_results.len());
         self.metrics.execute_time = start.elapsed();
     }
 }
