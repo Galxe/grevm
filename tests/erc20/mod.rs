@@ -7,7 +7,8 @@ use crate::erc20::erc20_contract::ERC20Token;
 
 pub mod erc20_contract;
 
-pub const GAS_LIMIT: u64 = 50_000;
+pub const GAS_LIMIT: u64 = 35_000;
+pub const ESTIMATED_GAS_USED: u64 = 29_738;
 
 /// Mapping from address to [EvmAccount]
 pub type ChainState = HashMap<Address, DbAccount>;

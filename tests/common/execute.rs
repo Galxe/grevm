@@ -17,8 +17,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 fn compare_bundle_state(left: &BundleState, right: &BundleState) {
-    let left = left.clone();
-    let right = right.clone();
     assert!(
         left.contracts.keys().all(|k| right.contracts.contains_key(k)),
         "Left contracts: {:?}, Right contracts: {:?}",
@@ -33,22 +31,21 @@ fn compare_bundle_state(left: &BundleState, right: &BundleState) {
         right.contracts.keys()
     );
 
-    let left_state: BTreeMap<Address, BundleAccount> = left.state.into_iter().collect();
-    let right_state: BTreeMap<Address, BundleAccount> = right.state.into_iter().collect();
+    let left_state: BTreeMap<&Address, &BundleAccount> = left.state.iter().collect();
+    let right_state: BTreeMap<&Address, &BundleAccount> = right.state.iter().collect();
     assert_eq!(left_state.len(), right_state.len());
 
     for ((addr1, account1), (addr2, account2)) in
         left_state.into_iter().zip(right_state.into_iter())
     {
         assert_eq!(addr1, addr2);
-        let BundleAccount { info, original_info, storage, status } = account1;
-        assert_eq!(info, account2.info);
-        assert_eq!(original_info, account2.original_info);
-        assert_eq!(status, account2.status);
-        let left_storage: BTreeMap<U256, StorageSlot> = storage.into_iter().collect();
-        let right_storage: BTreeMap<U256, StorageSlot> = account2.storage.into_iter().collect();
+        assert_eq!(account1.info, account2.info, "Address: {:?}", addr1);
+        assert_eq!(account1.original_info, account2.original_info, "Address: {:?}", addr1);
+        assert_eq!(account1.status, account2.status, "Address: {:?}", addr1);
+        let left_storage: BTreeMap<&U256, &StorageSlot> = account1.storage.iter().collect();
+        let right_storage: BTreeMap<&U256, &StorageSlot> = account2.storage.iter().collect();
         for (s1, s2) in left_storage.into_iter().zip(right_storage.into_iter()) {
-            assert_eq!(s1, s2);
+            assert_eq!(s1, s2, "Address: {:?}", addr1);
         }
     }
 }
@@ -136,6 +133,19 @@ pub fn compare_evm_execute<DB>(
     let start = Instant::now();
     let reth_result = execute_revm_sequential(db.clone(), SpecId::LATEST, env.clone(), txs.clone());
     println!("Origin sequential execute time: {}ms", start.elapsed().as_millis());
+
+    let mut max_gas_spent = 0;
+    let mut max_gas_used = 0;
+    for result in &reth_result.as_ref().unwrap().results {
+        match result {
+            ExecutionResult::Success { gas_used, gas_refunded, .. } => {
+                max_gas_spent = max_gas_spent.max(gas_used + gas_refunded);
+                max_gas_used = max_gas_used.max(*gas_used);
+            }
+            _ => panic!("result is not success"),
+        }
+    }
+    println!("max_gas_spent: {}, max_gas_used: {}", max_gas_spent, max_gas_used);
 
     compare_execution_result(
         &reth_result.as_ref().unwrap().results,

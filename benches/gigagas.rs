@@ -136,8 +136,7 @@ fn benchmark_gigagas(c: &mut Criterion) {
 }
 
 fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
-    const PEVM_GAS_LIMIT: u64 = 26_938;
-    let block_size = (GIGA_GAS as f64 / PEVM_GAS_LIMIT as f64).ceil() as usize;
+    let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let (mut state, bytecodes, eoa, sca) = generate_cluster(block_size, 1);
     let miner = common::mock_miner_account();
     state.insert(miner.0, miner.1);
@@ -148,7 +147,7 @@ fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
             caller: addr,
             transact_to: TransactTo::Call(sca),
             value: U256::from(0),
-            gas_limit: 50_000,
+            gas_limit: erc20::GAS_LIMIT,
             gas_price: U256::from(1),
             nonce: Some(0),
             data: ERC20Token::transfer(addr, U256::from(900)),
@@ -163,21 +162,19 @@ fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
 }
 
 fn benchmark_dependent_erc20(c: &mut Criterion, db_latency_us: u64) {
-    const PEVM_GAS_LIMIT: u64 = 26_938;
-    let block_size = (GIGA_GAS as f64 / PEVM_GAS_LIMIT as f64).ceil() as usize;
+    let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let (mut state, bytecodes, eoa, sca) = generate_cluster(block_size, 1);
     let miner = common::mock_miner_account();
     state.insert(miner.0, miner.1);
     let mut txs = Vec::with_capacity(block_size);
     let sca = sca[0];
     for (i, addr) in eoa.iter().enumerate() {
-        // Every 64 EOAs transfer token to the same recipient.
         let recipient = eoa[i % 64];
         let tx = TxEnv {
             caller: *addr,
             transact_to: TransactTo::Call(sca),
             value: U256::from(0),
-            gas_limit: 50_000,
+            gas_limit: erc20::GAS_LIMIT,
             gas_price: U256::from(1),
             nonce: Some(0),
             data: ERC20Token::transfer(recipient, U256::from(900)),

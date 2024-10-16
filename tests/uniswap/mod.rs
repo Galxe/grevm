@@ -3,12 +3,14 @@ pub mod contract;
 use crate::erc20::erc20_contract::ERC20Token;
 use contract::{SingleSwap, SwapRouter, UniswapV3Factory, UniswapV3Pool, WETH9};
 use revm::db::PlainAccount;
+use revm::interpreter::analysis::to_analysed;
 use revm::primitives::{
     fixed_bytes, uint, AccountInfo, Address, Bytecode, Bytes, TransactTo, TxEnv, B256, U256,
 };
 use std::collections::HashMap;
 
-pub const GAS_LIMIT: u64 = 155_934;
+pub const GAS_LIMIT: u64 = 200_000;
+pub const ESTIMATED_GAS_USED: u64 = 155_934;
 
 pub fn generate_cluster(
     num_people: usize,
@@ -165,6 +167,7 @@ pub fn generate_cluster(
     for account in state.values_mut() {
         let code = account.info.code.take();
         if let Some(code) = code {
+            let code = to_analysed(code);
             bytecodes.insert(account.info.code_hash, code);
         }
     }
