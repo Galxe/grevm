@@ -435,7 +435,10 @@ where
         // MUST drop the `PartitionExecutor::scheduler_db` before get mut
         self.partition_executors.clear();
         let database = Arc::get_mut(&mut self.database).unwrap();
-        Self::merge_not_modified_state(&mut database.cache, partition_state);
+        if self.num_finality_txs < self.txs.len() {
+            // Merging these states is only useful when there is a next round of execution.
+            Self::merge_not_modified_state(&mut database.cache, partition_state);
+        }
 
         #[allow(invalid_reference_casting)]
         let tx_states =
