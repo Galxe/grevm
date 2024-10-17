@@ -98,9 +98,9 @@ fn bench_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
     );
 }
 
-fn bench_dependent_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
+fn bench_dependent_raw_transfers(c: &mut Criterion, db_latency_us: u64, num_eoa: usize) {
     let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
-    let accounts = common::mock_block_accounts(common::START_ADDRESS, block_size);
+    let accounts = common::mock_block_accounts(common::START_ADDRESS, num_eoa);
     let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
     db.latency_us = db_latency_us;
     bench(
@@ -108,10 +108,12 @@ fn bench_dependent_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
         "Dependent Raw Transfers",
         db,
         (0..block_size)
-            .map(|i| TxEnv {
-                caller: Address::from(U160::from(common::START_ADDRESS + i)),
+            .map(|_| TxEnv {
+                caller: Address::from(U160::from(
+                    common::START_ADDRESS + rand::random::<usize>() % num_eoa,
+                )),
                 transact_to: TransactTo::Call(Address::from(U160::from(
-                    common::START_ADDRESS + i % 64,
+                    common::START_ADDRESS + rand::random::<usize>() % num_eoa,
                 ))),
                 value: U256::from(1),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
@@ -130,10 +132,12 @@ fn benchmark_gigagas(c: &mut Criterion) {
     let db_latency_us = std::env::var_os("DB_LATENCY_US")
         .map(|s| s.to_string_lossy().parse().unwrap())
         .unwrap_or(0);
+    let num_eoa =
+        std::env::var_os("NUM_EOA").map(|s| s.to_string_lossy().parse().unwrap()).unwrap_or(10000);
     bench_raw_transfers(c, db_latency_us);
-    bench_dependent_raw_transfers(c, db_latency_us);
+    bench_dependent_raw_transfers(c, db_latency_us, num_eoa);
     benchmark_erc20(c, db_latency_us);
-    benchmark_dependent_erc20(c, db_latency_us);
+    benchmark_dependent_erc20(c, db_latency_us, num_eoa);
     bench_uniswap(c, db_latency_us);
 
     fastrace::flush();
@@ -153,7 +157,6 @@ fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
             value: U256::from(0),
             gas_limit: erc20::GAS_LIMIT,
             gas_price: U256::from(1),
-            nonce: Some(0),
             data: ERC20Token::transfer(addr, U256::from(900)),
             ..TxEnv::default()
         };
@@ -165,23 +168,22 @@ fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
     bench(c, "Independent ERC20", db, txs);
 }
 
-fn benchmark_dependent_erc20(c: &mut Criterion, db_latency_us: u64) {
+fn benchmark_dependent_erc20(c: &mut Criterion, db_latency_us: u64, num_eoa: usize) {
     let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
-    let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(block_size, 1);
+    let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(num_eoa, 1);
     let miner = common::mock_miner_account();
     state.insert(miner.0, miner.1);
     let mut txs = Vec::with_capacity(block_size);
     let sca = sca[0];
-    for (i, addr) in eoa.iter().enumerate() {
-        let recipient = eoa[i % 64];
+
+    for _ in 0..block_size {
         let tx = TxEnv {
-            caller: *addr,
+            caller: eoa[rand::random::<usize>() % num_eoa],
             transact_to: TransactTo::Call(sca),
             value: U256::from(0),
             gas_limit: erc20::GAS_LIMIT,
             gas_price: U256::from(1),
-            nonce: Some(0),
-            data: ERC20Token::transfer(recipient, U256::from(900)),
+            data: ERC20Token::transfer(eoa[rand::random::<usize>() % num_eoa], U256::from(900)),
             ..TxEnv::default()
         };
         txs.push(tx);
