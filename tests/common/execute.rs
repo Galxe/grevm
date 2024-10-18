@@ -212,10 +212,14 @@ struct JsonAccount {
     pub storage: HashMap<U256, U256>,
 }
 
+const TEST_DATA_DIR: &str = "test_data";
+
 pub(crate) fn load_bytecodes_from_disk() -> HashMap<B256, Bytecode> {
     // Parse bytecodes
-    bincode::deserialize_from(BufReader::new(File::open("data/bytecodes.bincode").unwrap()))
-        .unwrap()
+    bincode::deserialize_from(BufReader::new(
+        File::open(format!("{TEST_DATA_DIR}/bytecodes.bincode")).unwrap(),
+    ))
+    .unwrap()
 }
 
 pub(crate) fn load_block_from_disk(
@@ -223,13 +227,13 @@ pub(crate) fn load_block_from_disk(
 ) -> (Block, HashMap<Address, PlainAccount>, HashMap<u64, B256>) {
     // Parse block
     let block: Block = serde_json::from_reader(BufReader::new(
-        File::open(format!("data/blocks/{}/block.json", block_number)).unwrap(),
+        File::open(format!("{TEST_DATA_DIR}/blocks/{block_number}/block.json")).unwrap(),
     ))
     .unwrap();
 
     // Parse state
     let accounts: HashMap<Address, JsonAccount> = serde_json::from_reader(BufReader::new(
-        File::open(format!("data/blocks/{}/pre_state.json", block_number)).unwrap(),
+        File::open(format!("{TEST_DATA_DIR}/blocks/{block_number}/pre_state.json")).unwrap(),
     ))
     .unwrap();
     let accounts: HashMap<Address, PlainAccount> = accounts
@@ -250,7 +254,7 @@ pub(crate) fn load_block_from_disk(
 
     // Parse block hashes
     let block_hashes: HashMap<u64, B256> =
-        File::open(format!("data/blocks/{}/block_hashes.json", block_number))
+        File::open(format!("{TEST_DATA_DIR}/blocks/{block_number}/block_hashes.json"))
             .map(|file| {
                 serde_json::from_reader::<_, HashMap<u64, B256>>(BufReader::new(file)).unwrap()
             })
@@ -263,7 +267,7 @@ pub(crate) fn for_each_block_from_disk(mut handler: impl FnMut(Block, InMemoryDB
     // Parse bytecodes
     let bytecodes = load_bytecodes_from_disk();
 
-    for block_path in fs::read_dir("data/blocks").unwrap() {
+    for block_path in fs::read_dir(format!("{TEST_DATA_DIR}/blocks")).unwrap() {
         let block_path = block_path.unwrap().path();
         let block_number = block_path.file_name().unwrap().to_str().unwrap();
 

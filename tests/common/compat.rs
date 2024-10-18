@@ -55,7 +55,9 @@ pub(crate) fn get_gas_price(tx: &Transaction) -> U256 {
     let tx_type = TxType::try_from(tx_type_raw).unwrap();
     match tx_type {
         TxType::Legacy | TxType::Eip2930 => tx.gas_price.map(U256::from).unwrap(),
-        TxType::Eip1559 | TxType::Eip4844 | TxType::Eip7702 => tx.max_fee_per_gas.map(U256::from).unwrap(),
+        TxType::Eip1559 | TxType::Eip4844 | TxType::Eip7702 => {
+            tx.max_fee_per_gas.map(U256::from).unwrap()
+        }
     }
 }
 
