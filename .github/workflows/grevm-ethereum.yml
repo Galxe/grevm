@@ -2,7 +2,7 @@ name: Grevm Ethereum
 
 on:
   pull_request:
-    branches: [ "main", "open_source" ]
+    branches: [ "main" ]
   merge_group:
     types: [checks_requested]
 

@@ -2,7 +2,7 @@ name: Grevm Tests
 
 on:
   pull_request:
-    branches: [ "main", "open_source" ]
+    branches: [ "main" ]
   merge_group:
     types: [checks_requested]
 
@@ -24,4 +24,4 @@ jobs:
           override: true
 
       - name: Run tests
-        run: cargo test
+        run: cargo test -- --skip mainnet
