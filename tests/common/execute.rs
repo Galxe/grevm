@@ -1,4 +1,5 @@
-use crate::common::MINER_ADDRESS;
+use crate::common::{storage::InMemoryDB, MINER_ADDRESS};
+use alloy_rpc_types::Block;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use alloy_chains::NamedChain;
@@ -8,15 +9,19 @@ use revm::db::states::StorageSlot;
 use revm::db::{BundleAccount, BundleState, PlainAccount};
 use revm::primitives::alloy_primitives::U160;
 use revm::primitives::{
-    uint, AccountInfo, Address, EVMError, Env, ExecutionResult, SpecId, TxEnv, KECCAK_EMPTY, U256,
+    uint, AccountInfo, Address, Bytecode, EVMError, Env, ExecutionResult, SpecId, TxEnv, B256,
+    KECCAK_EMPTY, U256,
 };
 use revm::{DatabaseCommit, DatabaseRef, EvmBuilder, StateBuilder};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
+use std::fs::{self, File};
+use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Instant;
 
-fn compare_bundle_state(left: &BundleState, right: &BundleState) {
+pub(crate) fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert!(
         left.contracts.keys().all(|k| right.contracts.contains_key(k)),
         "Left contracts: {:?}, Right contracts: {:?}",
@@ -50,14 +55,14 @@ fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     }
 }
 
-fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<ExecutionResult>) {
+pub(crate) fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<ExecutionResult>) {
     for (i, (left_res, right_res)) in left.iter().zip(right.iter()).enumerate() {
         assert_eq!(left_res, right_res, "Tx {}", i);
     }
     assert_eq!(left.len(), right.len());
 }
 
-pub fn mock_miner_account() -> (Address, PlainAccount) {
+pub(crate) fn mock_miner_account() -> (Address, PlainAccount) {
     let address = Address::from(U160::from(MINER_ADDRESS));
     let account = PlainAccount {
         info: AccountInfo { balance: U256::from(0), nonce: 1, code_hash: KECCAK_EMPTY, code: None },
@@ -66,7 +71,7 @@ pub fn mock_miner_account() -> (Address, PlainAccount) {
     (address, account)
 }
 
-pub fn mock_eoa_account(idx: usize) -> (Address, PlainAccount) {
+pub(crate) fn mock_eoa_account(idx: usize) -> (Address, PlainAccount) {
     let address = Address::from(U160::from(idx));
     let account = PlainAccount {
         info: AccountInfo {
@@ -80,7 +85,7 @@ pub fn mock_eoa_account(idx: usize) -> (Address, PlainAccount) {
     (address, account)
 }
 
-pub fn mock_block_accounts(from: usize, size: usize) -> HashMap<Address, PlainAccount> {
+pub(crate) fn mock_block_accounts(from: usize, size: usize) -> HashMap<Address, PlainAccount> {
     let mut accounts: HashMap<Address, PlainAccount> =
         (from..(from + size)).map(mock_eoa_account).collect();
     let miner = mock_miner_account();
@@ -88,7 +93,7 @@ pub fn mock_block_accounts(from: usize, size: usize) -> HashMap<Address, PlainAc
     accounts
 }
 
-pub fn compare_evm_execute<DB>(
+pub(crate) fn compare_evm_execute<DB>(
     db: DB,
     txs: Vec<TxEnv>,
     with_hints: bool,
@@ -112,8 +117,7 @@ pub fn compare_evm_execute<DB>(
     let mut parallel_result = Err(GrevmError::UnreachableError(String::from("Init")));
     metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
-        let mut parallel =
-            GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
+        let parallel = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
         // set determined partitions
         parallel_result = parallel.force_parallel_execute(with_hints, Some(23));
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
@@ -193,4 +197,77 @@ where
     evm.db_mut().merge_transitions(BundleRetention::Reverts);
 
     Ok(ExecuteOutput { state: evm.db_mut().take_bundle(), results })
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct JsonAccount {
+    /// The account's balance.
+    pub balance: U256,
+    /// The account's nonce.
+    pub nonce: u64,
+    /// The optional code hash of the account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_hash: Option<B256>,
+    /// The account's storage.
+    pub storage: HashMap<U256, U256>,
+}
+
+pub(crate) fn load_bytecodes_from_disk() -> HashMap<B256, Bytecode> {
+    // Parse bytecodes
+    bincode::deserialize_from(BufReader::new(File::open("data/bytecodes.bincode").unwrap()))
+        .unwrap()
+}
+
+pub(crate) fn load_block_from_disk(
+    block_number: u64,
+) -> (Block, HashMap<Address, PlainAccount>, HashMap<u64, B256>) {
+    // Parse block
+    let block: Block = serde_json::from_reader(BufReader::new(
+        File::open(format!("data/blocks/{}/block.json", block_number)).unwrap(),
+    ))
+    .unwrap();
+
+    // Parse state
+    let accounts: HashMap<Address, JsonAccount> = serde_json::from_reader(BufReader::new(
+        File::open(format!("data/blocks/{}/pre_state.json", block_number)).unwrap(),
+    ))
+    .unwrap();
+    let accounts: HashMap<Address, PlainAccount> = accounts
+        .into_iter()
+        .map(|(address, account)| {
+            let account = PlainAccount {
+                info: AccountInfo {
+                    balance: account.balance,
+                    nonce: account.nonce,
+                    code_hash: account.code_hash.unwrap_or_else(|| KECCAK_EMPTY),
+                    code: None,
+                },
+                storage: account.storage,
+            };
+            (address, account)
+        })
+        .collect();
+
+    // Parse block hashes
+    let block_hashes: HashMap<u64, B256> =
+        File::open(format!("data/blocks/{}/block_hashes.json", block_number))
+            .map(|file| {
+                serde_json::from_reader::<_, HashMap<u64, B256>>(BufReader::new(file)).unwrap()
+            })
+            .unwrap_or_default();
+
+    (block, accounts, block_hashes)
+}
+
+pub(crate) fn for_each_block_from_disk(mut handler: impl FnMut(Block, InMemoryDB)) {
+    // Parse bytecodes
+    let bytecodes = load_bytecodes_from_disk();
+
+    for block_path in fs::read_dir("data/blocks").unwrap() {
+        let block_path = block_path.unwrap().path();
+        let block_number = block_path.file_name().unwrap().to_str().unwrap();
+
+        let (block, accounts, block_hashes) = load_block_from_disk(block_number.parse().unwrap());
+        handler(block, InMemoryDB::new(accounts, bytecodes.clone(), block_hashes));
+    }
 }

@@ -129,11 +129,8 @@ fn benchmark_gigagas(c: &mut Criterion) {
     fastrace::set_reporter(reporter, Config::default());
 
     // TODO(gravity): Create options from toml file if there are more
-    let db_latency_us = std::env::var_os("DB_LATENCY_US")
-        .map(|s| s.to_string_lossy().parse().unwrap())
-        .unwrap_or(0);
-    let num_eoa =
-        std::env::var_os("NUM_EOA").map(|s| s.to_string_lossy().parse().unwrap()).unwrap_or(10000);
+    let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);
+    let num_eoa = std::env::var("NUM_EOA").map(|s| s.parse().unwrap()).unwrap_or(0);
     bench_raw_transfers(c, db_latency_us);
     bench_dependent_raw_transfers(c, db_latency_us, num_eoa);
     benchmark_erc20(c, db_latency_us);
