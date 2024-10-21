@@ -45,7 +45,7 @@ pub(crate) struct SchedulerDB<DB> {
 impl<DB> SchedulerDB<DB> {
     pub(crate) fn new(database: DB) -> Self {
         Self {
-            cache: CacheState::default(),
+            cache: CacheState::new(false),
             database,
             transition_state: Some(TransitionState::default()),
             bundle_state: BundleState::default(),
@@ -290,7 +290,7 @@ impl<DB> PartitionDB<DB> {
     pub(crate) fn new(coinbase: Address, scheduler_db: Arc<SchedulerDB<DB>>) -> Self {
         Self {
             coinbase,
-            cache: CacheState::default(),
+            cache: CacheState::new(false),
             scheduler_db,
             block_hashes: BTreeMap::new(),
             miner_involved: false,
