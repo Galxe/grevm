@@ -28,7 +28,6 @@ use revme::cmd::statetest::{
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::str::FromStr;
 use walkdir::{DirEntry, WalkDir};
 
 #[path = "../common/mod.rs"]

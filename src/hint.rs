@@ -5,11 +5,17 @@ use std::sync::Arc;
 
 use crate::{fork_join_util, LocationAndType, SharedTxStates, TxState};
 
+/// This module provides functionality for parsing and handling execution hints
+/// for parallel transaction execution in the context of Ethereum-like blockchains.
+/// It includes definitions for contract types, ERC20 functions, read-write types,
+/// and methods for updating transaction states based on contract interactions.
+#[allow(dead_code)]
 enum ContractType {
     UNKNOWN,
     ERC20,
 }
 
+/// Represents different types of contracts. Currently, only ERC20 is supported.
 enum ERC20Function {
     UNKNOWN,
     Allowance,
@@ -51,7 +57,7 @@ enum RWType {
 }
 
 impl TxState {
-    pub(crate) fn insert_location(&mut self, location: LocationAndType, rw_type: RWType) {
+    fn insert_location(&mut self, location: LocationAndType, rw_type: RWType) {
         match rw_type {
             RWType::ReadOnly => {
                 self.read_set.insert(location);
@@ -67,33 +73,44 @@ impl TxState {
     }
 }
 
-pub struct ParallelExecutionHints {
+/// Struct to hold shared transaction states and provide methods for parsing
+/// and handling execution hints for parallel transaction execution.
+pub(crate) struct ParallelExecutionHints {
+    /// Shared transaction states that will be updated with read/write sets
+    /// based on the contract interactions.
     tx_states: SharedTxStates,
 }
 
 impl ParallelExecutionHints {
-    pub fn new(tx_states: SharedTxStates) -> Self {
+    pub(crate) fn new(tx_states: SharedTxStates) -> Self {
         Self { tx_states }
     }
 
+    /// Obtain a mutable reference to shared transaction states, and parse execution hints for each transaction.
+    /// Although fork_join_util executes concurrently, transactions between each partition do not overlap.
+    /// This means each partition can independently update its assigned transactions.
+    /// `self.tx_states` is immutable, and can only be converted to mutable through unsafe code.
+    /// An alternative approach is to declare `self.tx_states` as `Arc<Vec<Mutex<TxState>>>`, allowing mutable access via `self.tx_states[index].lock().unwrap()`.
+    /// However, this would introduce locking overhead and impact performance.
+    /// The primary consideration is that developers are aware there are no conflicts between transactions, making the `Mutex` approach unnecessarily verbose and cumbersome.
     #[fastrace::trace]
     pub(crate) fn parse_hints(&self, txs: Arc<Vec<TxEnv>>) {
-        fork_join_util(txs.len(), None, |start_txs, end_txs, _| {
+        // Utilize fork-join utility to process transactions in parallel
+        fork_join_util(txs.len(), None, |start_tx, end_tx, _| {
             #[allow(invalid_reference_casting)]
             let hints =
                 unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
-            for index in start_txs..end_txs {
+            for index in start_tx..end_tx {
                 let tx_env = &txs[index];
                 let rw_set = &mut hints[index];
-                // Causing transactions that call the same contract to inevitably
-                // conflict with each other. Is this behavior reasonable?
-                // TODO(gaoxin): optimize contract account
+                // Insert caller's basic location into read-write set
                 rw_set.insert_location(LocationAndType::Basic(tx_env.caller), RWType::ReadWrite);
                 if let TxKind::Call(to_address) = tx_env.transact_to {
                     if !tx_env.data.is_empty() {
                         rw_set
                             .insert_location(LocationAndType::Basic(to_address), RWType::ReadOnly);
                         rw_set.insert_location(LocationAndType::Code(to_address), RWType::ReadOnly);
+                        // Update hints with contract data based on the transaction details
                         ParallelExecutionHints::update_hints_with_contract_data(
                             tx_env.caller,
                             to_address,
@@ -110,6 +127,33 @@ impl ParallelExecutionHints {
         });
     }
 
+    /// This function computes the storage slot using the provided slot number and a vector of indices.
+    /// It utilizes the keccak256 hash function to derive the final storage slot value.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `K` - The type of the slot number.
+    /// * `V` - The type of the indices.
+    ///
+    /// # Parameters
+    ///
+    /// * `slot` - The initial slot number.
+    /// * `indices` - A vector of indices used to compute the final storage slot.
+    ///
+    /// # Returns
+    ///
+    /// * `U256` - The computed storage slot.
+    ///
+    /// # ABI Standards
+    ///
+    /// This function adheres to the ABI (Application Binary Interface) standards for Ethereum Virtual Machine (EVM).
+    /// For more information on ABI standards, you can refer to the following resources:
+    ///
+    /// * [Ethereum Contract ABI Specification](https://docs.soliditylang.org/en/latest/abi-spec.html)
+    /// * [Ethereum Yellow Paper](https://ethereum.github.io/yellowpaper/paper.pdf)
+    /// * [EIP-20: ERC-20 Token Standard](https://eips.ethereum.org/EIPS/eip-20)
+    ///
+    /// These resources provide detailed information on how data is encoded and decoded in the EVM, which is essential for understanding how storage slots are calculated.
     fn slot_from_indices<K, V>(slot: K, indices: Vec<V>) -> U256
     where
         U256: UintTryFrom<K>,
@@ -208,7 +252,7 @@ impl ParallelExecutionHints {
         }
     }
 
-    fn get_contract_type(contract_address: Address) -> ContractType {
+    fn get_contract_type(_contract_address: Address) -> ContractType {
         // TODO(gaoxin): Parse the correct contract type to determined how to handle call data
         ContractType::ERC20
     }

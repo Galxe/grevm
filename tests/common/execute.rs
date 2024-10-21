@@ -112,8 +112,7 @@ pub fn compare_evm_execute<DB>(
     let mut parallel_result = Err(GrevmError::UnreachableError(String::from("Init")));
     metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
-        let mut parallel =
-            GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
+        let parallel = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
         // set determined partitions
         parallel_result = parallel.force_parallel_execute(with_hints, Some(23));
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
