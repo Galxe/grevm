@@ -8,6 +8,15 @@ use revm::{CacheState, Database, DatabaseRef, TransitionAccount, TransitionState
 use std::collections::{btree_map, hash_map, BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+/// SchedulerDB is a database wrapper that manages state transitions and caching for the EVM.
+/// It maintains a cache of committed data, a transition state for ongoing transactions, and a bundle state
+/// for finalizing block state changes. It also tracks block hashes for quick access.
+///
+/// After each execution round, SchedulerDB caches the committed data of finalized
+/// transactions and the read-only data accessed during execution.
+/// This cached data serves as the initial state for the next round of partition executors.
+/// When reverting to sequential execution, these cached states will include both
+/// the changes from EVM execution and the cached/loaded accounts and storages.
 pub(crate) struct SchedulerDB<DB> {
     /// Cache the committed data of finality txns and the read-only data during execution after each
     /// round of execution. Used as the initial state for the next round of partition executors.
@@ -44,18 +53,23 @@ impl<DB> SchedulerDB<DB> {
         }
     }
 
-    /// Commit transitions to the cache state and transition state after one round of execution.
+    /// This function is used to cache the committed data of finality txns and the read-only data during execution.
+    /// These data will be used as the initial state for the next round of partition executors.
+    /// When falling back to sequential execution, these cached states will include both the changes from EVM execution
+    /// and the cached/loaded accounts/storages.
     pub(crate) fn commit_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
         apply_transition_to_cache(&mut self.cache, &transitions);
         self.apply_transition(transitions);
     }
 
-    /// Fall back to sequential execute.
+    /// Fall back to sequential execute
     pub(crate) fn commit(&mut self, changes: HashMap<Address, Account>) {
         let transitions = self.cache.apply_evm_state(changes);
         self.apply_transition(transitions);
     }
 
+    /// Apply transition to transition state.
+    /// This will be used to create final post state and reverts.
     fn apply_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
         // add transition to transition state.
         if let Some(s) = self.transition_state.as_mut() {
@@ -65,8 +79,7 @@ impl<DB> SchedulerDB<DB> {
 
     /// Take all transitions and merge them inside bundle state.
     /// This action will create final post state and all reverts so that
-    /// we at any time revert state of bundle to the state before transition
-    /// is applied.
+    /// we at any time revert state of bundle to the state before transition is applied.
     #[fastrace::trace]
     pub(crate) fn merge_transitions(&mut self, retention: BundleRetention) {
         if let Some(transition_state) = self.transition_state.as_mut().map(TransitionState::take) {
@@ -79,6 +92,8 @@ impl<DB> SchedulerDB<DB>
 where
     DB: DatabaseRef,
 {
+    /// Load account from cache or database.
+    /// If account is not found in cache, it will be loaded from database.
     fn load_cache_account(&mut self, address: Address) -> Result<&mut CacheAccount, DB::Error> {
         match self.cache.accounts.entry(address) {
             hash_map::Entry::Vacant(entry) => {
@@ -89,8 +104,8 @@ where
         }
     }
 
-    /// rewards are distributed to the miner, ommers, and the DAO.
-    /// TODO(gaoxin): Full block reward to block.beneficiary
+    /// The miner's reward is calculated by subtracting the previous balance from the current balance.
+    /// and should add to the miner's account after each round of execution for finality transactions.
     pub(crate) fn increment_balances(
         &mut self,
         balances: impl IntoIterator<Item = (Address, u128)>,
@@ -160,6 +175,7 @@ fn load_storage<DB: DatabaseRef>(
     }
 }
 
+/// Apply transition to cache state.
 fn apply_transition_to_cache(
     cache: &mut CacheState,
     transitions: &Vec<(Address, TransitionAccount)>,
@@ -200,7 +216,7 @@ fn apply_transition_to_cache(
     }
 }
 
-/// Fall back to sequential execute
+/// SchedulerDB is used as a database for EVM when falling back to sequential execution.
 impl<DB> Database for SchedulerDB<DB>
 where
     DB: DatabaseRef,
@@ -249,11 +265,18 @@ where
     }
 }
 
+/// PartitionDB is used in PartitionExecutor to build EVM and hook the read operations.
+/// It maintains the partition internal cache, scheduler_db, and block_hashes.
+/// It also records the read set of the current transaction, which will be consumed after the execution of each transaction.
 pub(crate) struct PartitionDB<DB> {
+    /// The address of the miner
+    /// Miner's account may be updated for each transaction, if we add miner's account to the read/write set,
+    /// every transaction will be conflict with each other, so we need to handle miner's account separately.
     pub coinbase: Address,
 
-    // partition internal cache
+    /// Cache the state of the partition
     pub cache: CacheState,
+    /// The scheduler database, used to load the state of the committed data
     pub scheduler_db: Arc<SchedulerDB<DB>>,
     pub block_hashes: BTreeMap<u64, B256>,
 
@@ -281,18 +304,20 @@ impl<DB> PartitionDB<DB> {
     }
 
     /// Generate the write set after evm.transact() for each tx
+    /// The write set includes the locations of the basic account, code, and storage slots that have been modified.
+    /// Returns the write set(exclude miner) and the miner's rewards.
     pub(crate) fn generate_write_set(&self, changes: &EvmState) -> (LocationSet, Option<u128>) {
         let mut rewards: Option<u128> = None;
         let mut write_set = HashSet::new();
         for (address, account) in changes {
             if account.is_selfdestructed() {
-                write_set.insert(LocationAndType::Code(address.clone()));
+                write_set.insert(LocationAndType::Code(*address));
                 // When a contract account is destroyed, its remaining balance is sent to a
                 // designated address, and the account’s balance becomes invalid.
                 // Defensive programming should be employed to prevent subsequent transactions
                 // from attempting to read the contract account’s basic information,
                 // which could lead to errors.
-                write_set.insert(LocationAndType::Basic(address.clone()));
+                write_set.insert(LocationAndType::Basic(*address));
                 continue;
             }
 
@@ -316,6 +341,10 @@ impl<DB> PartitionDB<DB> {
                 }
             }
 
+            // If the account is touched, it means that the account's state has been modified
+            // during the transaction. This includes changes to the account's balance, nonce,
+            // or code. We need to track these changes to ensure the correct state is committed
+            // after the transaction.
             if account.is_touched() {
                 let has_code = !account.info.is_empty_code_hash();
                 // is newly created contract
@@ -335,10 +364,9 @@ impl<DB> PartitionDB<DB> {
                         new_contract_account = has_code;
                         true
                     }
-                } {
-                    if !miner_updated {
-                        write_set.insert(LocationAndType::Basic(*address));
-                    }
+                } && !miner_updated
+                {
+                    write_set.insert(LocationAndType::Basic(*address));
                 }
                 if new_contract_account {
                     write_set.insert(LocationAndType::Code(*address));
@@ -353,6 +381,7 @@ impl<DB> PartitionDB<DB> {
     }
 
     /// Temporary commit the state change after evm.transact() for each tx
+    /// Final commit will be called when the transaction is marked as finality in the validation of scheduler.
     pub(crate) fn temporary_commit(
         &mut self,
         changes: EvmState,

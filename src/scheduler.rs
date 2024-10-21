@@ -1,20 +1,18 @@
-use fastrace::Span;
-
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::DerefMut;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::hint::ParallelExecutionHints;
-use crate::partition::{OrderedVectorExt, PartitionExecutor};
+use crate::partition::PartitionExecutor;
 use crate::storage::SchedulerDB;
 use crate::tx_dependency::{DependentTxsVec, TxDependency};
 use crate::{
-    fork_join_util, GrevmError, LocationAndType, PartitionId, ResultAndTransition,
-    TransactionStatus, TxId, CPU_CORES, GREVM_RUNTIME, MAX_NUM_ROUND,
+    fork_join_util, GrevmError, LocationAndType, ResultAndTransition, TransactionStatus, TxId,
+    CPU_CORES, GREVM_RUNTIME, MAX_NUM_ROUND,
 };
 
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, gauge};
 use revm::db::states::bundle_state::BundleRetention;
 use revm::db::BundleState;
 use revm::primitives::{
@@ -22,7 +20,7 @@ use revm::primitives::{
 };
 use revm::{CacheState, DatabaseRef, EvmBuilder};
 
-pub struct ExecuteMetrics {
+struct ExecuteMetrics {
     /// Number of times parallel execution is called.
     parallel_execute_calls: metrics::Counter,
     /// Number of times sequential execution is called.
@@ -95,6 +93,8 @@ impl Default for ExecuteMetrics {
     }
 }
 
+/// The output of the execution of a block.
+#[derive(Debug)]
 pub struct ExecuteOutput {
     /// The changed state of the block after execution.
     pub state: BundleState,
@@ -102,10 +102,13 @@ pub struct ExecuteOutput {
     pub results: Vec<ExecutionResult>,
 }
 
-pub type LocationSet = HashSet<LocationAndType>;
+/// A set of locations. Used to store the read and write sets of a transaction.
+pub(crate) type LocationSet = HashSet<LocationAndType>;
 
+/// The state of a transaction.
+/// Contains the read and write sets of the transaction, as well as the result of executing the transaction.
 #[derive(Clone)]
-pub struct TxState {
+pub(crate) struct TxState {
     pub tx_status: TransactionStatus,
     pub read_set: LocationSet,
     pub write_set: LocationSet,
@@ -113,7 +116,7 @@ pub struct TxState {
 }
 
 impl TxState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             tx_status: TransactionStatus::Initial,
             read_set: HashSet::new(),
@@ -123,8 +126,19 @@ impl TxState {
     }
 }
 
-pub type SharedTxStates = Arc<Vec<TxState>>;
+/// A shared reference to a vector of transaction states.
+/// Used to share the transaction states between the partition executors.
+/// Since the state of a transaction is not modified by multiple threads simultaneously,
+/// `SharedTxStates` is thread-safe. Unsafe code is used to convert `SharedTxStates` to
+/// a mutable reference, allowing modification of transaction states during execution.
+pub(crate) type SharedTxStates = Arc<Vec<TxState>>;
 
+/// The scheduler for executing transactions in parallel.
+/// It partitions transactions into multiple groups and processes each group concurrently.
+/// After each round of execution, it validates the transactions and updates their states.
+/// The scheduler continues parallel execution until all transactions reach finality.
+/// It falls back to sequential execution if not finished after a certain number of rounds.
+#[allow(missing_debug_implementations)]
 pub struct GrevmScheduler<DB>
 where
     DB: DatabaseRef,
@@ -134,24 +148,34 @@ where
     coinbase: Address,
     txs: Arc<Vec<TxEnv>>,
 
+    /// The database utilized by the scheduler.
+    /// It is shared among the partition executors,
+    /// allowing them to read the final state from previous rounds.
     database: Arc<SchedulerDB<DB>>,
 
+    /// The dependency relationship between transactions.
+    /// Used to construct the next round of transaction partitions.
     tx_dependencies: TxDependency,
 
+    /// Shared state of transactions.
     tx_states: SharedTxStates,
 
-    // number of partitions. maybe larger in the first round to increase concurrence
+    /// number of partitions. maybe larger in the first round to increase concurrence
     num_partitions: usize,
-    // assigned txs ID for each partition
+    /// assigned tx IDs for each partition
     partitioned_txs: Vec<Vec<TxId>>,
+    /// PartitionExecutors for each assigned tx IDs
     partition_executors: Vec<Arc<RwLock<PartitionExecutor<DB>>>>,
-
+    /// number of finality txs in the current round
     num_finality_txs: usize,
     results: Vec<ExecutionResult>,
 
     metrics: ExecuteMetrics,
 }
 
+/// A wrapper for DatabaseRef.
+/// Used to bypass the 'static constraint of `tokio::spawn`.
+#[allow(missing_debug_implementations)]
 pub struct DatabaseWrapper<Error>(Arc<dyn DatabaseRef<Error = Error> + Send + Sync + 'static>);
 
 impl<Error> DatabaseRef for DatabaseWrapper<Error> {
@@ -204,8 +228,9 @@ where
     DB: DatabaseRef + Send + Sync + 'static,
     DB::Error: Send + Sync,
 {
+    /// Creates a new GrevmScheduler instance.
     pub fn new(spec_id: SpecId, env: Env, db: DB, txs: Vec<TxEnv>) -> Self {
-        let coinbase = env.block.coinbase.clone();
+        let coinbase = env.block.coinbase;
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
         let num_txs = txs.len();
         Self {
@@ -225,6 +250,7 @@ where
         }
     }
 
+    /// Get the partitioned transactions by dependencies.
     #[fastrace::trace]
     pub(crate) fn partition_transactions(&mut self) {
         // compute and assign partitioned_txs
@@ -246,13 +272,14 @@ where
         self.metrics.partition_tx_time.increment(start.elapsed().as_nanos() as u64);
     }
 
+    /// Execute transactions in parallel.
     #[fastrace::trace]
     fn round_execute(&mut self) -> Result<(), GrevmError<DB::Error>> {
         self.metrics.parallel_execute_calls.increment(1);
         self.partition_executors.clear();
         for partition_id in 0..self.num_partitions {
             let executor = PartitionExecutor::new(
-                self.spec_id.clone(),
+                self.spec_id,
                 partition_id,
                 self.env.clone(),
                 self.database.clone(),
@@ -277,17 +304,24 @@ where
         self.validate_transactions()
     }
 
-    // merge write set after each round
+    /// Merge write set after each round
     #[fastrace::trace]
     fn merge_write_set(&mut self) -> (TxId, HashMap<LocationAndType, BTreeSet<TxId>>) {
         let start = Instant::now();
         let mut merged_write_set: HashMap<LocationAndType, BTreeSet<TxId>> = HashMap::new();
         let mut end_skip_id = self.num_finality_txs;
         for txid in self.num_finality_txs..self.tx_states.len() {
-            let tx_state = &self.tx_states[txid];
-            if tx_state.tx_status == TransactionStatus::SkipValidation && end_skip_id == txid {
+            if self.tx_states[txid].tx_status == TransactionStatus::SkipValidation
+                && end_skip_id == txid
+            {
                 end_skip_id += 1;
             } else {
+                break;
+            }
+        }
+        if end_skip_id != self.tx_states.len() {
+            for txid in self.num_finality_txs..self.tx_states.len() {
+                let tx_state = &self.tx_states[txid];
                 for location in tx_state.write_set.iter() {
                     merged_write_set.entry(location.clone()).or_default().insert(txid);
                 }
@@ -326,15 +360,20 @@ where
         self.tx_dependencies.update_tx_dependency(new_dependency, num_finality_txs);
     }
 
+    /// Generate unconfirmed transactions, and find the continuous minimum TxID,
+    /// which can be marked as finality transactions.
     #[fastrace::trace]
     fn generate_unconfirmed_txs(&mut self) {
         let num_partitions = self.num_partitions;
         let (end_skip_id, merged_write_set) = self.merge_write_set();
         self.metrics.skip_validation_cnt.increment((end_skip_id - self.num_finality_txs) as u64);
         fork_join_util(num_partitions, Some(num_partitions), |_, _, part| {
-            // Tx validate process:
-            // 1. Traverse the read set of each tx in each partition, and find the Range<TxId> less than tx in merged_write_set
-            // 2. conflict: 1) exist tx in Range<TxId> not belong to tx's partition; 2) exist tx in Range<TxId> is conflicted
+            // Transaction validation process:
+            // 1. For each transaction in each partition, traverse its read set and find the largest TxID(previous_txid)
+            //    in merged_write_set that are less than the current transaction's TxId.
+            // 2. A conflict occurs if:
+            //    a) `previous_txid`` does not belong to the current transaction's partition, or
+            //    b) `previous_txid` in same partition that is already marked as conflicted.
             let mut executor = self.partition_executors[part].write().unwrap();
             let executor = executor.deref_mut();
 
@@ -353,7 +392,7 @@ where
                                 // update dependencies: previous_txid <- txid
                                 updated_dependencies.insert(*previous_txid);
                                 if !conflict
-                                    && (!executor.assigned_txs.has(previous_txid)
+                                    && (!executor.assigned_txs.binary_search(previous_txid).is_ok()
                                         || tx_states[*previous_txid].tx_status
                                             == TransactionStatus::Conflict)
                                 {
@@ -373,6 +412,8 @@ where
         });
     }
 
+    /// Find the continuous minimum TxID, which can be marked as finality transactions.
+    /// If the smallest TxID is a conflict transaction, return an error.
     #[fastrace::trace]
     fn find_continuous_min_txid(&mut self) -> Result<usize, GrevmError<DB::Error>> {
         let mut min_execute_time = Duration::from_secs(u64::MAX);
@@ -382,24 +423,29 @@ where
             self.metrics.reusable_tx_cnt.increment(executor.metrics.reusable_tx_cnt);
             min_execute_time = min_execute_time.min(executor.metrics.execute_time);
             max_execute_time = max_execute_time.max(executor.metrics.execute_time);
-            if executor.assigned_txs[0] == self.num_finality_txs {
-                if self.tx_states[self.num_finality_txs].tx_status == TransactionStatus::Conflict {
-                    return Err(GrevmError::EvmError(
-                        executor.error_txs.remove(&self.num_finality_txs).unwrap(),
-                    ));
-                }
+            if executor.assigned_txs[0] == self.num_finality_txs
+                && self.tx_states[self.num_finality_txs].tx_status == TransactionStatus::Conflict
+            {
+                return Err(GrevmError::EvmError(
+                    executor.error_txs.remove(&self.num_finality_txs).unwrap(),
+                ));
             }
         }
         let mut conflict_tx_cnt = 0;
         let mut unconfirmed_tx_cnt = 0;
         let mut finality_tx_cnt = 0;
         self.metrics.partition_et_diff.set((max_execute_time - min_execute_time).as_nanos() as f64);
-        for txid in self.num_finality_txs..self.tx_states.len() {
-            match self.tx_states[txid].tx_status {
+        #[allow(invalid_reference_casting)]
+        let tx_states =
+            unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
+        for txid in self.num_finality_txs..tx_states.len() {
+            let tx_state = &mut tx_states[txid];
+            match tx_state.tx_status {
                 TransactionStatus::Unconfirmed => {
                     if txid == self.num_finality_txs {
                         self.num_finality_txs += 1;
                         finality_tx_cnt += 1;
+                        tx_state.tx_status = TransactionStatus::Finality;
                     } else {
                         unconfirmed_tx_cnt += 1;
                     }
@@ -420,6 +466,7 @@ where
         return Ok(finality_tx_cnt);
     }
 
+    /// Commit the transition of the finality transactions, and update the minner's rewards.
     #[fastrace::trace]
     fn commit_transition(&mut self, finality_tx_cnt: usize) -> Result<(), GrevmError<DB::Error>> {
         let start = Instant::now();
@@ -499,6 +546,7 @@ where
         }
     }
 
+    /// Fall back to sequential execution for the remaining transactions.
     #[fastrace::trace]
     fn execute_remaining_sequential(&mut self) -> Result<(), GrevmError<DB::Error>> {
         self.metrics.sequential_execute_calls.increment(1);
@@ -599,10 +647,12 @@ where
         Ok(self.build_output())
     }
 
+    /// Execute transactions in parallel.
     pub fn parallel_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
         self.evm_execute(None, true, None)
     }
 
+    /// Execute transactions parallelly with or without hints.
     pub fn force_parallel_execute(
         mut self,
         with_hints: bool,
@@ -611,6 +661,7 @@ where
         self.evm_execute(Some(false), with_hints, num_partitions)
     }
 
+    /// Execute transactions sequentially.
     pub fn force_sequential_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
         self.evm_execute(Some(true), false, None)
     }

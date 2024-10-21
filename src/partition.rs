@@ -10,28 +10,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-pub struct PartitionMetrics {
+pub(crate) struct PartitionMetrics {
     pub execute_time: Duration,
     pub reusable_tx_cnt: u64,
 }
 
-/// Add some binary search methods for ordered vectors
-pub(crate) trait OrderedVectorExt<E> {
-    fn has(&self, element: &E) -> bool;
-
-    fn index(&self, element: &E) -> usize;
-}
-
-impl<E: Ord> OrderedVectorExt<E> for Vec<E> {
-    fn has(&self, element: &E) -> bool {
-        self.binary_search(element).is_ok()
-    }
-
-    fn index(&self, element: &E) -> usize {
-        self.binary_search(element).unwrap()
-    }
-}
-
+/// The `PartitionExecutor` is tasked with executing transactions within a specific partition.
+/// Transactions are executed optimistically, and their read and write sets are recorded after execution.
+/// If a transaction fails, it is marked as a conflict; if it succeeds, it is marked as unconfirmed.
+/// The final state of a transaction is determined by the scheduler's validation process,
+/// which leverages the recorded read/write sets and execution results.
+/// This validation process uses the STM (Software Transactional Memory) algorithm, a standard conflict-checking method.
+/// Additionally, the read/write sets are used to update transaction dependencies.
+/// For instance, if transaction A's write set intersects with transaction B's read set, then B depends on A.
+/// These dependencies are then used to construct the next round of transaction partitions.
+/// The global state of transactions is maintained in `SharedTxStates`.
+/// Since the state of a transaction is not modified by multiple threads simultaneously,
+/// `SharedTxStates` is thread-safe. Unsafe code is used to convert `SharedTxStates` to
+/// a mutable reference, allowing modification of transaction states during execution.
 pub(crate) struct PartitionExecutor<DB>
 where
     DB: DatabaseRef,
@@ -39,7 +35,13 @@ where
     spec_id: SpecId,
     env: Env,
     coinbase: Address,
+
+    #[allow(dead_code)]
     partition_id: PartitionId,
+
+    /// SharedTxStates is a thread-safe global state of transactions.
+    /// Unsafe code is used to convert SharedTxStates to a mutable reference,
+    /// allowing modification of transaction states during execution
     tx_states: SharedTxStates,
     txs: Arc<Vec<TxEnv>>,
 
@@ -66,8 +68,8 @@ where
         tx_states: SharedTxStates,
         assigned_txs: Vec<TxId>,
     ) -> Self {
-        let coinbase = env.block.coinbase.clone();
-        let partition_db = PartitionDB::new(coinbase.clone(), scheduler_db);
+        let coinbase = env.block.coinbase;
+        let partition_db = PartitionDB::new(coinbase, scheduler_db);
         Self {
             spec_id,
             env,
@@ -83,9 +85,28 @@ where
         }
     }
 
+    /// Check if there are unconfirmed transactions in the current partition
+    /// If there are unconfirmed transactions,
+    /// the update_write_set will be used to determine whether the transaction needs to be rerun
+    fn has_unconfirmed_tx(tx_states: &Vec<TxState>, assigned_txs: &Vec<TxId>) -> bool {
+        // If the first transaction is not executed, it means that the partition has not been executed
+        if tx_states[0].tx_status == TransactionStatus::Initial {
+            return false;
+        }
+        for txid in assigned_txs {
+            if tx_states[*txid].tx_status == TransactionStatus::Unconfirmed {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Execute transactions in the partition
+    /// The transactions are executed optimistically, and their read and write sets are recorded after execution.
+    /// The final state of a transaction is determined by the scheduler's validation process.
     pub(crate) fn execute(&mut self) {
         let start = Instant::now();
-        let mut has_unconfirmed_tx = false;
+        // the update_write_set is used to determine whether the transaction needs to be rerun
         let mut update_write_set: HashSet<LocationAndType> = HashSet::new();
         let mut evm = EvmBuilder::default()
             .with_db(&mut self.partition_db)
@@ -97,15 +118,16 @@ where
         let tx_states =
             unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
 
+        let has_unconfirmed_tx = Self::has_unconfirmed_tx(tx_states, &self.assigned_txs);
         for txid in &self.assigned_txs {
             let txid = *txid;
 
+            // Miner is handled separately for each transaction
+            // However, if the miner is involved in the transaction
+            // we have to fully track the updates of this transaction to make sure the miner's account is updated correctly
             let mut miner_involved = false;
             if let Some(tx) = self.txs.get(txid) {
                 *evm.tx_mut() = tx.clone();
-                // If the transaction includes the miner’s address,
-                // we need to record the miner’s address in both the write and read sets,
-                // and fully track the updates to the miner’s account.
                 if self.coinbase == tx.caller {
                     miner_involved = true;
                 }
@@ -117,15 +139,15 @@ where
             } else {
                 panic!("Wrong transactions ID");
             }
+            // If the transaction is unconfirmed, it may not require repeated execution
             let mut should_execute = true;
             if tx_states[txid].tx_status == TransactionStatus::Unconfirmed {
-                has_unconfirmed_tx = true;
-                // The unconfirmed transactions from the previous round may not require repeated execution.
+                // Unconfirmed transactions from the previous round might not need to be re-executed.
                 // The verification process is as follows:
-                // 1. create a write set(update_write_set) to store write_set of previous conflict tx
-                // 2. if an unconfirmed tx rerun, store write_set to update_write_set
-                // 3. when running an unconfirmed tx, take it's pre-round read_set to join with update_write_set
-                // 4. if the intersection is None, the unconfirmed tx no need to rerun, otherwise rerun
+                // 1. Create an update_write_set to store the write sets of previous conflicting transactions.
+                // 2. If an unconfirmed transaction is re-executed, add its write set to update_write_set.
+                // 3. When processing an unconfirmed transaction, join its previous round's read set with update_write_set.
+                // 4. If there is no intersection, the unconfirmed transaction does not need to be re-executed; otherwise, it does.
                 if tx_states[txid].read_set.is_disjoint(&update_write_set) {
                     let transition = &tx_states[txid].execute_result.transition;
                     evm.db_mut().temporary_commit_transition(transition);
@@ -138,7 +160,7 @@ where
                 evm.db_mut().miner_involved = miner_involved;
                 let result = evm.transact();
                 match result {
-                    Ok(mut result_and_state) => {
+                    Ok(result_and_state) => {
                         let read_set = evm.db_mut().take_read_set();
                         let (write_set, rewards) =
                             evm.db().generate_write_set(&result_and_state.state);
@@ -146,6 +168,11 @@ where
                             update_write_set.extend(write_set.clone().into_iter());
                         }
 
+                        // Check if the transaction can be skipped
+                        // skip_validation=true does not necessarily mean the transaction can skip validation.
+                        // Only transactions with consecutive minimum TxID can skip validation.
+                        // This is because if a transaction with a smaller TxID conflicts,
+                        // the states of subsequent transactions are invalid.
                         let mut skip_validation = true;
                         if !read_set.is_subset(&tx_states[txid].read_set) {
                             skip_validation = false;
@@ -177,10 +204,11 @@ where
                         };
                     }
                     Err(err) => {
-                        // Due to parallel execution, transactions may fail (such as dependent transfers not yet received),
-                        // so the transaction failure does not result in block failure.
-                        // Only the failure of transactions that in FINALITY state will result in block failure.
-                        // During verification, failed transactions are conflict state
+                        // In a parallel execution environment, transactions might fail due to reasons
+                        // such as dependent transfers not being received yet.
+                        // Therefore, a transaction failure does not necessarily lead to a block failure.
+                        // Only transactions that are in the FINALITY state can cause a block failure.
+                        // During verification, failed transactions are marked as being in a conflict state.
 
                         // update read set
                         let mut read_set = evm.db_mut().take_read_set();

@@ -8,22 +8,28 @@ pub(crate) type DependentTxsVec = SmallVec<[TxId; 1]>;
 
 const RAW_TRANSFER_WEIGHT: usize = 1;
 
+/// TxDependency is used to store the dependency relationship between transactions.
+/// The dependency relationship is stored in the form of a directed graph by adjacency list.
 pub(crate) struct TxDependency {
     // if txi <- txj, then tx_dependency[txj - num_finality_txs].push(txi)
     tx_dependency: Vec<DependentTxsVec>,
     // when a tx is in finality state, we don't need to store their dependencies
     num_finality_txs: usize,
+
     // After one round of transaction execution,
     // the running time can be obtained, which can make the next round of partitioning more balanced.
+    #[allow(dead_code)]
     tx_running_time: Option<Vec<u64>>,
+
     // Partitioning is balanced based on weights.
     // In the first round, weights can be assigned based on transaction type and called contract type,
     // while in the second round, weights can be assigned based on tx_running_time.
+    #[allow(dead_code)]
     tx_weight: Option<Vec<usize>>,
 }
 
 impl TxDependency {
-    pub fn new(num_txs: usize) -> Self {
+    pub(crate) fn new(num_txs: usize) -> Self {
         TxDependency {
             tx_dependency: vec![DependentTxsVec::new(); num_txs],
             num_finality_txs: 0,
@@ -36,7 +42,7 @@ impl TxDependency {
     pub fn init_tx_dependency(&mut self, tx_states: SharedTxStates) {
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
         for (txid, rw_set) in tx_states.iter().enumerate() {
-            let mut dependencies = &mut self.tx_dependency[txid];
+            let dependencies = &mut self.tx_dependency[txid];
             for location in rw_set.read_set.iter() {
                 if let Some(previous) = last_write_tx.get(location) {
                     dependencies.push(*previous);
@@ -48,7 +54,10 @@ impl TxDependency {
         }
     }
 
-    pub fn fetch_best_partitions(&mut self, partition_count: usize) -> Vec<Vec<TxId>> {
+    /// Retrieve the optimal partitions based on the dependency relationships between transactions.
+    /// This method uses a breadth-first traversal from back to front to group connected subgraphs,
+    /// and employs a greedy algorithm to allocate these groups into different partitions.
+    pub(crate) fn fetch_best_partitions(&mut self, partition_count: usize) -> Vec<Vec<TxId>> {
         let mut num_group = 0;
         let mut weighted_group: BTreeMap<usize, Vec<DependentTxsVec>> = BTreeMap::new();
         let tx_weight = self
@@ -64,7 +73,7 @@ impl TxDependency {
             vec![DependentTxsVec::new(); self.tx_dependency.len()];
         let mut is_related: Vec<bool> = vec![false; self.tx_dependency.len()];
         {
-            let mut single_groups = weighted_group.entry(RAW_TRANSFER_WEIGHT).or_default();
+            let single_groups = weighted_group.entry(RAW_TRANSFER_WEIGHT).or_default();
             for index in (0..self.tx_dependency.len()).rev() {
                 let txj = index + num_finality_txs;
                 let txj_dep = &self.tx_dependency[index];
@@ -139,7 +148,7 @@ impl TxDependency {
             if let Some(groups) = weighted_group.remove(&RAW_TRANSFER_WEIGHT) {
                 fork_join_util(groups.len(), Some(num_partitions), |start_pos, end_pos, part| {
                     #[allow(invalid_reference_casting)]
-                    let mut partition = unsafe {
+                    let partition = unsafe {
                         &mut *(&partitioned_group[part] as *const BTreeSet<TxId>
                             as *mut BTreeSet<TxId>)
                     };
@@ -172,7 +181,11 @@ impl TxDependency {
             .collect()
     }
 
-    pub fn update_tx_dependency(
+    /// Update the dependency relationship between transactions.
+    /// After each round of transaction execution, update the dependencies between transactions.
+    /// The new dependencies are used to optimize the partitioning for the next round of transactions,
+    /// ensuring that conflicting transactions can read the transactions they depend on.
+    pub(crate) fn update_tx_dependency(
         &mut self,
         tx_dependency: Vec<DependentTxsVec>,
         num_finality_txs: usize,

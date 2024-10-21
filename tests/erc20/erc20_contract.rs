@@ -12,17 +12,17 @@ const ERC20_TOKEN: &str = include_str!("./contracts/ERC20Token.hex");
 // $ forge inspect ERC20Token methods
 
 lazy_static! {
-    pub static ref ERC20_ALLLOWANCE: U256 = U256::from(0xdd62ed3e as i64);
-    pub static ref ERC20_APPROVE: U256 = U256::from(0x095ea7b3 as i64);
-    pub static ref ERC20_BALANCE_OF: U256 = U256::from(0x70a08231 as i64);
-    pub static ref ERC20_DECIMALS: U256 = U256::from(0x313ce567 as i64);
-    pub static ref ERC20_DECREASE_ALLOWANCE: U256 = U256::from(0xa457c2d7 as i64);
-    pub static ref ERC20_INCREASE_ALLOWANCE: U256 = U256::from(0x39509351 as i64);
-    pub static ref ERC20_NAME: U256 = U256::from(0x06fdde03 as i64);
-    pub static ref ERC20_SYMBOL: U256 = U256::from(0x95d89b41 as i64);
-    pub static ref ERC20_TOTAL_SUPPLY: U256 = U256::from(0x18160ddd as i64);
-    pub static ref ERC20_TRANSFER: U256 = U256::from(0xa9059cbb as i64);
-    pub static ref ERC20_TRANSFER_FROM: U256 = U256::from(0x23b872dd as i64);
+    pub static ref ERC20_ALLLOWANCE: U256 = U256::from(0xdd62ed3e_i64);
+    pub static ref ERC20_APPROVE: U256 = U256::from(0x095ea7b3_i64);
+    pub static ref ERC20_BALANCE_OF: U256 = U256::from(0x70a08231_i64);
+    pub static ref ERC20_DECIMALS: U256 = U256::from(0x313ce567_i64);
+    pub static ref ERC20_DECREASE_ALLOWANCE: U256 = U256::from(0xa457c2d7_i64);
+    pub static ref ERC20_INCREASE_ALLOWANCE: U256 = U256::from(0x39509351_i64);
+    pub static ref ERC20_NAME: U256 = U256::from(0x06fdde03_i64);
+    pub static ref ERC20_SYMBOL: U256 = U256::from(0x95d89b41_i64);
+    pub static ref ERC20_TOTAL_SUPPLY: U256 = U256::from(0x18160ddd_i64);
+    pub static ref ERC20_TRANSFER: U256 = U256::from(0xa9059cbb_i64);
+    pub static ref ERC20_TRANSFER_FROM: U256 = U256::from(0x23b872dd_i64);
 }
 
 // @risechain/op-test-bench/foundry/src/ERC20Token.sol
