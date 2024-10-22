@@ -17,6 +17,7 @@ use fastrace::collector::Config;
 use fastrace::prelude::*;
 use fastrace_jaeger::JaegerReporter;
 use grevm::GrevmScheduler;
+use rand::Rng;
 use revm::primitives::alloy_primitives::U160;
 use revm::primitives::{Address, Env, SpecId, TransactTo, TxEnv, U256};
 use std::collections::HashMap;
@@ -98,27 +99,52 @@ fn bench_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
     );
 }
 
-fn bench_dependent_raw_transfers(c: &mut Criterion, db_latency_us: u64, num_eoa: usize) {
+fn get_account_idx(num_eoa: usize, hot_start_idx: usize, hot_ratio: f64) -> usize {
+    if hot_ratio <= 0.0 {
+        // Uniform workload
+        rand::random::<usize>() % num_eoa
+    } else if rand::thread_rng().gen_range(0.0..1.0) < hot_ratio {
+        // Access hot
+        hot_start_idx + rand::random::<usize>() % (num_eoa - hot_start_idx)
+    } else {
+        rand::random::<usize>() % (num_eoa - hot_start_idx)
+    }
+}
+
+fn bench_dependent_raw_transfers(
+    c: &mut Criterion,
+    db_latency_us: u64,
+    num_eoa: usize,
+    hot_ratio: f64,
+) {
     let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
     let accounts = common::mock_block_accounts(common::START_ADDRESS, num_eoa);
     let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
     db.latency_us = db_latency_us;
+
+    // Let 10% of the accounts be hot accounts
+    let hot_start_idx = common::START_ADDRESS + (num_eoa as f64 * 0.9) as usize;
+
     bench(
         c,
         "Dependent Raw Transfers",
         db,
         (0..block_size)
-            .map(|_| TxEnv {
-                caller: Address::from(U160::from(
-                    common::START_ADDRESS + rand::random::<usize>() % num_eoa,
-                )),
-                transact_to: TransactTo::Call(Address::from(U160::from(
-                    common::START_ADDRESS + rand::random::<usize>() % num_eoa,
-                ))),
-                value: U256::from(1),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                ..TxEnv::default()
+            .map(|_| {
+                let from = Address::from(U160::from(
+                    common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                ));
+                let to = Address::from(U160::from(
+                    common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                ));
+                TxEnv {
+                    caller: from,
+                    transact_to: TransactTo::Call(to),
+                    value: U256::from(1),
+                    gas_limit: common::TRANSFER_GAS_LIMIT,
+                    gas_price: U256::from(1),
+                    ..TxEnv::default()
+                }
             })
             .collect::<Vec<_>>(),
     );
@@ -131,10 +157,11 @@ fn benchmark_gigagas(c: &mut Criterion) {
     // TODO(gravity): Create options from toml file if there are more
     let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);
     let num_eoa = std::env::var("NUM_EOA").map(|s| s.parse().unwrap()).unwrap_or(0);
+    let hot_ratio = std::env::var("HOT_RATIO").map(|s| s.parse().unwrap()).unwrap_or(0.0);
     bench_raw_transfers(c, db_latency_us);
-    bench_dependent_raw_transfers(c, db_latency_us, num_eoa);
+    bench_dependent_raw_transfers(c, db_latency_us, num_eoa, hot_ratio);
     benchmark_erc20(c, db_latency_us);
-    benchmark_dependent_erc20(c, db_latency_us, num_eoa);
+    benchmark_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
     bench_uniswap(c, db_latency_us);
 
     fastrace::flush();
@@ -165,7 +192,12 @@ fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
     bench(c, "Independent ERC20", db, txs);
 }
 
-fn benchmark_dependent_erc20(c: &mut Criterion, db_latency_us: u64, num_eoa: usize) {
+fn benchmark_dependent_erc20(
+    c: &mut Criterion,
+    db_latency_us: u64,
+    num_eoa: usize,
+    hot_ratio: f64,
+) {
     let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(num_eoa, 1);
     let miner = common::mock_miner_account();
@@ -173,14 +205,19 @@ fn benchmark_dependent_erc20(c: &mut Criterion, db_latency_us: u64, num_eoa: usi
     let mut txs = Vec::with_capacity(block_size);
     let sca = sca[0];
 
+    // Let 10% of the accounts be hot accounts
+    let hot_start_idx = common::START_ADDRESS + (num_eoa as f64 * 0.9) as usize;
+
     for _ in 0..block_size {
+        let from = eoa[get_account_idx(num_eoa, hot_start_idx, hot_ratio)];
+        let to = eoa[get_account_idx(num_eoa, hot_start_idx, hot_ratio)];
         let tx = TxEnv {
-            caller: eoa[rand::random::<usize>() % num_eoa],
+            caller: from,
             transact_to: TransactTo::Call(sca),
             value: U256::from(0),
             gas_limit: erc20::GAS_LIMIT,
             gas_price: U256::from(1),
-            data: ERC20Token::transfer(eoa[rand::random::<usize>() % num_eoa], U256::from(900)),
+            data: ERC20Token::transfer(to, U256::from(900)),
             ..TxEnv::default()
         };
         txs.push(tx);
