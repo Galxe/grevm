@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::hint::ParallelExecutionHints;
 use crate::partition::PartitionExecutor;
-use crate::storage::SchedulerDB;
+use crate::storage::{LazyUpdateValue, SchedulerDB};
 use crate::tx_dependency::{DependentTxsVec, TxDependency};
 use crate::{
     fork_join_util, GrevmError, LocationAndType, ResultAndTransition, TransactionStatus, TxId,
@@ -110,7 +110,7 @@ pub(crate) type LocationSet = HashSet<LocationAndType>;
 #[derive(Clone)]
 pub(crate) struct TxState {
     pub tx_status: TransactionStatus,
-    pub read_set: LocationSet,
+    pub read_set: HashMap<LocationAndType, Option<U256>>,
     pub write_set: LocationSet,
     pub execute_result: ResultAndTransition,
 }
@@ -119,7 +119,7 @@ impl TxState {
     pub(crate) fn new() -> Self {
         Self {
             tx_status: TransactionStatus::Initial,
-            read_set: HashSet::new(),
+            read_set: HashMap::new(),
             write_set: HashSet::new(),
             execute_result: ResultAndTransition::default(),
         }
@@ -386,7 +386,7 @@ where
                 let mut conflict = tx_states[txid].tx_status == TransactionStatus::Conflict;
                 let mut updated_dependencies = BTreeSet::new();
                 if txid >= end_skip_id {
-                    for location in tx_states[txid].read_set.iter() {
+                    for (location, _) in tx_states[txid].read_set.iter() {
                         if let Some(written_txs) = merged_write_set.get(location) {
                             if let Some(previous_txid) = written_txs.range(..txid).next_back() {
                                 // update dependencies: previous_txid <- txid
@@ -490,10 +490,10 @@ where
         #[allow(invalid_reference_casting)]
         let tx_states =
             unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
-        let mut rewards: u128 = 0;
+        let mut miner_updates = Vec::with_capacity(finality_tx_cnt);
         let start_txid = self.num_finality_txs - finality_tx_cnt;
         for txid in start_txid..self.num_finality_txs {
-            rewards += tx_states[txid].execute_result.rewards;
+            miner_updates.push(tx_states[txid].execute_result.miner_update.clone());
             database
                 .commit_transition(std::mem::take(&mut tx_states[txid].execute_result.transition));
             self.results.push(tx_states[txid].execute_result.result.clone().unwrap());
@@ -504,7 +504,7 @@ where
         // and track the rewards for the miner for each transaction separately.
         // The miner’s account is only updated after validation by SchedulerDB.increment_balances
         database
-            .increment_balances(vec![(self.coinbase, rewards)])
+            .update_balances(vec![(self.coinbase, LazyUpdateValue::merge(miner_updates))])
             .map_err(|err| GrevmError::EvmError(EVMError::Database(err)))?;
         self.metrics.commit_transition_time.increment(start.elapsed().as_nanos() as u64);
         Ok(())

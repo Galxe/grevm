@@ -4,7 +4,8 @@ use std::sync::Arc;
 use alloy_chains::NamedChain;
 use alloy_rpc_types::{Block, BlockTransactions};
 use common::{compat, storage::InMemoryDB};
-use grevm::GrevmScheduler;
+use grevm::{GrevmError, GrevmScheduler};
+use metrics_util::debugging::DebuggingRecorder;
 use revm::primitives::{Env, TxEnv};
 
 fn test_execute_alloy(block: Block, db: InMemoryDB) {
@@ -24,8 +25,18 @@ fn test_execute_alloy(block: Block, db: InMemoryDB) {
     let reth_result =
         common::execute_revm_sequential(db.clone(), spec_id, env.clone(), txs.clone());
 
-    let executor = GrevmScheduler::new(spec_id, env, db, txs);
-    let parallel_result = executor.parallel_execute();
+    // create registry for metrics
+    let recorder = DebuggingRecorder::new();
+    let mut parallel_result = Err(GrevmError::UnreachableError(String::from("Init")));
+    metrics::with_local_recorder(&recorder, || {
+        let executor = GrevmScheduler::new(spec_id, env, db, txs);
+        parallel_result = executor.parallel_execute();
+
+        let snapshot = recorder.snapshotter().snapshot();
+        for (key, unit, desc, value) in snapshot.into_vec() {
+            println!("metrics: {} => value: {:?}", key.key().name(), value);
+        }
+    });
 
     common::compare_execution_result(
         &reth_result.as_ref().unwrap().results,

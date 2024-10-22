@@ -8,6 +8,64 @@ use revm::{CacheState, Database, DatabaseRef, TransitionAccount, TransitionState
 use std::collections::{btree_map, hash_map, BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+/// LazyUpdateValue is used to update the balance of the miner's account.
+/// The miner's reward is calculated by subtracting the previous balance from the current balance.
+#[derive(Debug, Clone)]
+pub(crate) enum LazyUpdateValue {
+    Increase(u128, u64),
+    Decrease(u128, u64),
+}
+
+impl Default for LazyUpdateValue {
+    fn default() -> Self {
+        Self::Increase(0, 0)
+    }
+}
+
+/// Merge multiple LazyUpdateValue into one.
+impl LazyUpdateValue {
+    pub(crate) fn merge(values: Vec<Self>) -> Self {
+        let mut value: u128 = 0;
+        let mut positive: bool = true;
+        let mut nonce: u64 = 0;
+        for lazy_value in values {
+            match lazy_value {
+                Self::Increase(inc, add_nonce) => {
+                    nonce += add_nonce;
+                    if positive {
+                        value += inc;
+                    } else {
+                        if value > inc {
+                            value -= inc
+                        } else {
+                            value = inc - value;
+                            positive = true;
+                        }
+                    }
+                }
+                Self::Decrease(dec, add_nonce) => {
+                    nonce += add_nonce;
+                    if positive {
+                        if value > dec {
+                            value -= dec;
+                        } else {
+                            value = dec - value;
+                            positive = false;
+                        }
+                    } else {
+                        value += dec;
+                    }
+                }
+            }
+        }
+        if positive {
+            Self::Increase(value, nonce)
+        } else {
+            Self::Decrease(value, nonce)
+        }
+    }
+}
+
 /// SchedulerDB is a database wrapper that manages state transitions and caching for the EVM.
 /// It maintains a cache of committed data, a transition state for ongoing transactions, and a bundle state
 /// for finalizing block state changes. It also tracks block hashes for quick access.
@@ -45,7 +103,7 @@ pub(crate) struct SchedulerDB<DB> {
 impl<DB> SchedulerDB<DB> {
     pub(crate) fn new(database: DB) -> Self {
         Self {
-            cache: CacheState::default(),
+            cache: CacheState::new(false),
             database,
             transition_state: Some(TransitionState::default()),
             bundle_state: BundleState::default(),
@@ -106,22 +164,28 @@ where
 
     /// The miner's reward is calculated by subtracting the previous balance from the current balance.
     /// and should add to the miner's account after each round of execution for finality transactions.
-    pub(crate) fn increment_balances(
+    pub(crate) fn update_balances(
         &mut self,
-        balances: impl IntoIterator<Item = (Address, u128)>,
+        balances: impl IntoIterator<Item = (Address, LazyUpdateValue)>,
     ) -> Result<(), DB::Error> {
         // make transition and update cache state
         let mut transitions = Vec::new();
-        for (address, balance) in balances {
-            if balance == 0 {
-                continue;
-            }
-
+        for (address, update) in balances {
             let cache_account = self.load_cache_account(address)?;
-            transitions.push((
-                address,
-                cache_account.increment_balance(balance).expect("Balance is not zero"),
-            ))
+            let mut info = cache_account.account_info().unwrap_or_default();
+            let (new_balance, add_nonce) = match update {
+                LazyUpdateValue::Increase(value, nonce) => {
+                    (info.balance.saturating_add(U256::from(value)), nonce)
+                }
+                LazyUpdateValue::Decrease(value, nonce) => {
+                    (info.balance.saturating_sub(U256::from(value)), nonce)
+                }
+            };
+            if info.balance != new_balance || add_nonce != 0 {
+                info.balance = new_balance;
+                info.nonce += add_nonce;
+                transitions.push((address, cache_account.change(info, Default::default())));
+            }
         }
         // append transition
         if let Some(s) = self.transition_state.as_mut() {
@@ -280,34 +344,34 @@ pub(crate) struct PartitionDB<DB> {
     pub scheduler_db: Arc<SchedulerDB<DB>>,
     pub block_hashes: BTreeMap<u64, B256>,
 
-    /// Does the miner participate in the transaction
-    pub miner_involved: bool,
     /// Record the read set of current tx, will be consumed after the execution of each tx
-    tx_read_set: LocationSet,
+    tx_read_set: HashMap<LocationAndType, Option<U256>>,
 }
 
 impl<DB> PartitionDB<DB> {
     pub(crate) fn new(coinbase: Address, scheduler_db: Arc<SchedulerDB<DB>>) -> Self {
         Self {
             coinbase,
-            cache: CacheState::default(),
+            cache: CacheState::new(false),
             scheduler_db,
             block_hashes: BTreeMap::new(),
-            miner_involved: false,
-            tx_read_set: HashSet::new(),
+            tx_read_set: HashMap::new(),
         }
     }
 
     /// consume the read set after evm.transact() for each tx
-    pub(crate) fn take_read_set(&mut self) -> LocationSet {
+    pub(crate) fn take_read_set(&mut self) -> HashMap<LocationAndType, Option<U256>> {
         core::mem::take(&mut self.tx_read_set)
     }
 
     /// Generate the write set after evm.transact() for each tx
     /// The write set includes the locations of the basic account, code, and storage slots that have been modified.
     /// Returns the write set(exclude miner) and the miner's rewards.
-    pub(crate) fn generate_write_set(&self, changes: &EvmState) -> (LocationSet, Option<u128>) {
-        let mut rewards: Option<u128> = None;
+    pub(crate) fn generate_write_set(
+        &self,
+        changes: &EvmState,
+    ) -> (LocationSet, Option<LazyUpdateValue>) {
+        let mut miner_update: Option<LazyUpdateValue> = None;
         let mut write_set = HashSet::new();
         for (address, account) in changes {
             if account.is_selfdestructed() {
@@ -321,19 +385,31 @@ impl<DB> PartitionDB<DB> {
                 continue;
             }
 
+            // Lazy update miner's balance
             let mut miner_updated = false;
-            // When fully tracking the updates to the miner’s account,
-            // we should set rewards = 0
-            if self.coinbase == *address && !self.miner_involved {
+            if self.coinbase == *address {
                 match self.cache.accounts.get(address) {
                     Some(miner) => match miner.account.as_ref() {
                         Some(miner) => {
-                            rewards = Some((account.info.balance - miner.info.balance).to());
+                            if account.info.balance >= miner.info.balance {
+                                miner_update = Some(LazyUpdateValue::Increase(
+                                    (account.info.balance - miner.info.balance).to(),
+                                    account.info.nonce - miner.info.nonce,
+                                ));
+                            } else {
+                                miner_update = Some(LazyUpdateValue::Decrease(
+                                    (miner.info.balance - account.info.balance).to(),
+                                    account.info.nonce - miner.info.nonce,
+                                ));
+                            }
                             miner_updated = true;
                         }
                         // LoadedNotExisting
                         None => {
-                            rewards = Some(account.info.balance.to());
+                            miner_update = Some(LazyUpdateValue::Increase(
+                                account.info.balance.to(),
+                                account.info.nonce,
+                            ));
                             miner_updated = true;
                         }
                     },
@@ -377,7 +453,7 @@ impl<DB> PartitionDB<DB> {
                 write_set.insert(LocationAndType::Storage(*address, *slot));
             }
         }
-        (write_set, rewards)
+        (write_set, miner_update)
     }
 
     /// Temporary commit the state change after evm.transact() for each tx
@@ -397,6 +473,47 @@ impl<DB> PartitionDB<DB> {
     }
 }
 
+impl<DB> PartitionDB<DB>
+where
+    DB: DatabaseRef,
+{
+    /// If the read set is consistent with the read set of the previous round of execution,
+    /// We can reuse the results of the previous round of execution, and no need to re-execute the transaction.
+    pub(crate) fn check_read_set(
+        &mut self,
+        read_set: &HashMap<LocationAndType, Option<U256>>,
+    ) -> bool {
+        let mut visit_account = HashSet::new();
+        for (location, _) in read_set {
+            match location {
+                LocationAndType::Basic(address) => {
+                    if !visit_account.contains(address) {
+                        let _ = self.basic(address.clone());
+                        visit_account.insert(address.clone());
+                    }
+                }
+                LocationAndType::Storage(address, index) => {
+                    // If the account is not loaded, we need to load it from the database.
+                    if !visit_account.contains(address) {
+                        let _ = self.basic(address.clone());
+                        visit_account.insert(address.clone());
+                    }
+                    let _ = self.storage(address.clone(), index.clone());
+                }
+                _ => {}
+            }
+        }
+        let new_read_set = self.take_read_set();
+        if new_read_set.len() != read_set.len() {
+            false
+        } else {
+            new_read_set
+                .iter()
+                .all(|(key, value)| read_set.get(key).map_or(false, |v| *value == *v))
+        }
+    }
+}
+
 /// Used to build evm, and hook the read operations
 impl<DB> Database for PartitionDB<DB>
 where
@@ -405,10 +522,6 @@ where
     type Error = DB::Error;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if address != self.coinbase || self.miner_involved {
-            self.tx_read_set.insert(LocationAndType::Basic(address));
-        }
-
         // 1. read from internal cache
         let result = match self.cache.accounts.entry(address) {
             hash_map::Entry::Vacant(entry) => {
@@ -423,12 +536,17 @@ where
             }
             hash_map::Entry::Occupied(entry) => Ok(entry.get().account_info()),
         };
+        let mut balance = None;
         if let Ok(account) = &result {
             if let Some(info) = account {
                 if !info.is_empty_code_hash() {
-                    self.tx_read_set.insert(LocationAndType::Code(address));
+                    self.tx_read_set.insert(LocationAndType::Code(address), None);
                 }
+                balance = Some(info.balance);
             }
+        }
+        if address != self.coinbase {
+            self.tx_read_set.insert(LocationAndType::Basic(address), balance);
         }
         result
     }
@@ -455,9 +573,14 @@ where
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        self.tx_read_set.insert(LocationAndType::Storage(address, index));
+        let result = load_storage(&mut self.cache, &self.scheduler_db.database, address, index);
+        let mut slot_value = None;
+        if let Ok(value) = &result {
+            slot_value = Some(value.clone());
+        }
+        self.tx_read_set.insert(LocationAndType::Storage(address, index), slot_value);
 
-        load_storage(&mut self.cache, &self.scheduler_db.database, address, index)
+        result
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {

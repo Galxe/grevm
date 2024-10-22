@@ -85,29 +85,11 @@ where
         }
     }
 
-    /// Check if there are unconfirmed transactions in the current partition
-    /// If there are unconfirmed transactions,
-    /// the update_write_set will be used to determine whether the transaction needs to be rerun
-    fn has_unconfirmed_tx(tx_states: &Vec<TxState>, assigned_txs: &Vec<TxId>) -> bool {
-        // If the first transaction is not executed, it means that the partition has not been executed
-        if tx_states[0].tx_status == TransactionStatus::Initial {
-            return false;
-        }
-        for txid in assigned_txs {
-            if tx_states[*txid].tx_status == TransactionStatus::Unconfirmed {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Execute transactions in the partition
     /// The transactions are executed optimistically, and their read and write sets are recorded after execution.
     /// The final state of a transaction is determined by the scheduler's validation process.
     pub(crate) fn execute(&mut self) {
         let start = Instant::now();
-        // the update_write_set is used to determine whether the transaction needs to be rerun
-        let mut update_write_set: HashSet<LocationAndType> = HashSet::new();
         let mut evm = EvmBuilder::default()
             .with_db(&mut self.partition_db)
             .with_spec_id(self.spec_id)
@@ -118,37 +100,19 @@ where
         let tx_states =
             unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
 
-        let has_unconfirmed_tx = Self::has_unconfirmed_tx(tx_states, &self.assigned_txs);
         for txid in &self.assigned_txs {
             let txid = *txid;
 
-            // Miner is handled separately for each transaction
-            // However, if the miner is involved in the transaction
-            // we have to fully track the updates of this transaction to make sure the miner's account is updated correctly
-            let mut miner_involved = false;
             if let Some(tx) = self.txs.get(txid) {
                 *evm.tx_mut() = tx.clone();
-                if self.coinbase == tx.caller {
-                    miner_involved = true;
-                }
-                if let TxKind::Call(to) = tx.transact_to {
-                    if self.coinbase == to {
-                        miner_involved = true;
-                    }
-                }
             } else {
                 panic!("Wrong transactions ID");
             }
             // If the transaction is unconfirmed, it may not require repeated execution
             let mut should_execute = true;
             if tx_states[txid].tx_status == TransactionStatus::Unconfirmed {
-                // Unconfirmed transactions from the previous round might not need to be re-executed.
-                // The verification process is as follows:
-                // 1. Create an update_write_set to store the write sets of previous conflicting transactions.
-                // 2. If an unconfirmed transaction is re-executed, add its write set to update_write_set.
-                // 3. When processing an unconfirmed transaction, join its previous round's read set with update_write_set.
-                // 4. If there is no intersection, the unconfirmed transaction does not need to be re-executed; otherwise, it does.
-                if tx_states[txid].read_set.is_disjoint(&update_write_set) {
+                if evm.db_mut().check_read_set(&tx_states[txid].read_set) {
+                    // Unconfirmed transactions from the previous round might not need to be re-executed.
                     let transition = &tx_states[txid].execute_result.transition;
                     evm.db_mut().temporary_commit_transition(transition);
                     should_execute = false;
@@ -157,32 +121,25 @@ where
                 }
             }
             if should_execute {
-                evm.db_mut().miner_involved = miner_involved;
                 let result = evm.transact();
                 match result {
                     Ok(result_and_state) => {
                         let read_set = evm.db_mut().take_read_set();
-                        let (write_set, rewards) =
+                        let (write_set, miner_update) =
                             evm.db().generate_write_set(&result_and_state.state);
-                        if has_unconfirmed_tx {
-                            update_write_set.extend(write_set.clone().into_iter());
-                        }
 
                         // Check if the transaction can be skipped
                         // skip_validation=true does not necessarily mean the transaction can skip validation.
                         // Only transactions with consecutive minimum TxID can skip validation.
                         // This is because if a transaction with a smaller TxID conflicts,
                         // the states of subsequent transactions are invalid.
-                        let mut skip_validation = true;
-                        if !read_set.is_subset(&tx_states[txid].read_set) {
-                            skip_validation = false;
-                        }
-                        if skip_validation && !write_set.is_subset(&tx_states[txid].write_set) {
-                            skip_validation = false;
-                        }
+                        let mut skip_validation =
+                            read_set.iter().all(|l| tx_states[txid].read_set.contains_key(l.0));
+                        skip_validation &=
+                            write_set.iter().all(|l| tx_states[txid].write_set.contains(l));
 
                         let ResultAndState { result, mut state } = result_and_state;
-                        if rewards.is_some() {
+                        if miner_update.is_some() {
                             // remove miner's state if we handle rewards separately
                             state.remove(&self.coinbase);
                         }
@@ -199,7 +156,7 @@ where
                             execute_result: ResultAndTransition {
                                 result: Some(result),
                                 transition,
-                                rewards: rewards.unwrap_or(0),
+                                miner_update: miner_update.unwrap_or_default(),
                             },
                         };
                     }
@@ -214,10 +171,10 @@ where
                         let mut read_set = evm.db_mut().take_read_set();
                         // update write set with the caller and transact_to
                         let mut write_set = HashSet::new();
-                        read_set.insert(LocationAndType::Basic(evm.tx().caller));
+                        read_set.insert(LocationAndType::Basic(evm.tx().caller), None);
                         write_set.insert(LocationAndType::Basic(evm.tx().caller));
                         if let TxKind::Call(to) = evm.tx().transact_to {
-                            read_set.insert(LocationAndType::Basic(to));
+                            read_set.insert(LocationAndType::Basic(to), None);
                             write_set.insert(LocationAndType::Basic(to));
                         }
 

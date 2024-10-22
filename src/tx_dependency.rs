@@ -43,7 +43,7 @@ impl TxDependency {
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
         for (txid, rw_set) in tx_states.iter().enumerate() {
             let dependencies = &mut self.tx_dependency[txid];
-            for location in rw_set.read_set.iter() {
+            for (location, _) in rw_set.read_set.iter() {
                 if let Some(previous) = last_write_tx.get(location) {
                     dependencies.push(*previous);
                 }
