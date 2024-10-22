@@ -5,30 +5,22 @@ use contract::{SingleSwap, SwapRouter, UniswapV3Factory, UniswapV3Pool, WETH9};
 use revm::db::PlainAccount;
 use revm::interpreter::analysis::to_analysed;
 use revm::primitives::{
-    fixed_bytes, uint, AccountInfo, Address, Bytecode, Bytes, TransactTo, TxEnv, B256, U256,
+    uint, AccountInfo, Address, Bytecode, Bytes, HashMap, TransactTo, TxEnv, B256, U256,
 };
-use std::collections::HashMap;
 
 pub const GAS_LIMIT: u64 = 200_000;
 pub const ESTIMATED_GAS_USED: u64 = 155_934;
 
-pub fn generate_cluster(
-    num_people: usize,
-    num_swaps_per_person: usize,
-) -> (HashMap<Address, PlainAccount>, HashMap<B256, Bytecode>, Vec<TxEnv>) {
-    // TODO: Better randomness control. Sometimes we want duplicates to test
-    // dependent transactions, sometimes we want to guarantee non-duplicates
-    // for independent benchmarks.
-    let people_addresses: Vec<Address> =
-        (0..num_people).map(|_| Address::new(rand::random())).collect();
-
-    // make sure dai_address < usdc_address
+/// Return a tuple of (contract_accounts, bytecodes, single_swap_address)
+/// `single_swap_address` is the entrance of the contract.
+pub(crate) fn generate_contract_accounts(
+    eoa_addresses: &[Address],
+) -> (Vec<(Address, PlainAccount)>, HashMap<B256, Bytecode>, Address) {
     let (dai_address, usdc_address) = {
         let x = Address::new(rand::random());
         let y = Address::new(rand::random());
         (std::cmp::min(x, y), std::cmp::max(x, y))
     };
-
     let pool_init_code_hash = B256::new(rand::random());
     let swap_router_address = Address::new(rand::random());
     let single_swap_address = Address::new(rand::random());
@@ -43,22 +35,14 @@ pub fn generate_cluster(
 
     let dai_account = ERC20Token::new("DAI", "DAI", 18, 222_222_000_000_000_000_000_000u128)
         .add_balances(&[pool_address], uint!(111_111_000_000_000_000_000_000_U256))
-        .add_balances(&people_addresses, uint!(1_000_000_000_000_000_000_U256))
-        .add_allowances(
-            &people_addresses,
-            single_swap_address,
-            uint!(1_000_000_000_000_000_000_U256),
-        )
+        .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
+        .add_allowances(&eoa_addresses, single_swap_address, uint!(1_000_000_000_000_000_000_U256))
         .build();
 
     let usdc_account = ERC20Token::new("USDC", "USDC", 18, 222_222_000_000_000_000_000_000u128)
         .add_balances(&[pool_address], uint!(111_111_000_000_000_000_000_000_U256))
-        .add_balances(&people_addresses, uint!(1_000_000_000_000_000_000_U256))
-        .add_allowances(
-            &people_addresses,
-            single_swap_address,
-            uint!(1_000_000_000_000_000_000_U256),
-        )
+        .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
+        .add_allowances(&eoa_addresses, single_swap_address, uint!(1_000_000_000_000_000_000_U256))
         .build();
 
     let factory_account = UniswapV3Factory::new(owner)
@@ -103,14 +87,40 @@ pub fn generate_cluster(
     let single_swap_account =
         SingleSwap::new(swap_router_address, dai_address, usdc_address).build();
 
-    let mut state = HashMap::new();
-    state.insert(weth9_address, weth9_account);
-    state.insert(dai_address, dai_account);
-    state.insert(usdc_address, usdc_account);
-    state.insert(factory_address, factory_account);
-    state.insert(pool_address, pool_account);
-    state.insert(swap_router_address, swap_router_account);
-    state.insert(single_swap_address, single_swap_account);
+    let mut accounts = Vec::new();
+    accounts.push((weth9_address, weth9_account));
+    accounts.push((dai_address, dai_account));
+    accounts.push((usdc_address, usdc_account));
+    accounts.push((factory_address, factory_account));
+    accounts.push((pool_address, pool_account));
+    accounts.push((swap_router_address, swap_router_account));
+    accounts.push((single_swap_address, single_swap_account));
+
+    let mut bytecodes = HashMap::new();
+    for (_, account) in accounts.iter_mut() {
+        let code = account.info.code.take();
+        if let Some(code) = code {
+            let code = to_analysed(code);
+            bytecodes.insert(account.info.code_hash, code);
+        }
+    }
+
+    (accounts, bytecodes, single_swap_address)
+}
+
+pub fn generate_cluster(
+    num_people: usize,
+    num_swaps_per_person: usize,
+) -> (HashMap<Address, PlainAccount>, HashMap<B256, Bytecode>, Vec<TxEnv>) {
+    // TODO: Better randomness control. Sometimes we want duplicates to test
+    // dependent transactions, sometimes we want to guarantee non-duplicates
+    // for independent benchmarks.
+    let people_addresses: Vec<Address> =
+        (0..num_people).map(|_| Address::new(rand::random())).collect();
+
+    let (contract_accounts, bytecodes, single_swap_address) =
+        generate_contract_accounts(&people_addresses);
+    let mut state: HashMap<Address, PlainAccount> = contract_accounts.into_iter().collect();
 
     for person in people_addresses.iter() {
         state.insert(
@@ -127,27 +137,13 @@ pub fn generate_cluster(
 
     let mut txs = Vec::new();
 
-    // sellToken0(uint256): c92b0891
-    // sellToken1(uint256): 6b055260
-    // buyToken0(uint256,uint256): 8dc33f82
-    // buyToken1(uint256,uint256): b2db18a2
     for nonce in 0..num_swaps_per_person {
         for person in people_addresses.iter() {
-            let data_bytes: Vec<u8> = match nonce % 4 {
-                0 => [&fixed_bytes!("c92b0891")[..], &B256::from(U256::from(2000))[..]].concat(),
-                1 => [&fixed_bytes!("6b055260")[..], &B256::from(U256::from(2000))[..]].concat(),
-                2 => [
-                    &fixed_bytes!("8dc33f82")[..],
-                    &B256::from(U256::from(1000))[..],
-                    &B256::from(U256::from(2000))[..],
-                ]
-                .concat(),
-                3 => [
-                    &fixed_bytes!("b2db18a2")[..],
-                    &B256::from(U256::from(1000))[..],
-                    &B256::from(U256::from(2000))[..],
-                ]
-                .concat(),
+            let data_bytes = match nonce % 4 {
+                0 => SingleSwap::sell_token0(U256::from(2000)),
+                1 => SingleSwap::sell_token1(U256::from(2000)),
+                2 => SingleSwap::buy_token0(U256::from(1000), U256::from(2000)),
+                3 => SingleSwap::buy_token1(U256::from(1000), U256::from(2000)),
                 _ => Default::default(),
             };
 
@@ -160,15 +156,6 @@ pub fn generate_cluster(
                 nonce: Some(nonce as u64),
                 ..TxEnv::default()
             })
-        }
-    }
-
-    let mut bytecodes = HashMap::default();
-    for account in state.values_mut() {
-        let code = account.info.code.take();
-        if let Some(code) = code {
-            let code = to_analysed(code);
-            bytecodes.insert(account.info.code_hash, code);
         }
     }
 

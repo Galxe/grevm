@@ -10,6 +10,7 @@ pub mod erc20;
 pub mod uniswap;
 
 use crate::erc20::erc20_contract::ERC20Token;
+use crate::uniswap::contract::SingleSwap;
 use alloy_chains::NamedChain;
 use common::storage::InMemoryDB;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -163,6 +164,7 @@ fn benchmark_gigagas(c: &mut Criterion) {
     benchmark_erc20(c, db_latency_us);
     benchmark_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
     bench_uniswap(c, db_latency_us);
+    bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
 
     fastrace::flush();
 }
@@ -242,6 +244,96 @@ fn bench_uniswap(c: &mut Criterion, db_latency_us: u64) {
     let mut db = InMemoryDB::new(final_state, final_bytecodes, Default::default());
     db.latency_us = db_latency_us;
     bench(c, "Independent Uniswap", db, final_txs);
+}
+
+fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {
+    // 60% native transfer, 20% erc20 transfer, 20% uniswap
+    let num_native_transfer =
+        (GIGA_GAS as f64 * 0.6 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
+    let num_erc20_transfer =
+        (GIGA_GAS as f64 * 0.2 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
+    let num_uniswap = (GIGA_GAS as f64 * 0.2 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
+
+    // Let 10% of the accounts be hot accounts
+    let hot_start_idx = common::START_ADDRESS + (num_eoa as f64 * 0.9) as usize;
+    let mut state = common::mock_block_accounts(common::START_ADDRESS, num_eoa);
+    let eoa_addresses = state.keys().cloned().collect::<Vec<_>>();
+    let mut txs = Vec::with_capacity(num_native_transfer + num_erc20_transfer + num_uniswap);
+
+    for _ in 0..num_native_transfer {
+        let from = Address::from(U160::from(
+            common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+        ));
+        let to = Address::from(U160::from(
+            common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+        ));
+        let tx = TxEnv {
+            caller: from,
+            transact_to: TransactTo::Call(to),
+            value: U256::from(1),
+            gas_limit: common::TRANSFER_GAS_LIMIT,
+            gas_price: U256::from(1),
+            ..TxEnv::default()
+        };
+        txs.push(tx);
+    }
+
+    const NUM_ERC20_SCA: usize = 3;
+    let (erc20_contract_accounts, erc20_bytecodes) =
+        erc20::generate_contract_accounts(NUM_ERC20_SCA, &eoa_addresses);
+    for (sca_addr, _) in erc20_contract_accounts.iter() {
+        for _ in 0..(num_erc20_transfer / NUM_ERC20_SCA) {
+            let from = Address::from(U160::from(
+                common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+            ));
+            let to = Address::from(U160::from(
+                common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+            ));
+            let tx = TxEnv {
+                caller: from,
+                transact_to: TransactTo::Call(*sca_addr),
+                value: U256::from(0),
+                gas_limit: erc20::GAS_LIMIT,
+                gas_price: U256::from(1),
+                data: ERC20Token::transfer(to, U256::from(900)),
+                ..TxEnv::default()
+            };
+            txs.push(tx);
+        }
+    }
+    state.extend(erc20_contract_accounts.into_iter());
+
+    let mut bytecodes = erc20_bytecodes;
+    const NUM_UNISWAP_CLUSTER: usize = 2;
+    for _ in 0..NUM_UNISWAP_CLUSTER {
+        let (uniswap_contract_accounts, uniswap_bytecodes, single_swap_address) =
+            uniswap::generate_contract_accounts(&eoa_addresses);
+        state.extend(uniswap_contract_accounts);
+        bytecodes.extend(uniswap_bytecodes);
+        for _ in 0..(num_uniswap / NUM_UNISWAP_CLUSTER) {
+            let data_bytes = if rand::random::<u64>() % 2 == 0 {
+                SingleSwap::sell_token0(U256::from(2000))
+            } else {
+                SingleSwap::sell_token1(U256::from(2000))
+            };
+
+            txs.push(TxEnv {
+                caller: Address::from(U160::from(
+                    common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                )),
+                gas_limit: uniswap::GAS_LIMIT,
+                gas_price: U256::from(0xb2d05e07u64),
+                transact_to: TransactTo::Call(single_swap_address),
+                data: data_bytes,
+                ..TxEnv::default()
+            })
+        }
+    }
+
+    let mut db = InMemoryDB::new(state, bytecodes, Default::default());
+    db.latency_us = db_latency_us;
+
+    bench(c, "Hybrid", db, txs);
 }
 
 criterion_group!(benches, benchmark_gigagas);

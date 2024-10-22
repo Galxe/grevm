@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use revm::db::{DbAccount, PlainAccount};
+use revm::interpreter::analysis::to_analysed;
 use revm::primitives::{uint, AccountInfo, Address, Bytecode, TransactTo, TxEnv, B256, U256};
 
 use crate::erc20::erc20_contract::ERC20Token;
@@ -128,7 +129,7 @@ pub fn generate_erc20_batch(
     txns
 }
 
-/// Return a tuple of (state, bytecodes, eoa_address, sca_address)
+/// Return a tuple of (state, bytecodes, eoa_addresses, sca_addresses)
 pub fn generate_cluster(
     num_eoa: usize,
     num_sca: usize,
@@ -149,23 +150,14 @@ pub fn generate_cluster(
         );
     }
 
-    let mut bytecodes = HashMap::new();
-    let mut erc20_sca: Vec<PlainAccount> = Vec::new();
-    let mut erc20_sca_address: Vec<Address> = Vec::new();
-    for _ in 0..num_sca {
-        let gld_address = Address::new(rand::random());
-        erc20_sca_address.push(gld_address);
-
-        let mut gld_account =
-            ERC20Token::new("Gold Token", "GLD", 18, 222_222_000_000_000_000_000_000u128)
-                .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
-                .build();
-        erc20_sca.push(gld_account.clone());
-        bytecodes.insert(gld_account.info.code_hash, gld_account.info.code.take().unwrap());
-        state.insert(gld_address, gld_account);
+    let (contract_accounts, bytecodes) = generate_contract_accounts(num_sca, &eoa_addresses);
+    let mut erc20_sca_addresses = Vec::with_capacity(num_sca);
+    for (addr, sca) in contract_accounts {
+        state.insert(addr, sca);
+        erc20_sca_addresses.push(addr);
     }
 
-    (state, bytecodes, eoa_addresses, erc20_sca_address)
+    (state, bytecodes, eoa_addresses, erc20_sca_addresses)
 }
 
 pub fn generate_cluster_and_txs(
@@ -181,4 +173,24 @@ pub fn generate_cluster_and_txs(
         txn_batch_config.transaction_mode_type,
     );
     (state, bytecodes, txs)
+}
+
+/// Return a tuple of (contract_accounts, bytecodes)
+pub(crate) fn generate_contract_accounts(
+    num_sca: usize,
+    eoa_addresses: &[Address],
+) -> (Vec<(Address, PlainAccount)>, HashMap<B256, Bytecode>) {
+    let mut accounts = Vec::with_capacity(num_sca);
+    let mut bytecodes = HashMap::new();
+    for _ in 0..num_sca {
+        let gld_address = Address::new(rand::random());
+        let mut gld_account =
+            ERC20Token::new("Gold Token", "GLD", 18, 222_222_000_000_000_000_000_000u128)
+                .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
+                .build();
+        bytecodes
+            .insert(gld_account.info.code_hash, to_analysed(gld_account.info.code.take().unwrap()));
+        accounts.push((gld_address, gld_account));
+    }
+    (accounts, bytecodes)
 }
