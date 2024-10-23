@@ -1,3 +1,6 @@
 [submodule "test_data"]
 	path = test_data
 	url = https://github.com/Galxe/grevm-test-data
+[submodule "tests/ethereum/tests"]
+	path = tests/ethereum/tests
+	url = https://github.com/ethereum/tests.git

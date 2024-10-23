@@ -30,7 +30,7 @@ fn test_execute_alloy(block: Block, db: InMemoryDB) {
     let mut parallel_result = Err(GrevmError::UnreachableError(String::from("Init")));
     metrics::with_local_recorder(&recorder, || {
         let executor = GrevmScheduler::new(spec_id, env, db, txs);
-        parallel_result = executor.parallel_execute();
+        parallel_result = executor.force_parallel_execute(true, Some(23));
 
         let snapshot = recorder.snapshotter().snapshot();
         for (key, unit, desc, value) in snapshot.into_vec() {
