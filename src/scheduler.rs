@@ -19,6 +19,7 @@ use revm::primitives::{
     AccountInfo, Address, Bytecode, EVMError, Env, ExecutionResult, SpecId, TxEnv, B256, U256,
 };
 use revm::{CacheState, DatabaseRef, EvmBuilder};
+use tracing::info;
 
 struct ExecuteMetrics {
     /// Number of times parallel execution is called.
@@ -233,6 +234,7 @@ where
         let coinbase = env.block.coinbase;
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
         let num_txs = txs.len();
+        info!("Parallel execute {} txs of SpecId {:?}", num_txs, spec_id);
         Self {
             spec_id,
             env,
@@ -463,6 +465,10 @@ where
         self.metrics.conflict_tx_cnt.increment(conflict_tx_cnt as u64);
         self.metrics.unconfirmed_tx_cnt.increment(unconfirmed_tx_cnt as u64);
         self.metrics.finality_tx_cnt.increment(finality_tx_cnt as u64);
+        info!(
+            "Find continuous finality txs: conflict({}), unconfirmed({}), finality({})",
+            conflict_tx_cnt, unconfirmed_tx_cnt, finality_tx_cnt
+        );
         return Ok(finality_tx_cnt);
     }
 
@@ -641,6 +647,7 @@ where
         }
 
         if self.num_finality_txs < self.txs.len() {
+            info!("Sequential execute {} remaining txs", self.txs.len() - self.num_finality_txs);
             self.execute_remaining_sequential()?;
         }
 

@@ -12,13 +12,13 @@ use std::sync::Arc;
 /// The miner's reward is calculated by subtracting the previous balance from the current balance.
 #[derive(Debug, Clone)]
 pub(crate) enum LazyUpdateValue {
-    Increase(u128, u64),
-    Decrease(u128, u64),
+    Increase(u128),
+    Decrease(u128),
 }
 
 impl Default for LazyUpdateValue {
     fn default() -> Self {
-        Self::Increase(0, 0)
+        Self::Increase(0)
     }
 }
 
@@ -27,11 +27,9 @@ impl LazyUpdateValue {
     pub(crate) fn merge(values: Vec<Self>) -> Self {
         let mut value: u128 = 0;
         let mut positive: bool = true;
-        let mut nonce: u64 = 0;
         for lazy_value in values {
             match lazy_value {
-                Self::Increase(inc, add_nonce) => {
-                    nonce += add_nonce;
+                Self::Increase(inc) => {
                     if positive {
                         value += inc;
                     } else {
@@ -43,8 +41,7 @@ impl LazyUpdateValue {
                         }
                     }
                 }
-                Self::Decrease(dec, add_nonce) => {
-                    nonce += add_nonce;
+                Self::Decrease(dec) => {
                     if positive {
                         if value > dec {
                             value -= dec;
@@ -59,9 +56,9 @@ impl LazyUpdateValue {
             }
         }
         if positive {
-            Self::Increase(value, nonce)
+            Self::Increase(value)
         } else {
-            Self::Decrease(value, nonce)
+            Self::Decrease(value)
         }
     }
 }
@@ -173,17 +170,12 @@ where
         for (address, update) in balances {
             let cache_account = self.load_cache_account(address)?;
             let mut info = cache_account.account_info().unwrap_or_default();
-            let (new_balance, add_nonce) = match update {
-                LazyUpdateValue::Increase(value, nonce) => {
-                    (info.balance.saturating_add(U256::from(value)), nonce)
-                }
-                LazyUpdateValue::Decrease(value, nonce) => {
-                    (info.balance.saturating_sub(U256::from(value)), nonce)
-                }
+            let new_balance = match update {
+                LazyUpdateValue::Increase(value) => info.balance.saturating_add(U256::from(value)),
+                LazyUpdateValue::Decrease(value) => info.balance.saturating_sub(U256::from(value)),
             };
-            if info.balance != new_balance || add_nonce != 0 {
+            if info.balance != new_balance {
                 info.balance = new_balance;
-                info.nonce += add_nonce;
                 transitions.push((address, cache_account.change(info, Default::default())));
             }
         }
@@ -369,11 +361,12 @@ impl<DB> PartitionDB<DB> {
     /// Returns the write set(exclude miner) and the miner's rewards.
     pub(crate) fn generate_write_set(
         &self,
-        changes: &EvmState,
-    ) -> (LocationSet, Option<LazyUpdateValue>) {
-        let mut miner_update: Option<LazyUpdateValue> = None;
+        changes: &mut EvmState,
+    ) -> (LocationSet, LazyUpdateValue, bool) {
+        let mut miner_update = LazyUpdateValue::default();
+        let mut remove_miner = true;
         let mut write_set = HashSet::new();
-        for (address, account) in changes {
+        for (address, account) in &mut *changes {
             if account.is_selfdestructed() {
                 write_set.insert(LocationAndType::Code(*address));
                 // When a contract account is destroyed, its remaining balance is sent to a
@@ -388,33 +381,32 @@ impl<DB> PartitionDB<DB> {
             // Lazy update miner's balance
             let mut miner_updated = false;
             if self.coinbase == *address {
-                match self.cache.accounts.get(address) {
+                let add_nonce = match self.cache.accounts.get(address) {
                     Some(miner) => match miner.account.as_ref() {
                         Some(miner) => {
                             if account.info.balance >= miner.info.balance {
-                                miner_update = Some(LazyUpdateValue::Increase(
+                                miner_update = LazyUpdateValue::Increase(
                                     (account.info.balance - miner.info.balance).to(),
-                                    account.info.nonce - miner.info.nonce,
-                                ));
+                                );
                             } else {
-                                miner_update = Some(LazyUpdateValue::Decrease(
+                                miner_update = LazyUpdateValue::Decrease(
                                     (miner.info.balance - account.info.balance).to(),
-                                    account.info.nonce - miner.info.nonce,
-                                ));
+                                );
                             }
-                            miner_updated = true;
+                            account.info.balance = miner.info.balance;
+                            account.info.nonce - miner.info.nonce
                         }
                         // LoadedNotExisting
                         None => {
-                            miner_update = Some(LazyUpdateValue::Increase(
-                                account.info.balance.to(),
-                                account.info.nonce,
-                            ));
-                            miner_updated = true;
+                            miner_update = LazyUpdateValue::Increase(account.info.balance.to());
+                            account.info.balance = U256::ZERO;
+                            account.info.nonce
                         }
                     },
                     None => panic!("Miner should be cached"),
-                }
+                };
+                miner_updated = true;
+                remove_miner = add_nonce == 0 && account.changed_storage_slots().count() == 0;
             }
 
             // If the account is touched, it means that the account's state has been modified
@@ -453,7 +445,7 @@ impl<DB> PartitionDB<DB> {
                 write_set.insert(LocationAndType::Storage(*address, *slot));
             }
         }
-        (write_set, miner_update)
+        (write_set, miner_update, remove_miner)
     }
 
     /// Temporary commit the state change after evm.transact() for each tx

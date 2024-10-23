@@ -34,8 +34,9 @@ where
 {
     spec_id: SpecId,
     env: Env,
-    coinbase: Address,
 
+    #[allow(dead_code)]
+    coinbase: Address,
     #[allow(dead_code)]
     partition_id: PartitionId,
 
@@ -124,9 +125,10 @@ where
                 let result = evm.transact();
                 match result {
                     Ok(result_and_state) => {
-                        let read_set = evm.db_mut().take_read_set();
-                        let (write_set, miner_update) =
-                            evm.db().generate_write_set(&result_and_state.state);
+                        let ResultAndState { result, mut state } = result_and_state;
+                        let mut read_set = evm.db_mut().take_read_set();
+                        let (write_set, miner_update, remove_miner) =
+                            evm.db().generate_write_set(&mut state);
 
                         // Check if the transaction can be skipped
                         // skip_validation=true does not necessarily mean the transaction can skip validation.
@@ -138,10 +140,13 @@ where
                         skip_validation &=
                             write_set.iter().all(|l| tx_states[txid].write_set.contains(l));
 
-                        let ResultAndState { result, mut state } = result_and_state;
-                        if miner_update.is_some() {
+                        if remove_miner {
                             // remove miner's state if we handle rewards separately
                             state.remove(&self.coinbase);
+                        } else {
+                            // add miner to read set, because it's in write set.
+                            // set miner's value to None to make this tx redo in next round if unconfirmed.
+                            read_set.insert(LocationAndType::Basic(self.coinbase), None);
                         }
                         // temporary commit to cache_db, to make use the remaining txs can read the updated data
                         let transition = evm.db_mut().temporary_commit(state);
@@ -156,7 +161,7 @@ where
                             execute_result: ResultAndTransition {
                                 result: Some(result),
                                 transition,
-                                miner_update: miner_update.unwrap_or_default(),
+                                miner_update,
                             },
                         };
                     }

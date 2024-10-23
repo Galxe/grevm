@@ -272,10 +272,10 @@ fn native_loaded_not_existing_account() {
 
 #[test]
 fn native_transfer_with_beneficiary() {
-    let block_size = 100; // number of transactions
+    let block_size = 20; // number of transactions
     let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    let mut txs: Vec<TxEnv> = (START_ADDRESS..START_ADDRESS + block_size - 4)
+    let mut txs: Vec<TxEnv> = (START_ADDRESS..START_ADDRESS + block_size)
         .map(|i| {
             let address = Address::from(U160::from(i));
             TxEnv {
@@ -291,71 +291,57 @@ fn native_transfer_with_beneficiary() {
         .collect();
     let start_address = Address::from(U160::from(START_ADDRESS));
     let miner_address = Address::from(U160::from(MINER_ADDRESS));
-    // 19 => 20
-    txs.insert(
-        20,
-        TxEnv {
-            caller: Address::from(U160::from(START_ADDRESS + 19)),
-            transact_to: TransactTo::Call(Address::from(U160::from(START_ADDRESS + 20))),
-            value: U256::from(100),
-            gas_limit: common::TRANSFER_GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: None,
-            ..TxEnv::default()
-        },
-    );
     // miner => start
-    // failed for: LackOfFoundForMaxFee in the first round
-    txs.insert(
-        40,
-        TxEnv {
-            caller: miner_address,
-            transact_to: TransactTo::Call(start_address),
-            value: U256::from(100),
-            gas_limit: common::TRANSFER_GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: None,
-            ..TxEnv::default()
-        },
-    );
+    txs.push(TxEnv {
+        caller: miner_address,
+        transact_to: TransactTo::Call(start_address),
+        value: U256::from(1),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(1),
+        ..TxEnv::default()
+    });
+    // miner => start
+    txs.push(TxEnv {
+        caller: miner_address,
+        transact_to: TransactTo::Call(start_address),
+        value: U256::from(1),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(2),
+        ..TxEnv::default()
+    });
     // start => miner
-    txs.insert(
-        60,
-        TxEnv {
-            caller: start_address,
-            transact_to: TransactTo::Call(miner_address),
-            value: U256::from(100),
-            gas_limit: common::TRANSFER_GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: None,
-            ..TxEnv::default()
-        },
-    );
+    txs.push(TxEnv {
+        caller: start_address,
+        transact_to: TransactTo::Call(miner_address),
+        value: U256::from(1),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(2),
+        ..TxEnv::default()
+    });
     // miner => miner
-    txs.insert(
-        80,
-        TxEnv {
-            caller: miner_address,
-            transact_to: TransactTo::Call(miner_address),
-            value: U256::from(100),
-            gas_limit: common::TRANSFER_GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: None,
-            ..TxEnv::default()
-        },
-    );
+    txs.push(TxEnv {
+        caller: miner_address,
+        transact_to: TransactTo::Call(miner_address),
+        value: U256::from(1),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(3),
+        ..TxEnv::default()
+    });
     common::compare_evm_execute(
         db,
         txs,
-        false,
+        true,
         [
             ("grevm.parallel_round_calls", DebugValue::Counter(2)),
             ("grevm.sequential_execute_calls", DebugValue::Counter(0)),
-            ("grevm.parallel_tx_cnt", DebugValue::Counter(block_size as u64)),
-            ("grevm.conflict_tx_cnt", DebugValue::Counter(5)),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Counter(75)),
-            ("grevm.reusable_tx_cnt", DebugValue::Counter(75)),
-            ("grevm.partition_num_tx_diff", DebugValue::Gauge(1.0.into())),
+            ("grevm.parallel_tx_cnt", DebugValue::Counter(24 as u64)),
+            ("grevm.conflict_tx_cnt", DebugValue::Counter(4)),
+            ("grevm.unconfirmed_tx_cnt", DebugValue::Counter(0)),
+            ("grevm.reusable_tx_cnt", DebugValue::Counter(0)),
         ]
         .into_iter()
         .collect(),
