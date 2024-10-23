@@ -49,6 +49,10 @@ rust.unreachable_pub = "warn"
 name = "gigagas"
 harness = false
 
+[[bench]]
+name = "mainnet"
+harness = false
+
 [profile.release]
 codegen-units = 1
 panic = "abort"
