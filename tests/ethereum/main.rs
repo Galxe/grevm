@@ -9,6 +9,8 @@
 //   "re-testing".
 // - Help outline the minimal state commitment logic for pevm.
 
+#![allow(missing_docs)]
+
 use crate::common::storage::InMemoryDB;
 use alloy_chains::NamedChain;
 use grevm::{GrevmError, GrevmScheduler};
@@ -25,7 +27,7 @@ use revme::cmd::statetest::{
     models::{Env, SpecName, TestSuite, TestUnit, TransactionParts, TxPartIndices},
     utils::recover_address,
 };
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
 use walkdir::{DirEntry, WalkDir};
 
 #[path = "../common/mod.rs"]
@@ -137,7 +139,7 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
 
             match (
                 test.expect_exception.as_deref(),
-                GrevmScheduler::new(spec_name.to_spec_id(), env, db.clone(), vec![tx_env.unwrap()])
+                GrevmScheduler::new(spec_name.to_spec_id(), env, db.clone(), Arc::new(vec![tx_env.unwrap()]))
                     .parallel_execute(),
             ) {
                 // EIP-2681

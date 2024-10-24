@@ -226,7 +226,7 @@ where
         >(boxed)
     };
     let db: DatabaseWrapper<DB::Error> = DatabaseWrapper(db);
-    GrevmScheduler::new(spec_id, env, db, txs)
+    GrevmScheduler::new(spec_id, env, db, Arc::new(txs))
 }
 
 impl<DB> GrevmScheduler<DB>
@@ -235,7 +235,7 @@ where
     DB::Error: Send + Sync,
 {
     /// Creates a new GrevmScheduler instance.
-    pub fn new(spec_id: SpecId, env: Env, db: DB, txs: Vec<TxEnv>) -> Self {
+    pub fn new(spec_id: SpecId, env: Env, db: DB, txs: Arc<Vec<TxEnv>>) -> Self {
         let coinbase = env.block.coinbase;
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
         let num_txs = txs.len();
@@ -244,7 +244,7 @@ where
             spec_id,
             env,
             coinbase,
-            txs: Arc::new(txs),
+            txs,
             database: Arc::new(SchedulerDB::new(db)),
             tx_dependencies: TxDependency::new(num_txs),
             tx_states: Arc::new(vec![TxState::new(); num_txs]),

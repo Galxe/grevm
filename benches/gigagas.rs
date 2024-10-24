@@ -30,15 +30,16 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     env.cfg.chain_id = NamedChain::Mainnet.into();
     env.block.coinbase = Address::from(U160::from(common::MINER_ADDRESS));
     let db = Arc::new(db);
+    let txs = Arc::new(txs);
 
-    let mut group = c.benchmark_group(name);
+    let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
     group.bench_function("Origin Sequential", |b| {
         b.iter(|| {
             common::execute_revm_sequential(
                 black_box(db.clone()),
                 black_box(SpecId::LATEST),
                 black_box(env.clone()),
-                black_box(txs.clone()),
+                black_box(&*txs),
             )
         })
     });

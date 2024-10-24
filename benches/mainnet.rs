@@ -32,6 +32,7 @@ fn benchmark_mainnet(c: &mut Criterion) {
             }
             _ => panic!("Missing transaction data"),
         };
+        let txs = Arc::new(txs);
 
         let mut env = Env::default();
         env.cfg.chain_id = NamedChain::Mainnet.into();
@@ -45,7 +46,7 @@ fn benchmark_mainnet(c: &mut Criterion) {
                     black_box(db.clone()),
                     black_box(spec_id),
                     black_box(env.clone()),
-                    black_box(txs.clone()),
+                    black_box(&*txs),
                 )
             })
         });

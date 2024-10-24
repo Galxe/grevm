@@ -1,10 +1,12 @@
+#![allow(missing_docs)]
+
 mod common;
 use std::sync::Arc;
 
 use alloy_chains::NamedChain;
 use alloy_rpc_types::{Block, BlockTransactions};
 use common::{compat, storage::InMemoryDB};
-use grevm::{GrevmError, GrevmScheduler};
+use grevm::GrevmScheduler;
 use metrics_util::debugging::DebuggingRecorder;
 use revm::primitives::{Env, TxEnv};
 
@@ -15,6 +17,7 @@ fn test_execute_alloy(block: Block, db: InMemoryDB) {
         BlockTransactions::Full(txs) => txs.into_iter().map(|tx| compat::get_tx_env(tx)).collect(),
         _ => panic!("Missing transaction data"),
     };
+    let txs = Arc::new(txs);
 
     let mut env = Env::default();
     env.cfg.chain_id = NamedChain::Mainnet.into();
@@ -22,20 +25,19 @@ fn test_execute_alloy(block: Block, db: InMemoryDB) {
 
     let db = Arc::new(db);
 
-    let reth_result =
-        common::execute_revm_sequential(db.clone(), spec_id, env.clone(), txs.clone());
+    let reth_result = common::execute_revm_sequential(db.clone(), spec_id, env.clone(), &*txs);
 
     // create registry for metrics
     let recorder = DebuggingRecorder::new();
-    let mut parallel_result = Err(GrevmError::UnreachableError(String::from("Init")));
-    metrics::with_local_recorder(&recorder, || {
+    let parallel_result = metrics::with_local_recorder(&recorder, || {
         let executor = GrevmScheduler::new(spec_id, env, db, txs);
-        parallel_result = executor.force_parallel_execute(true, Some(23));
+        let parallel_result = executor.force_parallel_execute(true, Some(23));
 
         let snapshot = recorder.snapshotter().snapshot();
         for (key, unit, desc, value) in snapshot.into_vec() {
             println!("metrics: {} => value: {:?}", key.key().name(), value);
         }
+        parallel_result
     });
 
     common::compare_execution_result(
