@@ -16,6 +16,11 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use fastrace::{collector::Config, prelude::*};
 use fastrace_jaeger::JaegerReporter;
 use grevm::GrevmScheduler;
+use metrics::{SharedString, Unit};
+use metrics_util::{
+    debugging::{DebugValue, DebuggingRecorder},
+    CompositeKey, MetricKind,
+};
 use rand::Rng;
 use revm::primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256};
 use std::{collections::HashMap, sync::Arc};
@@ -24,6 +29,18 @@ const GIGA_GAS: u64 = 1_000_000_000;
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+fn get_metrics_counter_value(
+    snapshot: &HashMap<CompositeKey, (Option<Unit>, Option<SharedString>, DebugValue)>,
+    name: &'static str,
+) -> u64 {
+    match snapshot
+        .get(&CompositeKey::new(MetricKind::Counter, metrics::Key::from_static_name(name)))
+    {
+        Some((_, _, DebugValue::Counter(value))) => *value,
+        _ => panic!("{:?} not found", name),
+    }
+}
 
 fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut env = Env::default();
@@ -43,32 +60,66 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
             )
         })
     });
+
+    let mut num_iter: usize = 0;
+    let mut execution_time_ns: u64 = 0;
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
+            num_iter += 1;
+            let recorder = DebuggingRecorder::new();
             let root = Span::root(format!("{name} Grevm Parallel"), SpanContext::random());
             let _guard = root.set_local_parent();
-            let executor = GrevmScheduler::new(
-                black_box(SpecId::LATEST),
-                black_box(env.clone()),
-                black_box(db.clone()),
-                black_box(txs.clone()),
-            );
-            executor.parallel_execute()
+            metrics::with_local_recorder(&recorder, || {
+                let executor = GrevmScheduler::new(
+                    black_box(SpecId::LATEST),
+                    black_box(env.clone()),
+                    black_box(db.clone()),
+                    black_box(txs.clone()),
+                );
+                let _ = executor.parallel_execute();
+
+                let snapshot = recorder.snapshotter().snapshot().into_hashmap();
+                execution_time_ns +=
+                    get_metrics_counter_value(&snapshot, "grevm.parallel_execute_time");
+                execution_time_ns += get_metrics_counter_value(&snapshot, "grevm.validate_time");
+            });
         })
     });
+    println!(
+        "{} Grevm Parallel average execution time: {:.2} ms",
+        name,
+        execution_time_ns as f64 / num_iter as f64 / 1000000.0
+    );
+
+    let mut num_iter: usize = 0;
+    let mut execution_time_ns: u64 = 0;
     group.bench_function("Grevm Sequential", |b| {
         b.iter(|| {
+            num_iter += 1;
+            let recorder = DebuggingRecorder::new();
             let root = Span::root(format!("{name} Grevm Sequential"), SpanContext::random());
             let _guard = root.set_local_parent();
-            let executor = GrevmScheduler::new(
-                black_box(SpecId::LATEST),
-                black_box(env.clone()),
-                black_box(db.clone()),
-                black_box(txs.clone()),
-            );
-            executor.force_sequential_execute()
+            metrics::with_local_recorder(&recorder, || {
+                let executor = GrevmScheduler::new(
+                    black_box(SpecId::LATEST),
+                    black_box(env.clone()),
+                    black_box(db.clone()),
+                    black_box(txs.clone()),
+                );
+                let _ = executor.force_sequential_execute();
+
+                let snapshot = recorder.snapshotter().snapshot().into_hashmap();
+                execution_time_ns +=
+                    get_metrics_counter_value(&snapshot, "grevm.sequential_execute_time");
+            });
         })
     });
+    println!(
+        "{} Grevm Sequential average execution time: {:.2} ms",
+        name,
+        execution_time_ns as f64 / num_iter as f64 / 1000000.0
+    );
+
     group.finish();
 }
 

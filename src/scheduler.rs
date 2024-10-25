@@ -59,14 +59,16 @@ struct ExecuteMetrics {
     parse_hints_time: metrics::Counter,
     /// Time taken to partition transactions(in nanoseconds).
     partition_tx_time: metrics::Counter,
-    /// Time taken to validate transactions(in nanoseconds).
+    /// Time taken to execute transactions in parallel(in nanoseconds).
     parallel_execute_time: metrics::Counter,
-    /// Time taken to execute
+    /// Time taken to validate transactions(in nanoseconds).
     validate_time: metrics::Counter,
     /// Time taken to merge write set.
     merge_write_set_time: metrics::Counter,
     /// Time taken to commit transition
     commit_transition_time: metrics::Counter,
+    /// Time taken to execute transactions in sequential(in nanoseconds).
+    sequential_execute_time: metrics::Counter,
     /// Time taken to build output(in nanoseconds).
     build_output_time: metrics::Counter,
 }
@@ -93,6 +95,7 @@ impl Default for ExecuteMetrics {
             validate_time: counter!("grevm.validate_time"),
             merge_write_set_time: counter!("grevm.merge_write_set_time"),
             commit_transition_time: counter!("grevm.commit_transition_time"),
+            sequential_execute_time: counter!("grevm.sequential_execute_time"),
             build_output_time: counter!("grevm.build_output_time"),
         }
     }
@@ -561,6 +564,7 @@ where
     /// Fall back to sequential execution for the remaining transactions.
     #[fastrace::trace]
     fn execute_remaining_sequential(&mut self) -> Result<(), GrevmError<DB::Error>> {
+        let start = Instant::now();
         self.metrics.sequential_execute_calls.increment(1);
         self.metrics.sequential_tx_cnt.increment((self.txs.len() - self.num_finality_txs) as u64);
         // MUST drop the `PartitionExecutor::scheduler_db` before get mut
@@ -585,6 +589,7 @@ where
                 Err(err) => return Err(GrevmError::EvmError(err)),
             }
         }
+        self.metrics.sequential_execute_time.increment(start.elapsed().as_nanos() as u64);
         Ok(())
     }
 
