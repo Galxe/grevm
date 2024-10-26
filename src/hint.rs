@@ -60,13 +60,13 @@ impl TxState {
     fn insert_location(&mut self, location: LocationAndType, rw_type: RWType) {
         match rw_type {
             RWType::ReadOnly => {
-                self.read_set.insert(location);
+                self.read_set.insert(location, None);
             }
             RWType::WriteOnly => {
                 self.write_set.insert(location);
             }
             RWType::ReadWrite => {
-                self.read_set.insert(location.clone());
+                self.read_set.insert(location.clone(), None);
                 self.write_set.insert(location);
             }
         }
@@ -111,13 +111,18 @@ impl ParallelExecutionHints {
                             .insert_location(LocationAndType::Basic(to_address), RWType::ReadOnly);
                         rw_set.insert_location(LocationAndType::Code(to_address), RWType::ReadOnly);
                         // Update hints with contract data based on the transaction details
-                        ParallelExecutionHints::update_hints_with_contract_data(
+                        if !ParallelExecutionHints::update_hints_with_contract_data(
                             tx_env.caller,
                             to_address,
                             None,
                             &tx_env.data,
                             rw_set,
-                        );
+                        ) {
+                            rw_set.insert_location(
+                                LocationAndType::Basic(to_address),
+                                RWType::WriteOnly,
+                            );
+                        }
                     } else if to_address != tx_env.caller {
                         rw_set
                             .insert_location(LocationAndType::Basic(to_address), RWType::ReadWrite);
@@ -184,20 +189,21 @@ impl ParallelExecutionHints {
         code: Option<Bytes>,
         data: &Bytes,
         tx_rw_set: &mut TxState,
-    ) {
+    ) -> bool {
         if code.is_none() && data.is_empty() {
-            panic!("Unreachable error")
+            return false;
         }
         if data.len() < 4 || (data.len() - 4) % 32 != 0 {
-            tx_rw_set.insert_location(LocationAndType::Basic(contract_address), RWType::WriteOnly);
             // Invalid tx, or tx that triggers fallback CALL
-            return;
+            return false;
         }
         let (func_id, parameters) = Self::decode_contract_parameters(data);
         match Self::get_contract_type(contract_address) {
             ContractType::ERC20 => match ERC20Function::from(func_id) {
                 ERC20Function::Transfer => {
-                    assert_eq!(parameters.len(), 2);
+                    if parameters.len() != 2 {
+                        return false;
+                    }
                     let to_address: [u8; 20] =
                         parameters[0].as_slice()[12..].try_into().expect("try into failed");
                     let to_slot = Self::slot_from_address(0, vec![Address::new(to_address)]);
@@ -214,7 +220,9 @@ impl ParallelExecutionHints {
                     }
                 }
                 ERC20Function::TransferFrom => {
-                    assert_eq!(parameters.len(), 3);
+                    if parameters.len() != 3 {
+                        return false;
+                    }
                     let from_address: [u8; 20] =
                         parameters[0].as_slice()[12..].try_into().expect("try into failed");
                     let from_address = Address::new(from_address);
@@ -239,17 +247,14 @@ impl ParallelExecutionHints {
                     );
                 }
                 _ => {
-                    tx_rw_set.insert_location(
-                        LocationAndType::Basic(contract_address),
-                        RWType::WriteOnly,
-                    );
+                    return false;
                 }
             },
             ContractType::UNKNOWN => {
-                tx_rw_set
-                    .insert_location(LocationAndType::Basic(contract_address), RWType::WriteOnly);
+                return false;
             }
         }
+        true
     }
 
     fn get_contract_type(_contract_address: Address) -> ContractType {

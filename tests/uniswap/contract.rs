@@ -334,4 +334,24 @@ impl SingleSwap {
             storage: store.build(),
         }
     }
+
+    pub fn sell_token0(amount: U256) -> Bytes {
+        Bytes::from([&fixed_bytes!("c92b0891")[..], &B256::from(amount)[..]].concat())
+    }
+
+    pub fn sell_token1(amount: U256) -> Bytes {
+        Bytes::from([&fixed_bytes!("6b055260")[..], &B256::from(amount)[..]].concat())
+    }
+
+    pub fn buy_token0(arg1: U256, arg2: U256) -> Bytes {
+        Bytes::from(
+            [&fixed_bytes!("8dc33f82")[..], &B256::from(arg1)[..], &B256::from(arg2)[..]].concat(),
+        )
+    }
+
+    pub fn buy_token1(arg1: U256, arg2: U256) -> Bytes {
+        Bytes::from(
+            [&fixed_bytes!("b2db18a2")[..], &B256::from(arg1)[..], &B256::from(arg2)[..]].concat(),
+        )
+    }
 }

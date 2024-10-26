@@ -16,16 +16,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
+      - name: Initialize ethereum tests
+        run: |
+          git submodule update --init tests/ethereum/tests
+
       # install rust tools
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           override: true
-
-      - name: Clone ethereum/tests repository
-        run: |
-          git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/ethereum/tests.git tests/ethereum/tests
 
       - name: Run tests
         run: cargo test --test ethereum

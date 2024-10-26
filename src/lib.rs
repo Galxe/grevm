@@ -39,6 +39,7 @@ lazy_static! {
         .unwrap();
 }
 
+use crate::storage::LazyUpdateValue;
 pub use scheduler::*;
 
 /// The maximum number of rounds for transaction execution.
@@ -119,7 +120,7 @@ impl<DBError: Display> Display for GrevmError<DBError> {
 /// This struct encapsulates the outcome of executing a transaction, including the execution
 /// result, state transitions, and any rewards to the miner.
 #[derive(Debug, Clone, Default)]
-pub struct ResultAndTransition {
+pub(crate) struct ResultAndTransition {
     /// Status of execution.
     pub result: Option<ExecutionResult>,
 
@@ -127,7 +128,7 @@ pub struct ResultAndTransition {
     pub transition: Vec<(Address, TransitionAccount)>,
 
     /// Rewards to miner.
-    pub rewards: u128,
+    pub miner_update: LazyUpdateValue,
 }
 
 /// Utility function for parallel execution using fork-join pattern.
