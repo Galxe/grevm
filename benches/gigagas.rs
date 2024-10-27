@@ -148,15 +148,19 @@ fn bench_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
     );
 }
 
-fn get_account_idx(num_eoa: usize, hot_start_idx: usize, hot_ratio: f64) -> usize {
+fn pick_account_idx(num_eoa: usize, hot_ratio: f64) -> usize {
     if hot_ratio <= 0.0 {
         // Uniform workload
-        rand::random::<usize>() % num_eoa
-    } else if rand::thread_rng().gen_range(0.0..1.0) < hot_ratio {
+        return rand::random::<usize>() % num_eoa;
+    }
+
+    // Let `hot_ratio` of transactions conducted by 10% of hot accounts
+    let hot_start_idx = (num_eoa as f64 * 0.9) as usize;
+    if rand::thread_rng().gen_range(0.0..1.0) < hot_ratio {
         // Access hot
         hot_start_idx + rand::random::<usize>() % (num_eoa - hot_start_idx)
     } else {
-        rand::random::<usize>() % (num_eoa - hot_start_idx)
+        rand::random::<usize>() % hot_start_idx
     }
 }
 
@@ -171,9 +175,6 @@ fn bench_dependent_raw_transfers(
     let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
     db.latency_us = db_latency_us;
 
-    // Let 10% of the accounts be hot accounts
-    let hot_start_idx = common::START_ADDRESS + (num_eoa as f64 * 0.9) as usize;
-
     bench(
         c,
         "Dependent Raw Transfers",
@@ -181,10 +182,10 @@ fn bench_dependent_raw_transfers(
         (0..block_size)
             .map(|_| {
                 let from = Address::from(U160::from(
-                    common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                    common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio),
                 ));
                 let to = Address::from(U160::from(
-                    common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                    common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio),
                 ));
                 TxEnv {
                     caller: from,
@@ -255,12 +256,9 @@ fn benchmark_dependent_erc20(
     let mut txs = Vec::with_capacity(block_size);
     let sca = sca[0];
 
-    // Let 10% of the accounts be hot accounts
-    let hot_start_idx = common::START_ADDRESS + (num_eoa as f64 * 0.9) as usize;
-
     for _ in 0..block_size {
-        let from = eoa[get_account_idx(num_eoa, hot_start_idx, hot_ratio)];
-        let to = eoa[get_account_idx(num_eoa, hot_start_idx, hot_ratio)];
+        let from = eoa[pick_account_idx(num_eoa, hot_ratio)];
+        let to = eoa[pick_account_idx(num_eoa, hot_ratio)];
         let tx = TxEnv {
             caller: from,
             transact_to: TransactTo::Call(sca),
@@ -302,19 +300,15 @@ fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio
         (GIGA_GAS as f64 * 0.2 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let num_uniswap = (GIGA_GAS as f64 * 0.2 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
 
-    // Let 10% of the accounts be hot accounts
-    let hot_start_idx = common::START_ADDRESS + (num_eoa as f64 * 0.9) as usize;
     let mut state = common::mock_block_accounts(common::START_ADDRESS, num_eoa);
     let eoa_addresses = state.keys().cloned().collect::<Vec<_>>();
     let mut txs = Vec::with_capacity(num_native_transfer + num_erc20_transfer + num_uniswap);
 
     for _ in 0..num_native_transfer {
-        let from = Address::from(U160::from(
-            common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
-        ));
-        let to = Address::from(U160::from(
-            common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
-        ));
+        let from =
+            Address::from(U160::from(common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio)));
+        let to =
+            Address::from(U160::from(common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio)));
         let tx = TxEnv {
             caller: from,
             transact_to: TransactTo::Call(to),
@@ -332,10 +326,10 @@ fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio
     for (sca_addr, _) in erc20_contract_accounts.iter() {
         for _ in 0..(num_erc20_transfer / NUM_ERC20_SCA) {
             let from = Address::from(U160::from(
-                common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio),
             ));
             let to = Address::from(U160::from(
-                common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio),
             ));
             let tx = TxEnv {
                 caller: from,
@@ -367,7 +361,7 @@ fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio
 
             txs.push(TxEnv {
                 caller: Address::from(U160::from(
-                    common::START_ADDRESS + get_account_idx(num_eoa, hot_start_idx, hot_ratio),
+                    common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio),
                 )),
                 gas_limit: uniswap::GAS_LIMIT,
                 gas_price: U256::from(0xb2d05e07u64),
