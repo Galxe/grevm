@@ -1,10 +1,10 @@
-use crate::{LocationAndType, LocationSet};
+use crate::{fork_join_util, LocationAndType, LocationSet};
 use ahash::{AHashMap, AHashSet};
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use fastrace::Span;
 use revm::{
     db::{
         states::{bundle_state::BundleRetention, CacheAccount},
-        BundleState, PlainAccount,
+        AccountRevert, BundleAccount, BundleState, PlainAccount,
     },
     precompile::Address,
     primitives::{Account, AccountInfo, Bytecode, EvmState, B256, BLOCK_HASH_HISTORY, U256},
@@ -14,10 +14,8 @@ use std::{
     collections::{btree_map, hash_map, BTreeMap, HashMap},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc::channel,
         Arc, Mutex,
     },
-    thread,
 };
 
 /// LazyUpdateValue is used to update the balance of the miner's account.
@@ -84,6 +82,7 @@ trait ParallelBundleState {
 }
 
 impl ParallelBundleState for BundleState {
+    #[fastrace::trace]
     fn parallel_apply_transitions_and_create_reverts(
         &mut self,
         transitions: TransitionState,
@@ -93,39 +92,64 @@ impl ParallelBundleState for BundleState {
         let include_reverts = retention.includes_reverts();
         // pessimistically pre-allocate assuming _all_ accounts changed.
         let reverts_capacity = if include_reverts { transitions.transitions.len() } else { 0 };
-        let mut reverts = Vec::with_capacity(reverts_capacity);
-        let mut state = HashMap::with_capacity(transitions.transitions.len());
+        let transitions = transitions.transitions;
+        let addresses: Vec<Address> = transitions.keys().cloned().collect();
+        let reverts: Vec<Option<(Address, AccountRevert)>> = vec![None; reverts_capacity];
+        let bundle_state: Vec<Option<(Address, BundleAccount)>> = vec![None; transitions.len()];
         let state_size = AtomicUsize::new(0);
-        let (tx, rx) = channel();
-        let receiver = thread::spawn(move || {
-            while let Ok((address, present_bundle, revert)) = rx.recv() {
-                state.insert(address, present_bundle);
-                if include_reverts {
-                    reverts.push((address, revert));
-                }
-            }
-            (reverts, state)
-        });
-
         let contracts = Mutex::new(HashMap::new());
-        transitions.transitions.into_par_iter().for_each(|(address, transition)| {
-            // add new contract if it was created/changed.
-            if let Some((hash, new_bytecode)) = transition.has_new_contract() {
-                contracts.lock().unwrap().insert(hash, new_bytecode.clone());
-            }
-            let present_bundle = transition.present_bundle_account();
-            let revert = transition.create_revert();
-            if let Some(revert) = revert {
-                state_size.fetch_add(present_bundle.size_hint(), Ordering::Relaxed);
-                tx.send((address, present_bundle, revert)).unwrap();
+
+        let span = Span::enter_with_local_parent("parallel create reverts");
+        fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
+            #[allow(invalid_reference_casting)]
+            let reverts = unsafe {
+                &mut *(&reverts as *const Vec<Option<(Address, AccountRevert)>>
+                    as *mut Vec<Option<(Address, AccountRevert)>>)
+            };
+            #[allow(invalid_reference_casting)]
+            let addresses =
+                unsafe { &mut *(&addresses as *const Vec<Address> as *mut Vec<Address>) };
+            #[allow(invalid_reference_casting)]
+            let bundle_state = unsafe {
+                &mut *(&bundle_state as *const Vec<Option<(Address, BundleAccount)>>
+                    as *mut Vec<Option<(Address, BundleAccount)>>)
+            };
+
+            for pos in start_pos..end_pos {
+                let address = addresses[pos];
+                let transition = transitions.get(&address).cloned().unwrap();
+                // add new contract if it was created/changed.
+                if let Some((hash, new_bytecode)) = transition.has_new_contract() {
+                    contracts.lock().unwrap().insert(hash, new_bytecode.clone());
+                }
+                let present_bundle = transition.present_bundle_account();
+                let revert = transition.create_revert();
+                if let Some(revert) = revert {
+                    state_size.fetch_add(present_bundle.size_hint(), Ordering::Relaxed);
+                    bundle_state[pos] = Some((address, present_bundle));
+                    if include_reverts {
+                        reverts[pos] = Some((address, revert));
+                    }
+                }
             }
         });
         self.state_size = state_size.load(Ordering::Acquire);
-        drop(tx);
+        drop(span);
 
-        let (reverts, state) = receiver.join().unwrap();
-        self.state = state;
-        self.reverts.push(reverts);
+        // much faster than bundle_state.into_iter().filter_map(|r| r).collect()
+        self.state.reserve(transitions.len());
+        for bundle in bundle_state {
+            if let Some((address, state)) = bundle {
+                self.state.insert(address, state);
+            }
+        }
+        let mut final_reverts = Vec::with_capacity(reverts_capacity);
+        for revert in reverts {
+            if let Some(r) = revert {
+                final_reverts.push(r);
+            }
+        }
+        self.reverts.push(final_reverts);
         self.contracts = contracts.into_inner().unwrap();
     }
 }
