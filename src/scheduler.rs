@@ -1,10 +1,3 @@
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    ops::DerefMut,
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-};
-
 use crate::{
     fork_join_util,
     hint::ParallelExecutionHints,
@@ -14,7 +7,15 @@ use crate::{
     GrevmError, LocationAndType, ResultAndTransition, TransactionStatus, TxId, CPU_CORES,
     GREVM_RUNTIME, MAX_NUM_ROUND,
 };
+use fastrace::Span;
+use std::{
+    collections::BTreeSet,
+    ops::DerefMut,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use metrics::{counter, gauge};
 use revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
@@ -238,6 +239,7 @@ where
     DB::Error: Send + Sync,
 {
     /// Creates a new GrevmScheduler instance.
+    #[fastrace::trace]
     pub fn new(spec_id: SpecId, env: Env, db: DB, txs: Arc<Vec<TxEnv>>) -> Self {
         let coinbase = env.block.coinbase;
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
@@ -507,12 +509,16 @@ where
             unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
         let mut miner_updates = Vec::with_capacity(finality_tx_cnt);
         let start_txid = self.num_finality_txs - finality_tx_cnt;
+
+        let span = Span::enter_with_local_parent("database commit transitions");
         for txid in start_txid..self.num_finality_txs {
             miner_updates.push(tx_states[txid].execute_result.miner_update.clone());
             database
                 .commit_transition(std::mem::take(&mut tx_states[txid].execute_result.transition));
             self.results.push(tx_states[txid].execute_result.result.clone().unwrap());
         }
+        drop(span);
+
         // Each transaction updates three accounts: from, to, and coinbase.
         // If every tx updates the coinbase account, it will cause conflicts across all txs.
         // Therefore, we handle miner rewards separately. We don't record miner’s address in r/w

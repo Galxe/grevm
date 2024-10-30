@@ -3,12 +3,13 @@ use crate::{
     LocationAndType, PartitionId, ResultAndTransition, SharedTxStates, TransactionStatus, TxId,
     TxState,
 };
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use revm::{
     primitives::{Address, EVMError, Env, ResultAndState, SpecId, TxEnv, TxKind},
     DatabaseRef, EvmBuilder,
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::BTreeSet,
     sync::Arc,
     time::{Duration, Instant},
 };

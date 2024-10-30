@@ -1,12 +1,14 @@
 use smallvec::SmallVec;
 use std::{
     cmp::{min, Reverse},
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
 };
 
 use crate::{fork_join_util, LocationAndType, SharedTxStates, TxId};
 
 pub(crate) type DependentTxsVec = SmallVec<[TxId; 1]>;
+
+use ahash::AHashMap as HashMap;
 
 const RAW_TRANSFER_WEIGHT: usize = 1;
 

@@ -19,7 +19,6 @@ use revm::{
 use std::{
     cmp::min,
     fmt::{Display, Formatter},
-    sync::atomic::{AtomicUsize, Ordering},
     thread,
 };
 use tokio::runtime::{Builder, Runtime};
@@ -28,6 +27,7 @@ mod partition;
 mod scheduler;
 mod storage;
 mod tx_dependency;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 lazy_static! {
     static ref CPU_CORES: usize = thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
@@ -161,20 +161,14 @@ where
     F: Fn(usize, usize, usize) + Send + Sync + 'scope,
 {
     let parallel_cnt = num_partitions.unwrap_or(*CPU_CORES * 2 + 1);
-    let index = AtomicUsize::new(0);
     let remaining = num_elements % parallel_cnt;
     let chunk_size = num_elements / parallel_cnt;
-    thread::scope(|scope| {
-        for _ in 0..parallel_cnt {
-            scope.spawn(|| {
-                let index = index.fetch_add(1, Ordering::SeqCst);
-                let start_pos = chunk_size * index + min(index, remaining);
-                let mut end_pos = start_pos + chunk_size;
-                if index < remaining {
-                    end_pos += 1;
-                }
-                f(start_pos, end_pos, index);
-            });
+    (0..parallel_cnt).into_par_iter().for_each(|index| {
+        let start_pos = chunk_size * index + min(index, remaining);
+        let mut end_pos = start_pos + chunk_size;
+        if index < remaining {
+            end_pos += 1;
         }
+        f(start_pos, end_pos, index);
     });
 }

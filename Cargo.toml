@@ -8,6 +8,8 @@ description = "Create Parallel EVM"
 revm = "14.0.0"
 fastrace = "0.7"
 tracing = "0.1.40"
+ahash = { version = "0.8.11", features = ["serde"] }
+rayon = "1.10.0"
 
 # Alloy
 alloy-chains = "0.1.18"
