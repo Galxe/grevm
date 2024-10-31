@@ -23,7 +23,10 @@ use metrics_util::{
 };
 use rand::Rng;
 use revm::primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 const GIGA_GAS: u64 = 1_000_000_000;
 
@@ -50,17 +53,6 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let txs = Arc::new(txs);
 
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
-    group.bench_function("Origin Sequential", |b| {
-        b.iter(|| {
-            common::execute_revm_sequential(
-                black_box(db.clone()),
-                black_box(SpecId::LATEST),
-                black_box(env.clone()),
-                black_box(&*txs),
-            )
-        })
-    });
-
     let mut num_iter: usize = 0;
     let mut execution_time_ns: u64 = 0;
     group.bench_function("Grevm Parallel", |b| {
@@ -208,17 +200,32 @@ fn benchmark_gigagas(c: &mut Criterion) {
     let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);
     let num_eoa = std::env::var("NUM_EOA").map(|s| s.parse().unwrap()).unwrap_or(0);
     let hot_ratio = std::env::var("HOT_RATIO").map(|s| s.parse().unwrap()).unwrap_or(0.0);
-    bench_raw_transfers(c, db_latency_us);
-    bench_dependent_raw_transfers(c, db_latency_us, num_eoa, hot_ratio);
-    benchmark_erc20(c, db_latency_us);
-    benchmark_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
-    bench_uniswap(c, db_latency_us);
-    bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
+    let filter: String = std::env::var("FILTER").unwrap_or_default();
+    let filter: HashSet<&str> = filter.split(',').filter(|s| !s.is_empty()).collect();
+
+    if filter.is_empty() || filter.contains("raw_transfers") {
+        bench_raw_transfers(c, db_latency_us);
+    }
+    if filter.is_empty() || filter.contains("dependent_raw_transfers") {
+        bench_dependent_raw_transfers(c, db_latency_us, num_eoa, hot_ratio);
+    }
+    if filter.is_empty() || filter.contains("erc20") {
+        bench_erc20(c, db_latency_us);
+    }
+    if filter.is_empty() || filter.contains("dependent_erc20") {
+        bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
+    }
+    if filter.is_empty() || filter.contains("uniswap") {
+        bench_uniswap(c, db_latency_us);
+    }
+    if filter.is_empty() || filter.contains("hybrid") {
+        bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
+    }
 
     fastrace::flush();
 }
 
-fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
+fn bench_erc20(c: &mut Criterion, db_latency_us: u64) {
     let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(block_size, 1);
     let miner = common::mock_miner_account();
@@ -243,12 +250,7 @@ fn benchmark_erc20(c: &mut Criterion, db_latency_us: u64) {
     bench(c, "Independent ERC20", db, txs);
 }
 
-fn benchmark_dependent_erc20(
-    c: &mut Criterion,
-    db_latency_us: u64,
-    num_eoa: usize,
-    hot_ratio: f64,
-) {
+fn bench_dependent_erc20(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {
     let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(num_eoa, 1);
     let miner = common::mock_miner_account();
