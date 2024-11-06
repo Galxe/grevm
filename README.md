@@ -83,6 +83,7 @@ transaction will read or write, which serves as input to build the data dependen
 before parallel execution, avoiding introducing additional computational overhead during execution.
 
 ![image.png](images/glassnode-studio_eth-ethereum-transaction-type-breakdown-relative.png)
+_Screenshot 1: Ideal Parallel Execution_
 
 While not all hints are perfectly precise, these simulation-based hints are generally accurate enough for practical
 purposes. For instance, on the Ethereum mainnet, by **historical gas usages**, approximately 30% of transactions are
@@ -97,8 +98,8 @@ follow-up work of **Block-STM** model by incorporating data dependency hints fro
   example, when new transactions arrive in the mempool, simulations can be run immediately to prepare dependency hints
   in advance.
 - **Phase 2**: **Dependency Analysis**—Transform the dependency hints gathered during the simulation phase into a DAG
-  that models the dependencies between transactions. This DAG serves as a roadmap for scheduling transactions in
-  the subsequent parallel execution.
+  that models the dependencies between transactions. This DAG serves as a roadmap for scheduling transactions in the
+  subsequent parallel execution.
 - **Phase 3**: **Concurrent Execution with Conflict Resolution**—Execute transactions in parallel using a modified
   BlockSTM algorithm that leverages the dependency DAG generated in Phase 2. Instead of the scheduler selecting
   transactions strictly based on their sequence numbers in the block (e.g., 1, 2, 3, ..., n), it now prioritizes
@@ -204,14 +205,14 @@ transactions consist of independent raw transfers, ERC20 transfers, and Uniswap 
 and accounts to ensure no data dependencies. This setup provides a baseline to assess the maximum achievable performance
 improvement through parallel execution without the impact of transaction conflicts.
 
-|                 | Num Txs | DB Latency | Sequential Execution (ms) | Parallel Execution (ms) | Execution Speedup | Throughput (Gigagas/s) |
-| --------------- | ------- | ---------- | ------------------------- | ----------------------- | ----------------- | ---------------------- |
-| Raw Transfers   | 47620   | 0          | 155.86                    | 37.73                   | 4.13              | 26.50                  |
-|                 | 47620   | 100us      | 7476.21                   | 146.99                  | 50.84             | 6.80                   |
-| ERC20 Transfers | 33628   | 0          | 285.64                    | 63.88                   | 4.47              | 15.65                  |
-|                 | 33628   | 100us      | 10636.06                  | 208.94                  | 50.87             | 4.78                   |
-| Uniswap Swaps   | 6413    | 0          | 679.99                    | 82.71                   | 8.22              | 12.09                  |
-|                 | 6413    | 100us      | 24440.75                  | 420.91                  | 58.06             | 2.37                   |
+| Test            | Num Txs | DB Latency | Sequential Execution (ms) | Parallel Execution (ms) | Execution Speedup | Total Gas     | Throughput (Gigagas/s) |
+| --------------- | ------- | ---------- | ------------------------- | ----------------------- | ----------------- | ------------- | ---------------------- |
+| Raw Transfers   | 47620   | 0          | 155.86                    | 37.73                   | 4.13              | 1,000,020,000 | 26.5                   |
+|                 | 47620   | 100us      | 7476.21                   | 146.99                  | 50.84             | 1,000,020,000 | 6.8                    |
+| ERC20 Transfers | 33628   | 0          | 285.64                    | 63.88                   | 4.47              | 906,276,572   | 14.19                  |
+|                 | 33628   | 100us      | 10636.06                  | 208.94                  | 50.87             | 906,276,572   | 4.34                   |
+| Uniswap Swaps   | 6413    | 0          | 679.99                    | 82.71                   | 8.22              | 1,000,004,742 | 12.09                  |
+|                 | 6413    | 100us      | 24440.75                  | 420.91                  | 58.06             | 1,000,004,742 | 2.38                   |
 
 _Table 1: Grevm 1.0 Conflict-Free Transaction Execution Speedup_
 
@@ -228,11 +229,14 @@ The introduction of I/O latency amplified the performance advantages of parallel
 suffers from increased latency due to its linear processing nature, parallel execution mitigates this effect by
 overlapping I/O operations across multiple threads. See Figure 3.
 
-| | Num Txs | DB Latency | Sequential Execution pevm (ms) | Parallel Execution pevm (ms) | Execution Speedup |
-Throughput (Gigagas/s) | | --- | --- | --- | --- | --- | --- | --- | | Raw Transfers | 47620 | 0 | 156.47 | 55.488 |
-2.82 | 18.02 | | | 47620 | 100us | 7484.1 | 259.18 | 28.88 | 3.85 | | ERC20 Transfers | 33628 | 0 | 278.24 | 65.127 |
-4.27 | 15.35 | | | 33628 | 100us | 10628 | 683.13 | 15.55 | 1.46 | | Uniswap Swaps | 6413 | 0 | 665.96 | 33.787 | 19.71
-| 29.59 | | | 6413 | 100us | 26368 | 839.49 | 31.40 | 1.19 |
+|                 | Num Txs | DB Latency | Sequential Execution pevm (ms) | Parallel Execution pevm (ms) | Execution<br>Speedup | Throughput (Gigagas/s) |
+| --------------- | ------- | ---------- | ------------------------------ | ---------------------------- | -------------------- | ---------------------- |
+| Raw Transfers   | 47620   | 0          | 156.47                         | 55.488                       | 2.82                 | 18.02                  |
+|                 | 47620   | 100us      | 7484.1                         | 259.18                       | 28.88                | 3.85                   |
+| ERC20 Transfers | 33628   | 0          | 278.24                         | 65.127                       | 4.27                 | 15.35                  |
+|                 | 33628   | 100us      | 10628                          | 683.13                       | 15.55                | 1.46                   |
+| Uniswap Swaps   | 6413    | 0          | 665.96                         | 33.787                       | 19.71                | 29.59                  |
+|                 | 6413    | 100us      | 26368                          | 839.49                       | 31.4                 | 1.19                   |
 
 _Table 2: pevm Benchmark Result of Conflict-Free Transaction Execution_
 
@@ -254,14 +258,14 @@ For a fair comparison, The above test result of _Table 1_ excludes certain overh
 But even with the above overheads, the total speedup is still considerably significant, especially when DB latency is
 non-zero, see Table 3.
 
-|                 | Num Txs | DB Latency | Sequential Total (ms) | Parallel Total (ms) | Total Speedup | Throughput (Gigagas/s) |
-| --------------- | ------- | ---------- | --------------------- | ------------------- | ------------- | ---------------------- |
-| Raw Transfers   | 47620   | 0          | 190.12                | 69.176              | 2.75          | 14.45                  |
-|                 | 47620   | 100us      | 7512.8                | 179.03              | 41.96         | 5.58                   |
-| ERC20 Transfers | 33628   | 0          | 317.13                | 96.559              | 3.28          | 10.35                  |
-|                 | 33628   | 100us      | 10673                 | 243.27              | 43.87         | 4.11                   |
-| Uniswap Swaps   | 6413    | 0          | 719.08                | 108.20              | 6.65          | 9.24                   |
-|                 | 6413    | 100us      | 24485                 | 439.89              | 55.66         | 2.27                   |
+| Test            | Num Txs | DB Latency | Sequential Total (ms) | Parallel Total (ms) | Total Speedup | Total Gas     | Throughput (Gigagas/s) |
+| --------------- | ------- | ---------- | --------------------- | ------------------- | ------------- | ------------- | ---------------------- |
+| Raw Transfers   | 47620   | 0          | 190.12                | 69.176              | 2.75          | 1,000,020,000 | 14.46                  |
+|                 | 47620   | 100us      | 7512.8                | 179.03              | 41.96         | 1,000,020,000 | 5.59                   |
+| ERC20 Transfers | 33628   | 0          | 317.13                | 96.559              | 3.28          | 906,276,572   | 9.39                   |
+|                 | 33628   | 100us      | 10673                 | 243.27              | 43.87         | 906,276,572   | 3.73                   |
+| Uniswap Swaps   | 6413    | 0          | 719.08                | 108.2               | 6.65          | 1,000,004,742 | 9.24                   |
+|                 | 6413    | 100us      | 24485                 | 439.89              | 55.66         | 1,000,004,742 | 2.27                   |
 
 _Table 3: Grevm 1.0 Conflict-Free Transaction E2E Total Speedup_
 
@@ -283,38 +287,46 @@ We also introduced a a test set called **Hybrid**, consisting of
 - **20% ERC20 Transfers**: Token transfers within three ERC20 token contracts.
 - **20% Uniswap Swaps**: Swap transactions within two independent Uniswap pairs.
 
-|                 | Num Txs | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
-| --------------- | ------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
-| Raw Transfers   | 47620   | 0          | 207.25                   | 77.05                  | 2.69              | 12.97                  |
-|                 | 47620   | 100us      | 9610.52                  | 217.20                 | 44.29             | 4.60                   |
-| ERC20 Transfers | 33628   | 0          | 316.57                   | 92.63                  | 3.42              | 10.79                  |
-|                 | 33628   | 100us      | 12233.27                 | 263.90                 | 46.38             | 3.78                   |
-| Hybrid          | 36580   | 0          | 295.44                   | 206.71                 | 1.43              | 4.83                   |
-|                 | 36580   | 100us      | 10327.62                 | 1334.90                | 7.73              | 0.74                   |
+| Test            | Num Txs | Total Gas     |
+| --------------- | ------- | ------------- |
+| Raw Transfers   | 47,620  | 1,000,020,000 |
+| ERC20 Transfers | 33,628  | 1,161,842,024 |
+| Hybrid          | 36,580  | 1,002,841,727 |
 
-*Table 4: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 0%_)_
+_Table 4: Contention Transactions Execution Test Setup_
 
-|                 | Num Txs | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
-| --------------- | ------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
-| Raw Transfers   | 47620   | 0          | 208.05                   | 77.86                  | 2.67              | 12.84                  |
-|                 | 47620   | 100us      | 9632.20                  | 217.31                 | 44.33             | 4.60                   |
-| ERC20 Transfers | 33628   | 0          | 313.59                   | 94.28                  | 3.33              | 10.60                  |
-|                 | 33628   | 100us      | 12289.76                 | 270.19                 | 45.50             | 3.70                   |
-| Hybrid          | 36580   | 0          | 294.52                   | 204.64                 | 1.44              | 4.88                   |
-|                 | 36580   | 100us      | 10333.63                 | 1315.46                | 7.85              | 0.76                   |
+| Test            | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
+| --------------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
+| Raw Transfers   | 0          | 207.25                   | 77.05                  | 2.69              | 12.98                  |
+|                 | 100us      | 9610.52                  | 217.2                  | 44.29             | 4.6                    |
+| ERC20 Transfers | 0          | 316.57                   | 92.63                  | 3.42              | 12.54                  |
+|                 | 100us      | 12233.27                 | 263.9                  | 46.38             | 4.4                    |
+| Hybrid          | 0          | 295.44                   | 206.71                 | 1.43              | 4.85                   |
+|                 | 100us      | 10327.62                 | 1334.9                 | 7.73              | 0.75                   |
 
-*Table 5: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 10%_)_
+_Table 5: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 0%)_
 
-|                 | Num Txs | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
-| --------------- | ------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
-| Raw Transfers   | 47620   | 0          | 194.95                   | 171.65                 | 1.14              | 5.82                   |
-|                 | 47620   | 100us      | 8879.44                  | 4328.08                | 2.05              | 0.23                   |
-| ERC20 Transfers | 33628   | 0          | 313.48                   | 92.07                  | 3.41              | 10.86                  |
-|                 | 33628   | 100us      | 11434.40                 | 438.03                 | 26.14             | 2.28                   |
-| Hybrid          | 36580   | 0          | 292.63                   | 220.14                 | 1.33              | 4.54                   |
-|                 | 36580   | 100us      | 9742.60cd                | 1874.70                | 5.19              | 0.53                   |
+| Test            | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
+| --------------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
+| Raw Transfers   | 0          | 208.05                   | 77.86                  | 2.67              | 12.84                  |
+|                 | 100us      | 9632.2                   | 217.31                 | 44.33             | 4.6                    |
+| ERC20 Transfers | 0          | 313.59                   | 94.28                  | 3.33              | 12.32                  |
+|                 | 100us      | 12289.76                 | 270.19                 | 45.5              | 4.3                    |
+| Hybrid          | 0          | 294.52                   | 204.64                 | 1.44              | 4.9                    |
+|                 | 100us      | 10333.63                 | 1315.46                | 7.85              | 0.76                   |
 
-*Table 6: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 30%_)_
+_Table 6: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 10%)_
+
+| Test            | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
+| --------------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
+| Raw Transfers   | 0          | 194.95                   | 171.65                 | 1.14              | 5.83                   |
+|                 | 100us      | 8879.44                  | 4328.08                | 2.05              | 0.23                   |
+| ERC20 Transfers | 0          | 313.48                   | 92.07                  | 3.41              | 12.62                  |
+|                 | 100us      | 11434.4                  | 438.03                 | 26.14             | 2.65                   |
+| Hybrid          | 0          | 292.63                   | 220.14                 | 1.33              | 4.56                   |
+|                 | 100us      | 9742.6                   | 1874.7                 | 5.19              | 0.53                   |
+
+_Table 7: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 30%)_
 
 ![image.png](images/image%202.png)
 
