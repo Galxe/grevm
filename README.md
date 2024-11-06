@@ -83,6 +83,7 @@ transaction will read or write, which serves as input to build the data dependen
 before parallel execution, avoiding introducing additional computational overhead during execution.
 
 ![image.png](images/glassnode-studio_eth-ethereum-transaction-type-breakdown-relative.png)
+
 _Screenshot 1: Ideal Parallel Execution_
 
 While not all hints are perfectly precise, these simulation-based hints are generally accurate enough for practical
@@ -304,7 +305,7 @@ _Table 4: Contention Transactions Execution Test Setup_
 | Hybrid          | 0          | 295.44                   | 206.71                 | 1.43              | 4.85                   |
 |                 | 100us      | 10327.62                 | 1334.9                 | 7.73              | 0.75                   |
 
-_Table 5: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 0%)_
+_Table 5: Grevm 1.0 Contention Transactions Execution Speedup (hot ratio = 0%)_
 
 | Test            | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
 | --------------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
@@ -315,7 +316,7 @@ _Table 5: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 0%)_
 | Hybrid          | 0          | 294.52                   | 204.64                 | 1.44              | 4.9                    |
 |                 | 100us      | 10333.63                 | 1315.46                | 7.85              | 0.76                   |
 
-_Table 6: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 10%)_
+_Table 6: Grevm 1.0 Contention Transactions Execution Speedup (hot ratio = 10%)_
 
 | Test            | DB Latency | Sequential Execution(ms) | Parallel Execution(ms) | Execution Speedup | Throughput (Gigagas/s) |
 | --------------- | ---------- | ------------------------ | ---------------------- | ----------------- | ---------------------- |
@@ -326,7 +327,7 @@ _Table 6: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 10%)
 | Hybrid          | 0          | 292.63                   | 220.14                 | 1.33              | 4.56                   |
 |                 | 100us      | 9742.6                   | 1874.7                 | 5.19              | 0.53                   |
 
-_Table 7: Grevm 1.0 Contention Transactions Execution Speedup (*hot ratio = 30%)_
+_Table 7: Grevm 1.0 Contention Transactions Execution Speedup (hot ratio = 30%)_
 
 ![image.png](images/image%202.png)
 
