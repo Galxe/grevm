@@ -246,8 +246,10 @@ To compare Grevm with the vanilla BlockSTM algorithm, we ran
 should theoretically perform similarly, which is confirmed in our tests with raw and ERC20 transfers. However, the
 integration of asynchronous I/O in Grevm allows for better utilization of system resources, leading to significantly
 superior performance when I/O latency is present. For Uniswap transactions, Grevm's results are slower because the state
-merging part remains sequential in the current implementation. Since this component will be completely reworked in the
-upcoming 2.0 implementation, we will not optimize it in the current version.
+merging part remains sequential in the current implementation. It introduces many unnecessary copies, and when
+changesets are large, e.g. Uniswap transactions, these copies significantly slow down the execution. But since this
+component will be completely reworked in the upcoming 2.0 implementation, we will not optimize it in the current
+version.
 
 We noticed that some transactions in our benchmark may refund gas, e.g. when ERC20 balances become zero. The refunded
 gas are not accounted for in the total gas in our case, which may lead to a slight discrepancy in the throughput
