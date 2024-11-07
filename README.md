@@ -230,14 +230,14 @@ The introduction of I/O latency amplified the performance advantages of parallel
 suffers from increased latency due to its linear processing nature, parallel execution mitigates this effect by
 overlapping I/O operations across multiple threads. See Figure 3.
 
-|                 | Num Txs | DB Latency | Sequential Execution pevm (ms) | Parallel Execution pevm (ms) | Execution<br>Speedup | Throughput (Gigagas/s) |
-| --------------- | ------- | ---------- | ------------------------------ | ---------------------------- | -------------------- | ---------------------- |
-| Raw Transfers   | 47620   | 0          | 156.47                         | 55.488                       | 2.82                 | 18.02                  |
-|                 | 47620   | 100us      | 7484.1                         | 259.18                       | 28.88                | 3.85                   |
-| ERC20 Transfers | 33628   | 0          | 278.24                         | 65.127                       | 4.27                 | 15.35                  |
-|                 | 33628   | 100us      | 10628                          | 683.13                       | 15.55                | 1.46                   |
-| Uniswap Swaps   | 6413    | 0          | 665.96                         | 33.787                       | 19.71                | 29.59                  |
-|                 | 6413    | 100us      | 26368                          | 839.49                       | 31.4                 | 1.19                   |
+|                 | Num Txs | DB Latency | Sequential Execution pevm (ms) | Parallel Execution pevm (ms) | Execution Speedup | Throughput (Gigagas/s) |
+| --------------- | ------- | ---------- | ------------------------------ | ---------------------------- | ----------------- | ---------------------- |
+| Raw Transfers   | 47620   | 0          | 156.47                         | 55.488                       | 2.82              | 18.02                  |
+|                 | 47620   | 100us      | 7484.1                         | 259.18                       | 28.88             | 3.85                   |
+| ERC20 Transfers | 33628   | 0          | 278.24                         | 65.127                       | 4.27              | 15.35                  |
+|                 | 33628   | 100us      | 10628                          | 683.13                       | 15.55             | 1.46                   |
+| Uniswap Swaps   | 6413    | 0          | 665.96                         | 33.787                       | 19.71             | 29.59                  |
+|                 | 6413    | 100us      | 26368                          | 839.49                       | 31.4              | 1.19                   |
 
 _Table 2: pevm Benchmark Result of Conflict-Free Transaction Execution_
 
@@ -248,6 +248,10 @@ integration of asynchronous I/O in Grevm allows for better utilization of system
 superior performance when I/O latency is present. For Uniswap transactions, Grevm's results are slower because the state
 merging part remains sequential in the current implementation. Since this component will be completely reworked in the
 upcoming 2.0 implementation, we will not optimize it in the current version.
+
+We noticed that some transactions in our benchmark may refund gas, e.g. when ERC20 balances become zero. The refunded
+gas are not accounted for in the total gas in our case, which may lead to a slight discrepancy in the throughput
+calculation with pevm. We will conduct a more detailed analysis in the future.
 
 For a fair comparison, The above test result of _Table 1_ excludes certain overheads
 
