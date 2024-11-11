@@ -8,7 +8,7 @@ use revm::{
     },
     precompile::Address,
     primitives::{Account, AccountInfo, Bytecode, EvmState, B256, BLOCK_HASH_HISTORY, U256},
-    CacheState, Database, DatabaseRef, TransitionAccount, TransitionState,
+    CacheState, Database, DatabaseCommit, DatabaseRef, TransitionAccount, TransitionState,
 };
 use std::{
     collections::{btree_map, hash_map, BTreeMap, HashMap},
@@ -88,7 +88,11 @@ impl ParallelBundleState for BundleState {
         transitions: TransitionState,
         retention: BundleRetention,
     ) {
-        assert!(self.state.is_empty());
+        if !self.state.is_empty() {
+            self.apply_transitions_and_create_reverts(transitions, retention);
+            return;
+        }
+
         let include_reverts = retention.includes_reverts();
         // pessimistically pre-allocate assuming _all_ accounts changed.
         let reverts_capacity = if include_reverts { transitions.transitions.len() } else { 0 };
@@ -154,22 +158,13 @@ impl ParallelBundleState for BundleState {
     }
 }
 
-/// SchedulerDB is a database wrapper that manages state transitions and caching for the EVM.
-/// It maintains a cache of committed data, a transition state for ongoing transactions, and a
-/// bundle state for finalizing block state changes. It also tracks block hashes for quick access.
-///
-/// After each execution round, SchedulerDB caches the committed data of finalized
-/// transactions and the read-only data accessed during execution.
-/// This cached data serves as the initial state for the next round of partition executors.
-/// When reverting to sequential execution, these cached states will include both
-/// the changes from EVM execution and the cached/loaded accounts and storages.
-pub(crate) struct SchedulerDB<DB> {
+#[derive(Debug, Default)]
+pub struct State {
     /// Cache the committed data of finality txns and the read-only data during execution after
     /// each round of execution. Used as the initial state for the next round of partition
     /// executors. When fall back to sequential execution, used as cached state contains both
     /// changed from evm execution and cached/loaded account/storages.
     pub cache: CacheState,
-    pub database: DB,
     /// Block state, it aggregates transactions transitions into one state.
     ///
     /// Build reverts and state that gets applied to the state.
@@ -188,15 +183,47 @@ pub(crate) struct SchedulerDB<DB> {
     pub block_hashes: BTreeMap<u64, B256>,
 }
 
-impl<DB> SchedulerDB<DB> {
-    pub(crate) fn new(database: DB) -> Self {
-        Self {
-            cache: CacheState::new(false),
-            database,
-            transition_state: Some(TransitionState::default()),
-            bundle_state: BundleState::default(),
-            block_hashes: BTreeMap::new(),
+impl State {
+    /// Takes the current bundle state.
+    /// It is typically called after the bundle state has been finalized.
+    pub fn take_bundle(&mut self) -> BundleState {
+        std::mem::take(&mut self.bundle_state)
+    }
+
+    /// Take all transitions and merge them inside bundle state.
+    /// This action will create final post state and all reverts so that
+    /// we at any time revert state of bundle to the state before transition is applied.
+    #[fastrace::trace]
+    pub fn merge_transitions(&mut self, retention: BundleRetention) {
+        if let Some(transition_state) = self.transition_state.as_mut().map(TransitionState::take) {
+            self.bundle_state
+                .parallel_apply_transitions_and_create_reverts(transition_state, retention);
         }
+    }
+}
+
+/// SchedulerDB is a database wrapper that manages state transitions and caching for the EVM.
+/// It maintains a cache of committed data, a transition state for ongoing transactions, and a
+/// bundle state for finalizing block state changes. It also tracks block hashes for quick access.
+///
+/// After each execution round, SchedulerDB caches the committed data of finalized
+/// transactions and the read-only data accessed during execution.
+/// This cached data serves as the initial state for the next round of partition executors.
+/// When reverting to sequential execution, these cached states will include both
+/// the changes from EVM execution and the cached/loaded accounts and storages.
+#[allow(missing_debug_implementations)]
+pub struct SchedulerDB<DB> {
+    /// The cached state during execution.
+    pub state: Box<State>,
+
+    /// The underlying database that stores the state.
+    pub database: DB,
+}
+
+impl<DB> SchedulerDB<DB> {
+    /// Create new SchedulerDB with database
+    pub fn new(state: Box<State>, database: DB) -> Self {
+        Self { state, database }
     }
 
     /// This function is used to cache the committed data of finality txns and the read-only data
@@ -204,13 +231,7 @@ impl<DB> SchedulerDB<DB> {
     /// partition executors. When falling back to sequential execution, these cached states will
     /// include both the changes from EVM execution and the cached/loaded accounts/storages.
     pub(crate) fn commit_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
-        apply_transition_to_cache(&mut self.cache, &transitions);
-        self.apply_transition(transitions);
-    }
-
-    /// Fall back to sequential execute
-    pub(crate) fn commit(&mut self, changes: HashMap<Address, Account>) {
-        let transitions = self.cache.apply_evm_state(changes);
+        apply_transition_to_cache(&mut self.state.cache, &transitions);
         self.apply_transition(transitions);
     }
 
@@ -218,19 +239,8 @@ impl<DB> SchedulerDB<DB> {
     /// This will be used to create final post state and reverts.
     fn apply_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
         // add transition to transition state.
-        if let Some(s) = self.transition_state.as_mut() {
+        if let Some(s) = self.state.transition_state.as_mut() {
             s.add_transitions(transitions)
-        }
-    }
-
-    /// Take all transitions and merge them inside bundle state.
-    /// This action will create final post state and all reverts so that
-    /// we at any time revert state of bundle to the state before transition is applied.
-    #[fastrace::trace]
-    pub(crate) fn merge_transitions(&mut self, retention: BundleRetention) {
-        if let Some(transition_state) = self.transition_state.as_mut().map(TransitionState::take) {
-            self.bundle_state
-                .parallel_apply_transitions_and_create_reverts(transition_state, retention);
         }
     }
 }
@@ -242,7 +252,7 @@ where
     /// Load account from cache or database.
     /// If account is not found in cache, it will be loaded from database.
     fn load_cache_account(&mut self, address: Address) -> Result<&mut CacheAccount, DB::Error> {
-        match self.cache.accounts.entry(address) {
+        match self.state.cache.accounts.entry(address) {
             hash_map::Entry::Vacant(entry) => {
                 let info = self.database.basic_ref(address)?;
                 Ok(entry.insert(into_cache_account(info)))
@@ -273,7 +283,7 @@ where
             }
         }
         // append transition
-        if let Some(s) = self.transition_state.as_mut() {
+        if let Some(s) = self.state.transition_state.as_mut() {
             s.add_transitions(transitions)
         }
         Ok(())
@@ -377,7 +387,7 @@ where
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        let res = match self.cache.contracts.entry(code_hash) {
+        let res = match self.state.cache.contracts.entry(code_hash) {
             hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
             hash_map::Entry::Vacant(entry) => {
                 let code = self.database.code_by_hash_ref(code_hash)?;
@@ -389,18 +399,18 @@ where
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        load_storage(&mut self.cache, &self.database, address, index)
+        load_storage(&mut self.state.cache, &self.database, address, index)
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        match self.block_hashes.entry(number) {
+        match self.state.block_hashes.entry(number) {
             btree_map::Entry::Occupied(entry) => Ok(*entry.get()),
             btree_map::Entry::Vacant(entry) => {
                 let ret = *entry.insert(self.database.block_hash_ref(number)?);
 
                 // prune all hashes that are older than BLOCK_HASH_HISTORY
                 let last_block = number.saturating_sub(BLOCK_HASH_HISTORY);
-                while let Some(entry) = self.block_hashes.first_entry() {
+                while let Some(entry) = self.state.block_hashes.first_entry() {
                     if *entry.key() < last_block {
                         entry.remove();
                     } else {
@@ -411,6 +421,14 @@ where
                 Ok(ret)
             }
         }
+    }
+}
+
+impl<DB> DatabaseCommit for SchedulerDB<DB> {
+    /// Fall back to sequential execute
+    fn commit(&mut self, changes: HashMap<Address, Account>) {
+        let transitions = self.state.cache.apply_evm_state(changes);
+        self.apply_transition(transitions);
     }
 }
 
@@ -615,7 +633,7 @@ where
         let result = match self.cache.accounts.entry(address) {
             hash_map::Entry::Vacant(entry) => {
                 // 2. read initial state of this round from scheduler cache
-                if let Some(account) = self.scheduler_db.cache.accounts.get(&address) {
+                if let Some(account) = self.scheduler_db.state.cache.accounts.get(&address) {
                     Ok(entry.insert(account.clone()).account_info())
                 } else {
                     // 3. read from origin database
@@ -646,7 +664,7 @@ where
             hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
             hash_map::Entry::Vacant(entry) => {
                 // 2. read initial state of this round from scheduler cache
-                if let Some(code) = self.scheduler_db.cache.contracts.get(&code_hash) {
+                if let Some(code) = self.scheduler_db.state.cache.contracts.get(&code_hash) {
                     return Ok(entry.insert(code.clone()).clone());
                 }
 

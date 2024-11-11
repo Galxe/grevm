@@ -136,18 +136,19 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 tx: Default::default(),
             };
             let db = InMemoryDB::new(accounts.clone(), bytecodes, Default::default());
+            let mut executor = GrevmScheduler::new(spec_name.to_spec_id(), env, db, Arc::new(vec![tx_env.unwrap()]), None);
 
             match (
                 test.expect_exception.as_deref(),
-                GrevmScheduler::new(spec_name.to_spec_id(), env, db.clone(), Arc::new(vec![tx_env.unwrap()]))
-                    .parallel_execute(),
+                executor.parallel_execute(),
             ) {
                 // EIP-2681
                 (Some("TransactionException.NONCE_IS_MAX"), Ok(exec_results)) => {
                     assert_eq!(exec_results.results.len(), 1);
                     // This is overly strict as we only need the newly created account's code to be empty.
                     // Extracting such account is unjustified complexity so let's live with this for now.
-                    assert!(exec_results.state.state.values().all(|account| {
+                    let state = Arc::get_mut(&mut executor.database).unwrap().state.take_bundle();
+                    assert!(state.state.values().all(|account| {
                         match &account.info {
                             Some(account) => account.is_empty_code_hash(),
                             None => true,
@@ -187,7 +188,8 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
 
                     // This is a good reference for a minimal state/DB commitment logic for
                     // pevm/revm to meet the Ethereum specs throughout the eras.
-                    for (address, bundle) in exec_results.state.state {
+                    let state = Arc::get_mut(&mut executor.database).unwrap().state.take_bundle();
+                    for (address, bundle) in state.state {
                         if bundle.info.is_some() {
                             let chain_state_account = accounts.entry(address).or_default();
                             for (index, slot) in bundle.storage.iter() {

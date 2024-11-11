@@ -62,11 +62,12 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
             let root = Span::root(format!("{name} Grevm Parallel"), SpanContext::random());
             let _guard = root.set_local_parent();
             metrics::with_local_recorder(&recorder, || {
-                let executor = GrevmScheduler::new(
+                let mut executor = GrevmScheduler::new(
                     black_box(SpecId::LATEST),
                     black_box(env.clone()),
                     black_box(db.clone()),
                     black_box(txs.clone()),
+                    None,
                 );
                 let _ = executor.parallel_execute();
 
@@ -92,11 +93,12 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
             let root = Span::root(format!("{name} Grevm Sequential"), SpanContext::random());
             let _guard = root.set_local_parent();
             metrics::with_local_recorder(&recorder, || {
-                let executor = GrevmScheduler::new(
+                let mut executor = GrevmScheduler::new(
                     black_box(SpecId::LATEST),
                     black_box(env.clone()),
                     black_box(db.clone()),
                     black_box(txs.clone()),
+                    None,
                 );
                 let _ = executor.force_sequential_execute();
 

@@ -53,11 +53,12 @@ fn benchmark_mainnet(c: &mut Criterion) {
 
         group.bench_function("Grevm Parallel", |b| {
             b.iter(|| {
-                let executor = GrevmScheduler::new(
+                let mut executor = GrevmScheduler::new(
                     black_box(spec_id),
                     black_box(env.clone()),
                     black_box(db.clone()),
                     black_box(txs.clone()),
+                    None,
                 );
                 executor.parallel_execute()
             })
@@ -65,11 +66,12 @@ fn benchmark_mainnet(c: &mut Criterion) {
 
         group.bench_function("Grevm Sequential", |b| {
             b.iter(|| {
-                let executor = GrevmScheduler::new(
+                let mut executor = GrevmScheduler::new(
                     black_box(spec_id),
                     black_box(env.clone()),
                     black_box(db.clone()),
                     black_box(txs.clone()),
+                    None,
                 );
                 executor.force_sequential_execute()
             })

@@ -25,30 +25,25 @@ fn test_execute_alloy(block: Block, db: InMemoryDB) {
 
     let db = Arc::new(db);
 
-    let reth_result = common::execute_revm_sequential(db.clone(), spec_id, env.clone(), &*txs);
+    let reth_result =
+        common::execute_revm_sequential(db.clone(), spec_id, env.clone(), &*txs).unwrap();
 
     // create registry for metrics
     let recorder = DebuggingRecorder::new();
     let parallel_result = metrics::with_local_recorder(&recorder, || {
-        let executor = GrevmScheduler::new(spec_id, env, db, txs);
-        let parallel_result = executor.force_parallel_execute(true, Some(23));
+        let mut executor = GrevmScheduler::new(spec_id, env, db, txs, None);
+        let parallel_result = executor.force_parallel_execute(true, Some(23)).unwrap();
 
         let snapshot = recorder.snapshotter().snapshot();
-        for (key, unit, desc, value) in snapshot.into_vec() {
+        for (key, _, _, value) in snapshot.into_vec() {
             println!("metrics: {} => value: {:?}", key.key().name(), value);
         }
-        parallel_result
+        (parallel_result, Arc::get_mut(&mut executor.database).unwrap().state.take_bundle())
     });
 
-    common::compare_execution_result(
-        &reth_result.as_ref().unwrap().results,
-        &parallel_result.as_ref().unwrap().results,
-    );
+    common::compare_execution_result(&reth_result.0.results, &parallel_result.0.results);
 
-    common::compare_bundle_state(
-        &reth_result.as_ref().unwrap().state,
-        &parallel_result.as_ref().unwrap().state,
-    );
+    common::compare_bundle_state(&reth_result.1, &parallel_result.1);
 
     // TODO(gravity_nekomoto): compare the receipts root
 }

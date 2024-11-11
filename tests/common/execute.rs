@@ -115,25 +115,34 @@ pub(crate) fn compare_evm_execute<DB>(
     let db = Arc::new(db);
     let txs = Arc::new(txs);
     let start = Instant::now();
-    let sequential = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
-    let sequential_result = sequential.force_sequential_execute();
-    println!("Grevm sequential execute time: {}ms", start.elapsed().as_millis());
+    let sequential_result = {
+        let mut executor =
+            GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone(), None);
+        let sequential_result = executor.force_sequential_execute().unwrap();
+        println!("Grevm sequential execute time: {}ms", start.elapsed().as_millis());
+        let database = Arc::get_mut(&mut executor.database).unwrap();
+        database.state.merge_transitions(BundleRetention::Reverts);
+        (sequential_result, database.state.take_bundle())
+    };
 
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
-        let parallel = GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone());
+        let mut executor =
+            GrevmScheduler::new(SpecId::LATEST, env.clone(), db.clone(), txs.clone(), None);
         // set determined partitions
-        let parallel_result = parallel.force_parallel_execute(with_hints, Some(23));
+        let parallel_result = executor.force_parallel_execute(with_hints, Some(23)).unwrap();
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
 
         let snapshot = recorder.snapshotter().snapshot();
-        for (key, unit, desc, value) in snapshot.into_vec() {
+        for (key, _, _, value) in snapshot.into_vec() {
             println!("metrics: {} => value: {:?}", key.key().name(), value);
             if let Some(metric) = parallel_metrics.get(key.key().name()) {
                 assert_eq!(*metric, value);
             }
         }
-        parallel_result
+        let database = Arc::get_mut(&mut executor.database).unwrap();
+        database.state.merge_transitions(BundleRetention::Reverts);
+        (parallel_result, database.state.take_bundle())
     });
 
     let start = Instant::now();
@@ -142,7 +151,7 @@ pub(crate) fn compare_evm_execute<DB>(
 
     let mut max_gas_spent = 0;
     let mut max_gas_used = 0;
-    for result in &reth_result.as_ref().unwrap().results {
+    for result in &reth_result.as_ref().unwrap().0.results {
         match result {
             ExecutionResult::Success { gas_used, gas_refunded, .. } => {
                 max_gas_spent = max_gas_spent.max(gas_used + gas_refunded);
@@ -154,22 +163,13 @@ pub(crate) fn compare_evm_execute<DB>(
     println!("max_gas_spent: {}, max_gas_used: {}", max_gas_spent, max_gas_used);
 
     compare_execution_result(
-        &reth_result.as_ref().unwrap().results,
-        &sequential_result.as_ref().unwrap().results,
+        &reth_result.as_ref().unwrap().0.results,
+        &sequential_result.0.results,
     );
-    compare_execution_result(
-        &reth_result.as_ref().unwrap().results,
-        &parallel_result.as_ref().unwrap().results,
-    );
+    compare_execution_result(&reth_result.as_ref().unwrap().0.results, &parallel_result.0.results);
 
-    compare_bundle_state(
-        &reth_result.as_ref().unwrap().state,
-        &sequential_result.as_ref().unwrap().state,
-    );
-    compare_bundle_state(
-        &reth_result.as_ref().unwrap().state,
-        &parallel_result.as_ref().unwrap().state,
-    );
+    compare_bundle_state(&reth_result.as_ref().unwrap().1, &sequential_result.1);
+    compare_bundle_state(&reth_result.as_ref().unwrap().1, &parallel_result.1);
 }
 
 /// Simulate the sequential execution of transactions in reth
@@ -178,7 +178,7 @@ pub(crate) fn execute_revm_sequential<DB>(
     spec_id: SpecId,
     env: Env,
     txs: &[TxEnv],
-) -> Result<ExecuteOutput, EVMError<DB::Error>>
+) -> Result<(ExecuteOutput, BundleState), EVMError<DB::Error>>
 where
     DB: DatabaseRef,
     DB::Error: Debug,
@@ -201,7 +201,7 @@ where
 
     evm.db_mut().merge_transitions(BundleRetention::Reverts);
 
-    Ok(ExecuteOutput { state: evm.db_mut().take_bundle(), results })
+    Ok((ExecuteOutput { results }, evm.db_mut().take_bundle()))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]

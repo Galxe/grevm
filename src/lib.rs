@@ -25,7 +25,8 @@ use tokio::runtime::{Builder, Runtime};
 mod hint;
 mod partition;
 mod scheduler;
-mod storage;
+/// Manages storage-related operations.
+pub mod storage;
 mod tx_dependency;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
