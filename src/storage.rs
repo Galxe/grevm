@@ -158,7 +158,7 @@ impl ParallelBundleState for BundleState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     /// Cache the committed data of finality txns and the read-only data during execution after
     /// each round of execution. Used as the initial state for the next round of partition
@@ -181,6 +181,17 @@ pub struct State {
     /// This map can be used to give different values for block hashes if in case
     /// The fork block is different or some blocks are not saved inside database.
     pub block_hashes: BTreeMap<u64, B256>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            cache: CacheState::new(false),
+            transition_state: Some(TransitionState::default()),
+            bundle_state: BundleState::default(),
+            block_hashes: BTreeMap::new(),
+        }
+    }
 }
 
 impl State {

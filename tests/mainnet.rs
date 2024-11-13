@@ -8,7 +8,10 @@ use alloy_rpc_types::{Block, BlockTransactions};
 use common::{compat, storage::InMemoryDB};
 use grevm::GrevmScheduler;
 use metrics_util::debugging::DebuggingRecorder;
-use revm::primitives::{Env, TxEnv};
+use revm::{
+    db::states::bundle_state::BundleRetention,
+    primitives::{Env, TxEnv},
+};
 
 fn test_execute_alloy(block: Block, db: InMemoryDB) {
     let spec_id = compat::get_block_spec(&block.header);
@@ -38,7 +41,10 @@ fn test_execute_alloy(block: Block, db: InMemoryDB) {
         for (key, _, _, value) in snapshot.into_vec() {
             println!("metrics: {} => value: {:?}", key.key().name(), value);
         }
-        (parallel_result, Arc::get_mut(&mut executor.database).unwrap().state.take_bundle())
+
+        let database = Arc::get_mut(&mut executor.database).unwrap();
+        database.state.merge_transitions(BundleRetention::Reverts);
+        (parallel_result, database.state.take_bundle())
     });
 
     common::compare_execution_result(&reth_result.0.results, &parallel_result.0.results);

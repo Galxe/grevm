@@ -305,13 +305,18 @@ where
         }
 
         let start = Instant::now();
-        GREVM_RUNTIME.block_on(async {
-            let mut tasks = vec![];
-            for executor in &self.partition_executors {
-                let executor = executor.clone();
-                tasks.push(GREVM_RUNTIME.spawn(async move { executor.write().unwrap().execute() }));
-            }
-            futures::future::join_all(tasks).await;
+        // Do not block tokio runtime if we are in async context
+        tokio::task::block_in_place(|| {
+            GREVM_RUNTIME.block_on(async {
+                let mut tasks = vec![];
+                for executor in &self.partition_executors {
+                    let executor = executor.clone();
+                    tasks.push(
+                        GREVM_RUNTIME.spawn(async move { executor.write().unwrap().execute() }),
+                    );
+                }
+                futures::future::join_all(tasks).await;
+            })
         });
         self.metrics.parallel_execute_time.increment(start.elapsed().as_nanos() as u64);
 
