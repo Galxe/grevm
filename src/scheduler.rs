@@ -681,4 +681,10 @@ where
     pub fn force_sequential_execute(&mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
         self.evm_execute(Some(true), false, None)
     }
+
+    /// Take the state of the scheduler.
+    /// It is typically called after the execution.
+    pub fn take_state(self) -> Box<State> {
+        Arc::try_unwrap(self.database).ok().unwrap().state
+    }
 }
