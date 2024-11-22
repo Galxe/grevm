@@ -44,7 +44,6 @@ lazy_static! {
         .unwrap();
 }
 
-use crate::storage::LazyUpdateValue;
 pub use scheduler::*;
 
 /// The maximum number of rounds for transaction execution.
@@ -133,7 +132,7 @@ pub(crate) struct ResultAndTransition {
     pub transition: Vec<(Address, TransitionAccount)>,
 
     /// Rewards to miner.
-    pub miner_update: LazyUpdateValue,
+    pub rewards: u128,
 }
 
 /// Utility function for parallel execution using fork-join pattern.

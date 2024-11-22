@@ -8,6 +8,7 @@ use revm::{
     primitives::{Address, EVMError, Env, ResultAndState, SpecId, TxEnv, TxKind},
     DatabaseRef, EvmBuilder,
 };
+use revm_primitives::db::Database;
 use std::{
     collections::BTreeSet,
     sync::Arc,
@@ -97,10 +98,11 @@ where
     /// validation process.
     pub(crate) fn execute(&mut self) {
         let start = Instant::now();
+        let coinbase = self.env.block.coinbase;
         let mut evm = EvmBuilder::default()
             .with_db(&mut self.partition_db)
             .with_spec_id(self.spec_id)
-            .with_env(Box::new(self.env.clone()))
+            .with_env(Box::new(std::mem::take(&mut self.env)))
             .build();
 
         #[allow(invalid_reference_casting)]
@@ -112,6 +114,16 @@ where
 
             if let Some(tx) = self.txs.get(txid) {
                 *evm.tx_mut() = tx.clone();
+                let mut raw_transfer = true;
+                if let Ok(Some(info)) = evm.db_mut().basic(tx.caller) {
+                    raw_transfer &= info.is_empty_code_hash();
+                }
+                if let TxKind::Call(to) = tx.transact_to {
+                    if let Ok(Some(info)) = evm.db_mut().basic(to) {
+                        raw_transfer &= info.is_empty_code_hash();
+                    }
+                }
+                evm.db_mut().raw_transfer = raw_transfer;
             } else {
                 panic!("Wrong transactions ID");
             }
@@ -129,13 +141,12 @@ where
                 }
             }
             if should_execute {
-                let result = evm.transact();
+                let result = evm.transact_lazy_reward();
                 match result {
                     Ok(result_and_state) => {
-                        let ResultAndState { result, mut state } = result_and_state;
-                        let mut read_set = evm.db_mut().take_read_set();
-                        let (write_set, miner_update, remove_miner) =
-                            evm.db().generate_write_set(&mut state);
+                        let ResultAndState { result, mut state, rewards } = result_and_state;
+                        let read_set = evm.db_mut().take_read_set();
+                        let write_set = evm.db().generate_write_set(&mut state);
 
                         // Check if the transaction can be skipped
                         // skip_validation=true does not necessarily mean the transaction can skip
@@ -144,19 +155,12 @@ where
                         // if a transaction with a smaller TxID conflicts,
                         // the states of subsequent transactions are invalid.
                         let mut skip_validation =
+                            !matches!(read_set.get(&LocationAndType::Basic(coinbase)), Some(None));
+                        skip_validation &=
                             read_set.iter().all(|l| tx_states[txid].read_set.contains_key(l.0));
                         skip_validation &=
                             write_set.iter().all(|l| tx_states[txid].write_set.contains(l));
 
-                        if remove_miner {
-                            // remove miner's state if we handle rewards separately
-                            state.remove(&self.coinbase);
-                        } else {
-                            // add miner to read set, because it's in write set.
-                            // set miner's value to None to make this tx redo in next round if
-                            // unconfirmed.
-                            read_set.insert(LocationAndType::Basic(self.coinbase), None);
-                        }
                         // temporary commit to cache_db, to make use the remaining txs can read the
                         // updated data
                         let transition = evm.db_mut().temporary_commit(state);
@@ -171,7 +175,7 @@ where
                             execute_result: ResultAndTransition {
                                 result: Some(result),
                                 transition,
-                                miner_update,
+                                rewards,
                             },
                         };
                     }

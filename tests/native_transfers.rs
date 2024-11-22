@@ -348,3 +348,82 @@ fn native_transfer_with_beneficiary() {
         .collect(),
     );
 }
+
+#[test]
+fn native_transfer_with_beneficiary_enough() {
+    let block_size = 20; // number of transactions
+    let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let db = InMemoryDB::new(accounts, Default::default(), Default::default());
+    let mut txs: Vec<TxEnv> = (START_ADDRESS..START_ADDRESS + block_size)
+        .map(|i| {
+            let address = Address::from(U160::from(i));
+            TxEnv {
+                caller: address,
+                transact_to: TransactTo::Call(address),
+                value: U256::from(100),
+                gas_limit: common::TRANSFER_GAS_LIMIT,
+                gas_price: U256::from(1),
+                nonce: None,
+                ..TxEnv::default()
+            }
+        })
+        .collect();
+    let start_address = Address::from(U160::from(START_ADDRESS));
+    let miner_address = Address::from(U160::from(MINER_ADDRESS));
+    // start => miner
+    txs.push(TxEnv {
+        caller: start_address,
+        transact_to: TransactTo::Call(miner_address),
+        value: U256::from(100000),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(2),
+        ..TxEnv::default()
+    });
+    // miner => start
+    txs.push(TxEnv {
+        caller: miner_address,
+        transact_to: TransactTo::Call(start_address),
+        value: U256::from(1),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(1),
+        ..TxEnv::default()
+    });
+    // miner => start
+    txs.push(TxEnv {
+        caller: miner_address,
+        transact_to: TransactTo::Call(start_address),
+        value: U256::from(1),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(2),
+        ..TxEnv::default()
+    });
+    // miner => miner
+    txs.push(TxEnv {
+        caller: miner_address,
+        transact_to: TransactTo::Call(miner_address),
+        value: U256::from(1),
+        gas_limit: common::TRANSFER_GAS_LIMIT,
+        gas_price: U256::from(1),
+        nonce: Some(3),
+        ..TxEnv::default()
+    });
+    common::compare_evm_execute(
+        db,
+        txs,
+        true,
+        [
+            ("grevm.parallel_round_calls", DebugValue::Counter(1)),
+            ("grevm.sequential_execute_calls", DebugValue::Counter(0)),
+            ("grevm.parallel_tx_cnt", DebugValue::Counter(24 as u64)),
+            ("grevm.conflict_tx_cnt", DebugValue::Counter(0)),
+            ("grevm.unconfirmed_tx_cnt", DebugValue::Counter(0)),
+            ("grevm.reusable_tx_cnt", DebugValue::Counter(0)),
+            ("grevm.skip_validation_cnt", DebugValue::Counter(24)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+}
