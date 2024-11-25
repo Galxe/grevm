@@ -1,4 +1,7 @@
-use crate::{fork_join_util, LocationAndType, LocationSet};
+use crate::{
+    fork_join_util, scheduler::RewardsAccumulators, LocationAndType, LocationSet, TxId,
+    GREVM_RUNTIME,
+};
 use ahash::{AHashMap, AHashSet};
 use fastrace::Span;
 use revm::{
@@ -17,6 +20,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use tokio::time::{timeout, Duration};
 
 trait ParallelBundleState {
     fn parallel_apply_transitions_and_create_reverts(
@@ -412,18 +416,28 @@ pub(crate) struct PartitionDB<DB> {
     /// Record the read set of current tx, will be consumed after the execution of each tx
     tx_read_set: AHashMap<LocationAndType, Option<U256>>,
 
+    pub current_txid: TxId,
     pub raw_transfer: bool,
+    rewards_accumulators: Arc<RewardsAccumulators>,
+    accumulated_rewards: u128,
 }
 
 impl<DB> PartitionDB<DB> {
-    pub(crate) fn new(coinbase: Address, scheduler_db: Arc<SchedulerDB<DB>>) -> Self {
+    pub(crate) fn new(
+        coinbase: Address,
+        scheduler_db: Arc<SchedulerDB<DB>>,
+        rewards_accumulators: Arc<RewardsAccumulators>,
+    ) -> Self {
         Self {
             coinbase,
             cache: CacheState::new(scheduler_db.state.cache.has_state_clear),
             scheduler_db,
             block_hashes: BTreeMap::new(),
             tx_read_set: AHashMap::new(),
+            current_txid: 0,
             raw_transfer: false,
+            rewards_accumulators,
+            accumulated_rewards: 0,
         }
     }
 
@@ -556,7 +570,7 @@ where
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         // 1. read from internal cache
-        let result = match self.cache.accounts.entry(address) {
+        let mut result = match self.cache.accounts.entry(address) {
             hash_map::Entry::Vacant(entry) => {
                 // 2. read initial state of this round from scheduler cache
                 if let Some(account) = self.scheduler_db.state.cache.accounts.get(&address) {
@@ -569,19 +583,51 @@ where
             }
             hash_map::Entry::Occupied(entry) => Ok(entry.get().account_info()),
         };
-        let mut balance = None;
-        if let Ok(account) = &result {
+
+        let mut inc_rewards = 0;
+        if address == self.coinbase && !self.raw_transfer {
+            if let Some(accumulator) = self.rewards_accumulators.get(&self.current_txid) {
+                let mut wait_time_ms = 0;
+                let loop_wait_time = 10; // 10ms
+                let wait_time_out = 10_1000; // 10s
+                while accumulator.accumulate_counter.load(Ordering::Acquire) <
+                    accumulator.accumulate_num
+                {
+                    let notifier = accumulator.notifier.clone();
+                    tokio::task::block_in_place(move || {
+                        GREVM_RUNTIME.block_on(async move {
+                            let _ =
+                                timeout(Duration::from_millis(loop_wait_time), notifier.notified())
+                                    .await
+                                    .is_ok();
+                        })
+                    });
+                    wait_time_ms += loop_wait_time;
+                    if wait_time_ms > wait_time_out {
+                        panic!(
+                            "wait to much time for the accumulated rewards of account({:?})",
+                            address
+                        );
+                    }
+                }
+                let new_rewards = accumulator.accumulate_rewards.load(Ordering::Acquire);
+                inc_rewards = new_rewards - self.accumulated_rewards;
+                self.accumulated_rewards = new_rewards;
+            }
+            self.tx_read_set.entry(LocationAndType::Basic(address)).or_insert(None);
+        }
+        let mut balance = U256::ZERO;
+        if let Ok(account) = &mut result {
             if let Some(info) = account {
                 if !info.is_empty_code_hash() {
                     self.tx_read_set.insert(LocationAndType::Code(address), None);
                 }
-                balance = Some(info.balance);
+                info.balance = info.balance.saturating_add(U256::from(inc_rewards));
+                balance = info.balance;
             }
         }
-        if address == self.coinbase && !self.raw_transfer {
-            self.tx_read_set.entry(LocationAndType::Basic(address)).or_insert(None);
-        } else {
-            self.tx_read_set.entry(LocationAndType::Basic(address)).or_insert(balance);
+        if address != self.coinbase || self.raw_transfer {
+            self.tx_read_set.entry(LocationAndType::Basic(address)).or_insert(Some(balance));
         }
         result
     }

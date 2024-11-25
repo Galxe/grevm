@@ -1,4 +1,5 @@
 use crate::{
+    scheduler::RewardsAccumulators,
     storage::{PartitionDB, SchedulerDB},
     LocationAndType, PartitionId, ResultAndTransition, SharedTxStates, TransactionStatus, TxId,
     TxState,
@@ -11,7 +12,7 @@ use revm::{
 use revm_primitives::db::Database;
 use std::{
     collections::BTreeSet,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -52,6 +53,8 @@ where
     tx_states: SharedTxStates,
     txs: Arc<Vec<TxEnv>>,
 
+    rewards_accumulators: Arc<RewardsAccumulators>,
+
     pub partition_db: PartitionDB<DB>,
     pub assigned_txs: Vec<TxId>,
 
@@ -70,13 +73,14 @@ where
         spec_id: SpecId,
         partition_id: PartitionId,
         env: Env,
+        rewards_accumulators: Arc<RewardsAccumulators>,
         scheduler_db: Arc<SchedulerDB<DB>>,
         txs: Arc<Vec<TxEnv>>,
         tx_states: SharedTxStates,
         assigned_txs: Vec<TxId>,
     ) -> Self {
         let coinbase = env.block.coinbase;
-        let partition_db = PartitionDB::new(coinbase, scheduler_db);
+        let partition_db = PartitionDB::new(coinbase, scheduler_db, rewards_accumulators.clone());
         Self {
             spec_id,
             env,
@@ -84,6 +88,7 @@ where
             partition_id,
             tx_states,
             txs,
+            rewards_accumulators,
             partition_db,
             assigned_txs,
             error_txs: HashMap::new(),
@@ -114,6 +119,7 @@ where
 
             if let Some(tx) = self.txs.get(txid) {
                 *evm.tx_mut() = tx.clone();
+                evm.db_mut().current_txid = txid;
                 let mut raw_transfer = true;
                 if let Ok(Some(info)) = evm.db_mut().basic(tx.caller) {
                     raw_transfer &= info.is_empty_code_hash();
@@ -124,11 +130,13 @@ where
                     }
                 }
                 evm.db_mut().raw_transfer = raw_transfer;
+                evm.db_mut().take_read_set(); // clean read set
             } else {
                 panic!("Wrong transactions ID");
             }
             // If the transaction is unconfirmed, it may not require repeated execution
             let mut should_execute = true;
+            let mut update_rewards = 0;
             if tx_states[txid].tx_status == TransactionStatus::Unconfirmed {
                 if evm.db_mut().check_read_set(&tx_states[txid].read_set) {
                     // Unconfirmed transactions from the previous round might not need to be
@@ -137,6 +145,7 @@ where
                     evm.db_mut().temporary_commit_transition(transition);
                     should_execute = false;
                     self.metrics.reusable_tx_cnt += 1;
+                    update_rewards = tx_states[txid].execute_result.rewards;
                     tx_states[txid].tx_status = TransactionStatus::SkipValidation;
                 }
             }
@@ -178,6 +187,7 @@ where
                                 rewards,
                             },
                         };
+                        update_rewards = rewards;
                     }
                     Err(err) => {
                         // In a parallel execution environment, transactions might fail due to
@@ -192,10 +202,10 @@ where
                         let mut read_set = evm.db_mut().take_read_set();
                         // update write set with the caller and transact_to
                         let mut write_set = HashSet::new();
-                        read_set.insert(LocationAndType::Basic(evm.tx().caller), None);
+                        read_set.entry(LocationAndType::Basic(evm.tx().caller)).or_insert(None);
                         write_set.insert(LocationAndType::Basic(evm.tx().caller));
                         if let TxKind::Call(to) = evm.tx().transact_to {
-                            read_set.insert(LocationAndType::Basic(to), None);
+                            read_set.entry(LocationAndType::Basic(to)).or_insert(None);
                             write_set.insert(LocationAndType::Basic(to));
                         }
 
@@ -209,7 +219,25 @@ where
                     }
                 }
             }
+            if !self.rewards_accumulators.is_empty() {
+                Self::report_rewards(self.rewards_accumulators.clone(), txid, update_rewards);
+            }
         }
         self.metrics.execute_time = start.elapsed();
+    }
+
+    fn report_rewards(rewards_accumulators: Arc<RewardsAccumulators>, txid: TxId, rewards: u128) {
+        if !rewards_accumulators.is_empty() {
+            for (_, accumulator) in rewards_accumulators.range((txid + 1)..) {
+                let counter = accumulator.accumulate_counter.fetch_add(1, Ordering::Release);
+                accumulator.accumulate_rewards.fetch_add(rewards, Ordering::Release);
+                if counter >= accumulator.accumulate_num {
+                    panic!("to many reward records!");
+                }
+                if counter == accumulator.accumulate_num - 1 {
+                    accumulator.notifier.notify_one();
+                }
+            }
+        }
     }
 }

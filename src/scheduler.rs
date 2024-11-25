@@ -8,6 +8,8 @@ use crate::{
     GREVM_RUNTIME, MAX_NUM_ROUND,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use atomic::Atomic;
+use dashmap::DashSet;
 use fastrace::Span;
 use metrics::{counter, gauge};
 use revm::{
@@ -17,14 +19,12 @@ use revm::{
     CacheState, DatabaseCommit, DatabaseRef, EvmBuilder,
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::DerefMut,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, RwLock,
-    },
+    sync::{atomic::AtomicUsize, Arc, RwLock},
     time::{Duration, Instant},
 };
+use tokio::sync::Notify;
 use tracing::info;
 
 struct ExecuteMetrics {
@@ -132,6 +132,26 @@ impl TxState {
     }
 }
 
+pub(crate) struct RewardsAccumulator {
+    pub accumulate_num: usize,
+    pub accumulate_counter: AtomicUsize,
+    pub accumulate_rewards: Atomic<u128>,
+    pub notifier: Arc<Notify>,
+}
+
+impl RewardsAccumulator {
+    pub(crate) fn new(accumulate_num: usize) -> Self {
+        Self {
+            accumulate_num,
+            accumulate_counter: AtomicUsize::new(0),
+            accumulate_rewards: Atomic::<u128>::new(0),
+            notifier: Arc::new(Notify::new()),
+        }
+    }
+}
+
+pub(crate) type RewardsAccumulators = BTreeMap<TxId, RewardsAccumulator>;
+
 /// A shared reference to a vector of transaction states.
 /// Used to share the transaction states between the partition executors.
 /// Since the state of a transaction is not modified by multiple threads simultaneously,
@@ -175,6 +195,8 @@ where
     /// number of finality txs in the current round
     num_finality_txs: usize,
     results: Vec<ExecutionResult>,
+
+    rewards_accumulators: Arc<RewardsAccumulators>,
 
     metrics: ExecuteMetrics,
 }
@@ -262,6 +284,7 @@ where
             partition_executors: vec![],
             num_finality_txs: 0,
             results: Vec::with_capacity(num_txs),
+            rewards_accumulators: Arc::new(RewardsAccumulators::new()),
             metrics: Default::default(),
         }
     }
@@ -298,6 +321,7 @@ where
                 self.spec_id,
                 partition_id,
                 self.env.clone(),
+                self.rewards_accumulators.clone(),
                 self.database.clone(),
                 self.txs.clone(),
                 self.tx_states.clone(),
@@ -357,7 +381,7 @@ where
     /// and there is no need to record the dependency and dependent relationships of these
     /// transactions. Thus achieving the purpose of pruning.
     #[fastrace::trace]
-    fn update_and_pruning_dependency(&mut self, max_miner_involved_tx: TxId) {
+    fn update_and_pruning_dependency(&mut self) {
         let num_finality_txs = self.num_finality_txs;
         if num_finality_txs == self.txs.len() {
             return;
@@ -368,19 +392,14 @@ where
             let executor = executor.read().unwrap();
             for (txid, dep) in executor.assigned_txs.iter().zip(executor.tx_dependency.iter()) {
                 let txid = *txid;
-                if txid >= num_finality_txs && txid >= max_miner_involved_tx {
-                    if txid == max_miner_involved_tx {
-                        new_dependency[txid - num_finality_txs] =
-                            (num_finality_txs..max_miner_involved_tx).collect();
-                    } else {
-                        // pruning the tx that is finality state
-                        new_dependency[txid - num_finality_txs] = dep
-                            .clone()
-                            .into_iter()
-                            // pruning the dependent tx that is finality state
-                            .filter(|dep_id| *dep_id >= num_finality_txs)
-                            .collect();
-                    }
+                if txid >= num_finality_txs {
+                    // pruning the tx that is finality state
+                    new_dependency[txid - num_finality_txs] = dep
+                        .clone()
+                        .into_iter()
+                        // pruning the dependent tx that is finality state
+                        .filter(|dep_id| *dep_id >= num_finality_txs)
+                        .collect();
                 }
             }
         }
@@ -390,13 +409,12 @@ where
     /// Generate unconfirmed transactions, and find the continuous minimum TxID,
     /// which can be marked as finality transactions.
     #[fastrace::trace]
-    fn generate_unconfirmed_txs(&mut self) -> TxId {
+    fn generate_unconfirmed_txs(&mut self) -> Vec<TxId> {
         let num_partitions = self.num_partitions;
         let (end_skip_id, merged_write_set) = self.merge_write_set();
         self.metrics.skip_validation_cnt.increment((end_skip_id - self.num_finality_txs) as u64);
         let miner_location = LocationAndType::Basic(self.coinbase);
-        let min_tx_id = self.num_finality_txs;
-        let max_miner_involved_tx = AtomicUsize::new(min_tx_id);
+        let miner_involved_txs = DashSet::new();
         fork_join_util(num_partitions, Some(num_partitions), |_, _, part| {
             // Transaction validation process:
             // 1. For each transaction in each partition, traverse its read set and find the largest
@@ -412,17 +430,19 @@ where
             let tx_states =
                 unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
 
-            for (index, txid) in executor.assigned_txs.iter().enumerate() {
+            for txid in executor.assigned_txs.iter() {
                 let txid = *txid;
                 let mut conflict = tx_states[txid].tx_status == TransactionStatus::Conflict;
                 let mut updated_dependencies = BTreeSet::new();
                 if txid >= end_skip_id {
                     for (location, balance) in tx_states[txid].read_set.iter() {
-                        if *location == miner_location {
-                            if balance.is_none() && txid - min_tx_id != index {
+                        if *location == miner_location && balance.is_none() {
+                            if txid != self.num_finality_txs &&
+                                !self.rewards_accumulators.contains_key(&txid)
+                            {
                                 conflict = true;
-                                max_miner_involved_tx.fetch_max(txid, Ordering::Relaxed);
                             }
+                            miner_involved_txs.insert(txid);
                         }
                         if let Some(written_txs) = merged_write_set.get(location) {
                             if let Some(previous_txid) = written_txs.range(..txid).next_back() {
@@ -447,7 +467,7 @@ where
                 }
             }
         });
-        max_miner_involved_tx.load(Ordering::Acquire)
+        miner_involved_txs.into_iter().collect()
     }
 
     /// Find the continuous minimum TxID, which can be marked as finality transactions.
@@ -536,8 +556,15 @@ where
 
         let span = Span::enter_with_local_parent("database commit transitions");
         let mut rewards = 0;
+        let rewards_start_txid =
+            match self.rewards_accumulators.range(..self.num_finality_txs).next_back() {
+                Some((txid, _)) => *txid,
+                None => start_txid,
+            };
         for txid in start_txid..self.num_finality_txs {
-            rewards += tx_states[txid].execute_result.rewards;
+            if txid >= rewards_start_txid {
+                rewards += tx_states[txid].execute_result.rewards;
+            }
             database
                 .commit_transition(std::mem::take(&mut tx_states[txid].execute_result.transition));
             self.results.push(tx_states[txid].execute_result.result.clone().unwrap());
@@ -562,11 +589,19 @@ where
     #[fastrace::trace]
     fn validate_transactions(&mut self) -> Result<(), GrevmError<DB::Error>> {
         let start = Instant::now();
-        let max_miner_involved_tx = self.generate_unconfirmed_txs();
+        let miner_involved_txs = self.generate_unconfirmed_txs();
         let finality_tx_cnt = self.find_continuous_min_txid()?;
         // update and pruning tx dependencies
-        self.update_and_pruning_dependency(max_miner_involved_tx);
+        self.update_and_pruning_dependency();
         self.commit_transition(finality_tx_cnt)?;
+        let mut rewards_accumulators = RewardsAccumulators::new();
+        for txid in miner_involved_txs {
+            if txid > self.num_finality_txs {
+                rewards_accumulators
+                    .insert(txid, RewardsAccumulator::new(txid - self.num_finality_txs));
+            }
+        }
+        self.rewards_accumulators = Arc::new(rewards_accumulators);
         self.metrics.validate_time.increment(start.elapsed().as_nanos() as u64);
         Ok(())
     }
