@@ -435,7 +435,7 @@ impl<DB> PartitionDB<DB> {
             block_hashes: BTreeMap::new(),
             tx_read_set: AHashMap::new(),
             current_txid: 0,
-            raw_transfer: false,
+            raw_transfer: true,
             rewards_accumulators,
             accumulated_rewards: 0,
         }

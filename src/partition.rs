@@ -120,9 +120,10 @@ where
             if let Some(tx) = self.txs.get(txid) {
                 *evm.tx_mut() = tx.clone();
                 evm.db_mut().current_txid = txid;
+                evm.db_mut().raw_transfer = true; // no need to wait miner rewards
                 let mut raw_transfer = true;
                 if let Ok(Some(info)) = evm.db_mut().basic(tx.caller) {
-                    raw_transfer &= info.is_empty_code_hash();
+                    raw_transfer = info.is_empty_code_hash();
                 }
                 if let TxKind::Call(to) = tx.transact_to {
                     if let Ok(Some(info)) = evm.db_mut().basic(to) {
@@ -137,7 +138,9 @@ where
             // If the transaction is unconfirmed, it may not require repeated execution
             let mut should_execute = true;
             let mut update_rewards = 0;
-            if tx_states[txid].tx_status == TransactionStatus::Unconfirmed {
+            if tx_states[txid].tx_status == TransactionStatus::Unconfirmed &&
+                !self.rewards_accumulators.contains_key(&txid)
+            {
                 if evm.db_mut().check_read_set(&tx_states[txid].read_set) {
                     // Unconfirmed transactions from the previous round might not need to be
                     // re-executed.
@@ -165,6 +168,7 @@ where
                         // the states of subsequent transactions are invalid.
                         let mut skip_validation =
                             !matches!(read_set.get(&LocationAndType::Basic(coinbase)), Some(None));
+                        skip_validation &= !self.rewards_accumulators.contains_key(&txid);
                         skip_validation &=
                             read_set.iter().all(|l| tx_states[txid].read_set.contains_key(l.0));
                         skip_validation &=
