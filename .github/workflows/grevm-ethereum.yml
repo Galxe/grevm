@@ -16,10 +16,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Initialize ethereum tests
-        run: |
-          git submodule update --init tests/ethereum/tests
-
       # install rust tools
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
@@ -28,4 +24,4 @@ jobs:
           override: true
 
       - name: Run tests
-        run: cargo test --test ethereum
+        run: cargo test --features update-submodule-ethereum-tests --test ethereum

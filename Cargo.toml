@@ -3,6 +3,7 @@ name = "grevm"
 version = "0.1.0"
 edition = "2021"
 description = "Create Parallel EVM"
+build = "build.rs"
 
 [dependencies]
 revm = { package = "revm", git = "https://github.com/galxe/revm", rev = "20b5883" }
@@ -59,3 +60,8 @@ harness = false
 codegen-units = 1
 panic = "abort"
 lto = "fat"
+
+[features]
+update-test-submodule = ["update-submodule-test-data", "update-submodule-ethereum-tests"]
+update-submodule-test-data = []
+update-submodule-ethereum-tests = []

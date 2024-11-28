@@ -35,3 +35,7 @@ rustc-ice-*
 
 # Rust lock file
 Cargo.lock
+
+# test submodules
+test_data
+tests/ethereum/tests
