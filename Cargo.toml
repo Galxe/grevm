@@ -6,8 +6,8 @@ description = "Create Parallel EVM"
 build = "build.rs"
 
 [dependencies]
-revm = { package = "revm", git = "https://github.com/galxe/revm", rev = "20b5883" }
-revm-primitives = { package = "revm-primitives", git = "https://github.com/galxe/revm", rev = "20b5883" }
+revm = { package = "revm", git = "https://github.com/galxe/revm", rev = "a32cd92" }
+revm-primitives = { package = "revm-primitives", git = "https://github.com/galxe/revm", rev = "a32cd92" }
 fastrace = "0.7"
 tracing = "0.1.40"
 ahash = { version = "0.8.11", features = ["serde"] }
@@ -36,7 +36,7 @@ criterion = "0.5.1"
 metrics-util = "0.17.0"
 walkdir = "2.5.0"
 rayon = "1.10.0"
-revme = { package = "revme", git = "https://github.com/galxe/revm", rev = "20b5883" }
+revme = { package = "revme", git = "https://github.com/galxe/revm", rev = "a32cd92" }
 fastrace = { version = "0.7", features = ["enable"] }
 fastrace-jaeger = "0.7"
 tikv-jemallocator = "0.5.0"
