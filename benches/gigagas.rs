@@ -40,7 +40,7 @@ fn get_metrics_counter_value(
     match snapshot
         .get(&CompositeKey::new(MetricKind::Counter, metrics::Key::from_static_name(name)))
     {
-        Some((_, _, DebugValue::Counter(value))) => *value,
+        Some((_, _, DebugValue::Gauge(value))) => *value,
         _ => panic!("{:?} not found", name),
     }
 }

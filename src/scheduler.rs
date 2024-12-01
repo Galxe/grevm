@@ -11,6 +11,7 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use atomic::Atomic;
 use dashmap::DashSet;
 use fastrace::Span;
+use lazy_static::lazy_static;
 use metrics::gauge;
 use revm::{
     primitives::{
@@ -100,6 +101,60 @@ impl Default for ExecuteMetrics {
             commit_transition_time: gauge!("grevm.commit_transition_time"),
             sequential_execute_time: gauge!("grevm.sequential_execute_time"),
         }
+    }
+}
+
+lazy_static! {
+    static ref EXECUTE_METRICS: ExecuteMetrics = ExecuteMetrics::default();
+}
+
+/// Collect metrics and report
+#[derive(Default)]
+struct ExecuteMetricsCollector {
+    parallel_execute_calls: u64,
+    sequential_execute_calls: u64,
+    total_tx_cnt: u64,
+    parallel_tx_cnt: u64,
+    sequential_tx_cnt: u64,
+    conflict_tx_cnt: u64,
+    finality_tx_cnt: u64,
+    unconfirmed_tx_cnt: u64,
+    reusable_tx_cnt: u64,
+    skip_validation_cnt: u64,
+    concurrent_partition_num: u64,
+    partition_et_diff: u64,
+    partition_tx_diff: u64,
+    parse_hints_time: u64,
+    partition_tx_time: u64,
+    parallel_execute_time: u64,
+    validate_time: u64,
+    merge_write_set_time: u64,
+    commit_transition_time: u64,
+    sequential_execute_time: u64,
+}
+
+impl ExecuteMetricsCollector {
+    fn report(&self) {
+        EXECUTE_METRICS.parallel_execute_calls.set(self.parallel_execute_calls as f64);
+        EXECUTE_METRICS.sequential_execute_calls.set(self.sequential_execute_calls as f64);
+        EXECUTE_METRICS.total_tx_cnt.set(self.total_tx_cnt as f64);
+        EXECUTE_METRICS.parallel_tx_cnt.set(self.parallel_tx_cnt as f64);
+        EXECUTE_METRICS.sequential_tx_cnt.set(self.sequential_tx_cnt as f64);
+        EXECUTE_METRICS.conflict_tx_cnt.set(self.conflict_tx_cnt as f64);
+        EXECUTE_METRICS.finality_tx_cnt.set(self.finality_tx_cnt as f64);
+        EXECUTE_METRICS.unconfirmed_tx_cnt.set(self.unconfirmed_tx_cnt as f64);
+        EXECUTE_METRICS.reusable_tx_cnt.set(self.reusable_tx_cnt as f64);
+        EXECUTE_METRICS.skip_validation_cnt.set(self.skip_validation_cnt as f64);
+        EXECUTE_METRICS.concurrent_partition_num.set(self.concurrent_partition_num as f64);
+        EXECUTE_METRICS.partition_et_diff.set(self.partition_et_diff as f64);
+        EXECUTE_METRICS.partition_tx_diff.set(self.partition_tx_diff as f64);
+        EXECUTE_METRICS.parse_hints_time.set(self.parse_hints_time as f64);
+        EXECUTE_METRICS.partition_tx_time.set(self.partition_tx_time as f64);
+        EXECUTE_METRICS.parallel_execute_time.set(self.parallel_execute_time as f64);
+        EXECUTE_METRICS.validate_time.set(self.validate_time as f64);
+        EXECUTE_METRICS.merge_write_set_time.set(self.merge_write_set_time as f64);
+        EXECUTE_METRICS.commit_transition_time.set(self.commit_transition_time as f64);
+        EXECUTE_METRICS.sequential_execute_time.set(self.sequential_execute_time as f64);
     }
 }
 
@@ -203,7 +258,7 @@ where
 
     rewards_accumulators: Arc<RewardsAccumulators>,
 
-    metrics: ExecuteMetrics,
+    metrics: ExecuteMetricsCollector,
 }
 
 /// A wrapper for DatabaseRef.
@@ -311,14 +366,15 @@ where
                 min = partition.len();
             }
         }
-        self.metrics.partition_tx_diff.set((max - min) as f64);
-        self.metrics.concurrent_partition_num.set(self.num_partitions as f64);
-        self.metrics.partition_tx_time.set(start.elapsed().as_nanos() as f64);
+        self.metrics.partition_tx_diff += (max - min) as u64;
+        self.metrics.concurrent_partition_num += self.num_partitions as u64;
+        self.metrics.partition_tx_time += start.elapsed().as_nanos() as u64;
     }
 
     /// Execute transactions in parallel.
     #[fastrace::trace]
     fn round_execute(&mut self) -> Result<(), GrevmError<DB::Error>> {
+        self.metrics.parallel_execute_calls += 1;
         self.partition_executors.clear();
         for partition_id in 0..self.num_partitions {
             let executor = PartitionExecutor::new(
@@ -348,7 +404,7 @@ where
                 futures::future::join_all(tasks).await;
             })
         });
-        self.metrics.parallel_execute_time.set(start.elapsed().as_nanos() as f64);
+        self.metrics.parallel_execute_time += start.elapsed().as_nanos() as u64;
 
         self.validate_transactions()
     }
@@ -376,7 +432,7 @@ where
                 }
             }
         }
-        self.metrics.merge_write_set_time.set(start.elapsed().as_nanos() as f64);
+        self.metrics.merge_write_set_time += start.elapsed().as_nanos() as u64;
         (end_skip_id, merged_write_set)
     }
 
@@ -416,7 +472,7 @@ where
     fn generate_unconfirmed_txs(&mut self) -> Vec<TxId> {
         let num_partitions = self.num_partitions;
         let (end_skip_id, merged_write_set) = self.merge_write_set();
-        self.metrics.skip_validation_cnt.set((end_skip_id - self.num_finality_txs) as f64);
+        self.metrics.skip_validation_cnt += (end_skip_id - self.num_finality_txs) as u64;
         let miner_location = LocationAndType::Basic(self.coinbase);
         let miner_involved_txs = DashSet::new();
         fork_join_util(num_partitions, Some(num_partitions), |_, _, part| {
@@ -482,7 +538,7 @@ where
         let mut max_execute_time = Duration::from_secs(0);
         for executor in &self.partition_executors {
             let mut executor = executor.write().unwrap();
-            self.metrics.reusable_tx_cnt.set(executor.metrics.reusable_tx_cnt as f64);
+            self.metrics.reusable_tx_cnt += executor.metrics.reusable_tx_cnt;
             min_execute_time = min_execute_time.min(executor.metrics.execute_time);
             max_execute_time = max_execute_time.max(executor.metrics.execute_time);
             if executor.assigned_txs[0] == self.num_finality_txs &&
@@ -496,7 +552,7 @@ where
         let mut conflict_tx_cnt = 0;
         let mut unconfirmed_tx_cnt = 0;
         let mut finality_tx_cnt = 0;
-        self.metrics.partition_et_diff.set((max_execute_time - min_execute_time).as_nanos() as f64);
+        self.metrics.partition_et_diff += (max_execute_time - min_execute_time).as_nanos() as u64;
         #[allow(invalid_reference_casting)]
         let tx_states =
             unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
@@ -522,14 +578,14 @@ where
                 }
             }
         }
-        self.metrics.conflict_tx_cnt.set(conflict_tx_cnt as f64);
-        self.metrics.unconfirmed_tx_cnt.set(unconfirmed_tx_cnt as f64);
-        self.metrics.finality_tx_cnt.set(finality_tx_cnt as f64);
+        self.metrics.conflict_tx_cnt += conflict_tx_cnt;
+        self.metrics.unconfirmed_tx_cnt += unconfirmed_tx_cnt;
+        self.metrics.finality_tx_cnt += finality_tx_cnt;
         info!(
             "Find continuous finality txs: conflict({}), unconfirmed({}), finality({})",
             conflict_tx_cnt, unconfirmed_tx_cnt, finality_tx_cnt
         );
-        return Ok(finality_tx_cnt);
+        return Ok(finality_tx_cnt as usize);
     }
 
     /// Commit the transition of the finality transactions, and update the minner's rewards.
@@ -585,7 +641,7 @@ where
         database
             .increment_balances(vec![(self.coinbase, rewards)])
             .map_err(|err| GrevmError::EvmError(EVMError::Database(err)))?;
-        self.metrics.commit_transition_time.set(start.elapsed().as_nanos() as f64);
+        self.metrics.commit_transition_time += start.elapsed().as_nanos() as u64;
         Ok(())
     }
 
@@ -608,7 +664,7 @@ where
             }
         }
         self.rewards_accumulators = Arc::new(rewards_accumulators);
-        self.metrics.validate_time.set(start.elapsed().as_nanos() as f64);
+        self.metrics.validate_time += start.elapsed().as_nanos() as u64;
         Ok(())
     }
 
@@ -637,8 +693,8 @@ where
     #[fastrace::trace]
     fn execute_remaining_sequential(&mut self) -> Result<(), GrevmError<DB::Error>> {
         let start = Instant::now();
-        self.metrics.sequential_execute_calls.set(1);
-        self.metrics.sequential_tx_cnt.set((self.txs.len() - self.num_finality_txs) as f64);
+        self.metrics.sequential_execute_calls += 1;
+        self.metrics.sequential_tx_cnt += (self.txs.len() - self.num_finality_txs) as u64;
         // MUST drop the `PartitionExecutor::scheduler_db` before get mut
         self.partition_executors.clear();
         let database = Arc::get_mut(&mut self.database).unwrap();
@@ -661,7 +717,7 @@ where
                 Err(err) => return Err(GrevmError::EvmError(err)),
             }
         }
-        self.metrics.sequential_execute_time.set(start.elapsed().as_nanos() as f64);
+        self.metrics.sequential_execute_time += start.elapsed().as_nanos() as u64;
         Ok(())
     }
 
@@ -671,7 +727,7 @@ where
         let hints = ParallelExecutionHints::new(self.tx_states.clone());
         hints.parse_hints(self.txs.clone());
         self.tx_dependencies.init_tx_dependency(self.tx_states.clone());
-        self.metrics.parse_hints_time.set(start.elapsed().as_nanos() as f64);
+        self.metrics.parse_hints_time += start.elapsed().as_nanos() as u64;
     }
 
     #[fastrace::trace]
@@ -688,7 +744,7 @@ where
             self.num_partitions = num_partitions;
         }
 
-        self.metrics.total_tx_cnt.set(self.txs.len() as f64);
+        self.metrics.total_tx_cnt += self.txs.len() as u64;
         let force_parallel = !force_sequential.unwrap_or(true); // adaptive false
         let force_sequential = force_sequential.unwrap_or(false); // adaptive false
 
@@ -711,14 +767,14 @@ where
                     break;
                 }
             }
-            self.metrics.parallel_execute_calls.set(round as f64);
-            self.metrics.parallel_tx_cnt.set(self.num_finality_txs as f64);
+            self.metrics.parallel_tx_cnt += self.num_finality_txs as u64;
         }
 
         if self.num_finality_txs < self.txs.len() {
             info!("Sequential execute {} remaining txs", self.txs.len() - self.num_finality_txs);
             self.execute_remaining_sequential()?;
         }
+        self.metrics.report();
 
         Ok(ExecuteOutput { results: std::mem::take(&mut self.results) })
     }
