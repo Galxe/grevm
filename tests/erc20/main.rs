@@ -50,11 +50,11 @@ fn erc20_gigagas() {
         txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(1.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge((block_size as f64).into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.skip_validation_cnt", DebugValue::Gauge((block_size as f64).into())),
+            ("grevm.parallel_round_calls", 1),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", block_size),
+            ("grevm.conflict_tx_cnt", 0),
+            ("grevm.skip_validation_cnt", block_size),
         ]
         .into_iter()
         .collect(),
@@ -123,17 +123,17 @@ fn erc20_hints_test() {
         txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(1.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge(3.0.into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.reusable_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.skip_validation_cnt", DebugValue::Gauge(3.0.into())),
+            ("grevm.parallel_round_calls", 1),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", 3),
+            ("grevm.conflict_tx_cnt", 0),
+            ("grevm.unconfirmed_tx_cnt", 0),
+            ("grevm.reusable_tx_cnt", 0),
+            ("grevm.skip_validation_cnt", 3),
             // important metrics!!! (tx0, tx1) are independent with (tx2)
             // so there are two partitions
-            ("grevm.concurrent_partition_num", DebugValue::Gauge(2.0.into())),
-            ("grevm.partition_num_tx_diff", DebugValue::Gauge(1.0.into())),
+            ("grevm.concurrent_partition_num", 2),
+            ("grevm.partition_num_tx_diff", 1),
         ]
         .into_iter()
         .collect(),
@@ -161,9 +161,9 @@ fn erc20_independent() {
         txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(1.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(0.0.into())),
+            ("grevm.parallel_round_calls", 1),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.conflict_tx_cnt", 0),
         ]
         .into_iter()
         .collect(),
@@ -199,11 +199,6 @@ fn erc20_batch_transfer() {
         db,
         final_txs,
         true,
-        [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(1.0.into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(0.0.into())),
-        ]
-        .into_iter()
-        .collect(),
+        [("grevm.parallel_round_calls", 1), ("grevm.conflict_tx_cnt", 0)].into_iter().collect(),
     );
 }

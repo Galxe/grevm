@@ -4,7 +4,6 @@ pub mod common;
 
 use crate::common::{MINER_ADDRESS, START_ADDRESS};
 use common::storage::InMemoryDB;
-use metrics_util::debugging::DebugValue;
 
 use revm::primitives::{alloy_primitives::U160, Address, TransactTo, TxEnv, U256};
 use std::collections::HashMap;
@@ -37,14 +36,14 @@ fn native_gigagas() {
         txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(1.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge((block_size as f64).into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.reusable_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.skip_validation_cnt", DebugValue::Gauge((block_size as f64).into())),
-            ("grevm.partition_num_tx_diff", DebugValue::Gauge(1.0.into())),
+            ("grevm.parallel_round_calls", 1),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", block_size),
+            ("grevm.conflict_tx_cnt", 0),
+            ("grevm.unconfirmed_tx_cnt", 0),
+            ("grevm.reusable_tx_cnt", 0),
+            ("grevm.skip_validation_cnt", block_size),
+            ("grevm.partition_num_tx_diff", 1),
         ]
         .into_iter()
         .collect(),
@@ -75,14 +74,14 @@ fn native_transfers_independent() {
         txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(1.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge((block_size as f64).into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.reusable_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.skip_validation_cnt", DebugValue::Gauge((block_size as f64).into())),
-            ("grevm.partition_num_tx_diff", DebugValue::Gauge(1.0.into())),
+            ("grevm.parallel_round_calls", 1),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", block_size),
+            ("grevm.conflict_tx_cnt", 0),
+            ("grevm.unconfirmed_tx_cnt", 0),
+            ("grevm.reusable_tx_cnt", 0),
+            ("grevm.skip_validation_cnt", block_size),
+            ("grevm.partition_num_tx_diff", 1),
         ]
         .into_iter()
         .collect(),
@@ -100,7 +99,7 @@ fn native_with_same_sender() {
     let mut sender_nonce = 0;
     let txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
-            let (address, to, nonce) = if i % 4 != 1 {
+            let (address, to, _) = if i % 4 != 1 {
                 (
                     Address::from(U160::from(START_ADDRESS + i)),
                     Address::from(U160::from(START_ADDRESS + i)),
@@ -132,13 +131,13 @@ fn native_with_same_sender() {
         txs,
         false,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(2.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge((block_size as f64).into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(24.0.into())),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Gauge(71.0.into())),
-            ("grevm.reusable_tx_cnt", DebugValue::Gauge(71.0.into())),
-            ("grevm.partition_num_tx_diff", DebugValue::Gauge(21.0.into())),
+            ("grevm.parallel_round_calls", 2),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", block_size),
+            ("grevm.conflict_tx_cnt", 24),
+            ("grevm.unconfirmed_tx_cnt", 71),
+            ("grevm.reusable_tx_cnt", 71),
+            ("grevm.partition_num_tx_diff", 22),
         ]
         .into_iter()
         .collect(),
@@ -172,14 +171,15 @@ fn native_with_all_related() {
         txs,
         false,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(2.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge((block_size as f64).into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(96.0.into())),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.reusable_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.concurrent_partition_num", DebugValue::Gauge(1.0.into())), // all transactions are related, so running in one partition
-            ("grevm.partition_num_tx_diff", DebugValue::Gauge(0.0.into())),
+            ("grevm.parallel_round_calls", 2),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", block_size),
+            ("grevm.conflict_tx_cnt", 96),
+            ("grevm.unconfirmed_tx_cnt", 0),
+            ("grevm.reusable_tx_cnt", 0),
+            // all transactions are related, so running in one partition
+            ("grevm.concurrent_partition_num", 1),
+            ("grevm.partition_num_tx_diff", 1),
         ]
         .into_iter()
         .collect(),
@@ -337,12 +337,12 @@ fn native_transfer_with_beneficiary() {
         txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(2.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge(24.0.into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(4.0.into())),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.reusable_tx_cnt", DebugValue::Gauge(0.0.into())),
+            ("grevm.parallel_round_calls", 2),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", 24),
+            ("grevm.conflict_tx_cnt", 4),
+            ("grevm.unconfirmed_tx_cnt", 0),
+            ("grevm.reusable_tx_cnt", 0),
         ]
         .into_iter()
         .collect(),
@@ -415,13 +415,13 @@ fn native_transfer_with_beneficiary_enough() {
         txs,
         true,
         [
-            ("grevm.parallel_round_calls", DebugValue::Gauge(1.0.into())),
-            ("grevm.sequential_execute_calls", DebugValue::Gauge(0.0.into())),
-            ("grevm.parallel_tx_cnt", DebugValue::Gauge(24.0.into())),
-            ("grevm.conflict_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.unconfirmed_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.reusable_tx_cnt", DebugValue::Gauge(0.0.into())),
-            ("grevm.skip_validation_cnt", DebugValue::Gauge(24.0.into())),
+            ("grevm.parallel_round_calls", 1),
+            ("grevm.sequential_execute_calls", 0),
+            ("grevm.parallel_tx_cnt", 24),
+            ("grevm.conflict_tx_cnt", 0),
+            ("grevm.unconfirmed_tx_cnt", 0),
+            ("grevm.reusable_tx_cnt", 0),
+            ("grevm.skip_validation_cnt", 24),
         ]
         .into_iter()
         .collect(),

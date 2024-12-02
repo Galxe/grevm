@@ -38,9 +38,11 @@ fn get_metrics_counter_value(
     name: &'static str,
 ) -> u64 {
     match snapshot
-        .get(&CompositeKey::new(MetricKind::Counter, metrics::Key::from_static_name(name)))
+        .get(&CompositeKey::new(MetricKind::Histogram, metrics::Key::from_static_name(name)))
     {
-        Some((_, _, DebugValue::Gauge(value))) => *value,
+        Some((_, _, DebugValue::Histogram(value))) => {
+            value.last().cloned().map_or(0, |ov| ov.0 as u64)
+        }
         _ => panic!("{:?} not found", name),
     }
 }

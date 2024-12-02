@@ -12,7 +12,7 @@ use atomic::Atomic;
 use dashmap::DashSet;
 use fastrace::Span;
 use lazy_static::lazy_static;
-use metrics::gauge;
+use metrics::{gauge, histogram};
 use revm::{
     primitives::{
         AccountInfo, Address, Bytecode, EVMError, Env, ExecutionResult, SpecId, TxEnv, B256, U256,
@@ -38,43 +38,43 @@ struct ExecuteMetrics {
     sequential_execute_calls: metrics::Gauge,
 
     /// Total number of transactions.
-    total_tx_cnt: metrics::Gauge,
+    total_tx_cnt: metrics::Histogram,
     /// Number of transactions executed in parallel.
-    parallel_tx_cnt: metrics::Gauge,
+    parallel_tx_cnt: metrics::Histogram,
     /// Number of transactions executed sequentially.
-    sequential_tx_cnt: metrics::Gauge,
+    sequential_tx_cnt: metrics::Histogram,
     /// Number of transactions that encountered conflicts.
-    conflict_tx_cnt: metrics::Gauge,
+    conflict_tx_cnt: metrics::Histogram,
     /// Number of transactions that reached finality.
-    finality_tx_cnt: metrics::Gauge,
+    finality_tx_cnt: metrics::Histogram,
     /// Number of transactions that are unconfirmed.
-    unconfirmed_tx_cnt: metrics::Gauge,
+    unconfirmed_tx_cnt: metrics::Histogram,
     /// Number of reusable transactions.
-    reusable_tx_cnt: metrics::Gauge,
+    reusable_tx_cnt: metrics::Histogram,
     /// Number of transactions that skip validation
-    skip_validation_cnt: metrics::Gauge,
+    skip_validation_cnt: metrics::Histogram,
 
     /// Number of concurrent partitions.
-    concurrent_partition_num: metrics::Gauge,
+    concurrent_partition_num: metrics::Histogram,
     /// Execution time difference between partitions(in nanoseconds).
-    partition_et_diff: metrics::Gauge,
+    partition_et_diff: metrics::Histogram,
     /// Number of transactions difference between partitions.
-    partition_tx_diff: metrics::Gauge,
+    partition_tx_diff: metrics::Histogram,
 
     /// Time taken to parse execution hints(in nanoseconds).
-    parse_hints_time: metrics::Gauge,
+    parse_hints_time: metrics::Histogram,
     /// Time taken to partition transactions(in nanoseconds).
-    partition_tx_time: metrics::Gauge,
+    partition_tx_time: metrics::Histogram,
     /// Time taken to execute transactions in parallel(in nanoseconds).
-    parallel_execute_time: metrics::Gauge,
+    parallel_execute_time: metrics::Histogram,
     /// Time taken to validate transactions(in nanoseconds).
-    validate_time: metrics::Gauge,
+    validate_time: metrics::Histogram,
     /// Time taken to merge write set.
-    merge_write_set_time: metrics::Gauge,
+    merge_write_set_time: metrics::Histogram,
     /// Time taken to commit transition
-    commit_transition_time: metrics::Gauge,
+    commit_transition_time: metrics::Histogram,
     /// Time taken to execute transactions in sequential(in nanoseconds).
-    sequential_execute_time: metrics::Gauge,
+    sequential_execute_time: metrics::Histogram,
 }
 
 impl Default for ExecuteMetrics {
@@ -82,30 +82,26 @@ impl Default for ExecuteMetrics {
         Self {
             parallel_execute_calls: gauge!("grevm.parallel_round_calls"),
             sequential_execute_calls: gauge!("grevm.sequential_execute_calls"),
-            total_tx_cnt: gauge!("grevm.total_tx_cnt"),
-            parallel_tx_cnt: gauge!("grevm.parallel_tx_cnt"),
-            sequential_tx_cnt: gauge!("grevm.sequential_tx_cnt"),
-            finality_tx_cnt: gauge!("grevm.finality_tx_cnt"),
-            conflict_tx_cnt: gauge!("grevm.conflict_tx_cnt"),
-            unconfirmed_tx_cnt: gauge!("grevm.unconfirmed_tx_cnt"),
-            reusable_tx_cnt: gauge!("grevm.reusable_tx_cnt"),
-            skip_validation_cnt: gauge!("grevm.skip_validation_cnt"),
-            concurrent_partition_num: gauge!("grevm.concurrent_partition_num"),
-            partition_et_diff: gauge!("grevm.partition_execution_time_diff"),
-            partition_tx_diff: gauge!("grevm.partition_num_tx_diff"),
-            parse_hints_time: gauge!("grevm.parse_hints_time"),
-            partition_tx_time: gauge!("grevm.partition_tx_time"),
-            parallel_execute_time: gauge!("grevm.parallel_execute_time"),
-            validate_time: gauge!("grevm.validate_time"),
-            merge_write_set_time: gauge!("grevm.merge_write_set_time"),
-            commit_transition_time: gauge!("grevm.commit_transition_time"),
-            sequential_execute_time: gauge!("grevm.sequential_execute_time"),
+            total_tx_cnt: histogram!("grevm.total_tx_cnt"),
+            parallel_tx_cnt: histogram!("grevm.parallel_tx_cnt"),
+            sequential_tx_cnt: histogram!("grevm.sequential_tx_cnt"),
+            finality_tx_cnt: histogram!("grevm.finality_tx_cnt"),
+            conflict_tx_cnt: histogram!("grevm.conflict_tx_cnt"),
+            unconfirmed_tx_cnt: histogram!("grevm.unconfirmed_tx_cnt"),
+            reusable_tx_cnt: histogram!("grevm.reusable_tx_cnt"),
+            skip_validation_cnt: histogram!("grevm.skip_validation_cnt"),
+            concurrent_partition_num: histogram!("grevm.concurrent_partition_num"),
+            partition_et_diff: histogram!("grevm.partition_execution_time_diff"),
+            partition_tx_diff: histogram!("grevm.partition_num_tx_diff"),
+            parse_hints_time: histogram!("grevm.parse_hints_time"),
+            partition_tx_time: histogram!("grevm.partition_tx_time"),
+            parallel_execute_time: histogram!("grevm.parallel_execute_time"),
+            validate_time: histogram!("grevm.validate_time"),
+            merge_write_set_time: histogram!("grevm.merge_write_set_time"),
+            commit_transition_time: histogram!("grevm.commit_transition_time"),
+            sequential_execute_time: histogram!("grevm.sequential_execute_time"),
         }
     }
-}
-
-lazy_static! {
-    static ref EXECUTE_METRICS: ExecuteMetrics = ExecuteMetrics::default();
 }
 
 /// Collect metrics and report
@@ -135,26 +131,27 @@ struct ExecuteMetricsCollector {
 
 impl ExecuteMetricsCollector {
     fn report(&self) {
-        EXECUTE_METRICS.parallel_execute_calls.set(self.parallel_execute_calls as f64);
-        EXECUTE_METRICS.sequential_execute_calls.set(self.sequential_execute_calls as f64);
-        EXECUTE_METRICS.total_tx_cnt.set(self.total_tx_cnt as f64);
-        EXECUTE_METRICS.parallel_tx_cnt.set(self.parallel_tx_cnt as f64);
-        EXECUTE_METRICS.sequential_tx_cnt.set(self.sequential_tx_cnt as f64);
-        EXECUTE_METRICS.conflict_tx_cnt.set(self.conflict_tx_cnt as f64);
-        EXECUTE_METRICS.finality_tx_cnt.set(self.finality_tx_cnt as f64);
-        EXECUTE_METRICS.unconfirmed_tx_cnt.set(self.unconfirmed_tx_cnt as f64);
-        EXECUTE_METRICS.reusable_tx_cnt.set(self.reusable_tx_cnt as f64);
-        EXECUTE_METRICS.skip_validation_cnt.set(self.skip_validation_cnt as f64);
-        EXECUTE_METRICS.concurrent_partition_num.set(self.concurrent_partition_num as f64);
-        EXECUTE_METRICS.partition_et_diff.set(self.partition_et_diff as f64);
-        EXECUTE_METRICS.partition_tx_diff.set(self.partition_tx_diff as f64);
-        EXECUTE_METRICS.parse_hints_time.set(self.parse_hints_time as f64);
-        EXECUTE_METRICS.partition_tx_time.set(self.partition_tx_time as f64);
-        EXECUTE_METRICS.parallel_execute_time.set(self.parallel_execute_time as f64);
-        EXECUTE_METRICS.validate_time.set(self.validate_time as f64);
-        EXECUTE_METRICS.merge_write_set_time.set(self.merge_write_set_time as f64);
-        EXECUTE_METRICS.commit_transition_time.set(self.commit_transition_time as f64);
-        EXECUTE_METRICS.sequential_execute_time.set(self.sequential_execute_time as f64);
+        let execute_metrics = ExecuteMetrics::default();
+        execute_metrics.parallel_execute_calls.set(self.parallel_execute_calls as f64);
+        execute_metrics.sequential_execute_calls.set(self.sequential_execute_calls as f64);
+        execute_metrics.total_tx_cnt.record(self.total_tx_cnt as f64);
+        execute_metrics.parallel_tx_cnt.record(self.parallel_tx_cnt as f64);
+        execute_metrics.sequential_tx_cnt.record(self.sequential_tx_cnt as f64);
+        execute_metrics.conflict_tx_cnt.record(self.conflict_tx_cnt as f64);
+        execute_metrics.finality_tx_cnt.record(self.finality_tx_cnt as f64);
+        execute_metrics.unconfirmed_tx_cnt.record(self.unconfirmed_tx_cnt as f64);
+        execute_metrics.reusable_tx_cnt.record(self.reusable_tx_cnt as f64);
+        execute_metrics.skip_validation_cnt.record(self.skip_validation_cnt as f64);
+        execute_metrics.concurrent_partition_num.record(self.concurrent_partition_num as f64);
+        execute_metrics.partition_et_diff.record(self.partition_et_diff as f64);
+        execute_metrics.partition_tx_diff.record(self.partition_tx_diff as f64);
+        execute_metrics.parse_hints_time.record(self.parse_hints_time as f64);
+        execute_metrics.partition_tx_time.record(self.partition_tx_time as f64);
+        execute_metrics.parallel_execute_time.record(self.parallel_execute_time as f64);
+        execute_metrics.validate_time.record(self.validate_time as f64);
+        execute_metrics.merge_write_set_time.record(self.merge_write_set_time as f64);
+        execute_metrics.commit_transition_time.record(self.commit_transition_time as f64);
+        execute_metrics.sequential_execute_time.record(self.sequential_execute_time as f64);
     }
 }
 
@@ -367,7 +364,7 @@ where
             }
         }
         self.metrics.partition_tx_diff += (max - min) as u64;
-        self.metrics.concurrent_partition_num += self.num_partitions as u64;
+        self.metrics.concurrent_partition_num = self.num_partitions as u64;
         self.metrics.partition_tx_time += start.elapsed().as_nanos() as u64;
     }
 

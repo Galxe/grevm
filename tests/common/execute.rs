@@ -110,7 +110,7 @@ pub(crate) fn compare_evm_execute<DB>(
     db: DB,
     txs: Vec<TxEnv>,
     with_hints: bool,
-    parallel_metrics: HashMap<&str, DebugValue>,
+    parallel_metrics: HashMap<&str, usize>,
 ) where
     DB: DatabaseRef + Send + Sync + 'static,
     DB::Error: Send + Sync + Clone + Debug,
@@ -146,7 +146,12 @@ pub(crate) fn compare_evm_execute<DB>(
         for (key, _, _, value) in snapshot.into_vec() {
             println!("metrics: {} => value: {:?}", key.key().name(), value);
             if let Some(metric) = parallel_metrics.get(key.key().name()) {
-                assert_eq!(*metric, value);
+                let v = match value {
+                    DebugValue::Counter(v) => v as usize,
+                    DebugValue::Gauge(v) => v.0 as usize,
+                    DebugValue::Histogram(v) => v.last().cloned().map_or(0, |ov| ov.0 as usize),
+                };
+                assert_eq!(*metric, v);
             }
         }
         let database = Arc::get_mut(&mut executor.database).unwrap();
