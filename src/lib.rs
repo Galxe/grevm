@@ -31,6 +31,11 @@ mod tx_dependency;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 lazy_static! {
+    static ref DEBUG_BOTTLENECK: bool =
+        std::env::var("DEBUG_BOTTLENECK").map_or(false, |v| v == "on");
+}
+
+lazy_static! {
     static ref CPU_CORES: usize = thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 }
 

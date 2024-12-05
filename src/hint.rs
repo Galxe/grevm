@@ -1,10 +1,12 @@
+use crate::{fork_join_util, LocationAndType, SharedTxStates, TxState};
 use revm::primitives::{
     alloy_primitives::U160, keccak256, ruint::UintTryFrom, Address, Bytes, TxEnv, TxKind, B256,
     U256,
 };
-use std::sync::Arc;
-
-use crate::{fork_join_util, LocationAndType, SharedTxStates, TxState};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 /// This module provides functionality for parsing and handling execution hints
 /// for parallel transaction execution in the context of Ethereum-like blockchains.
@@ -80,11 +82,13 @@ pub(crate) struct ParallelExecutionHints {
     /// Shared transaction states that will be updated with read/write sets
     /// based on the contract interactions.
     tx_states: SharedTxStates,
+    pub unknown_contract_tx_cnt: u64,
+    pub raw_tx_cnt: u64,
 }
 
 impl ParallelExecutionHints {
     pub(crate) fn new(tx_states: SharedTxStates) -> Self {
-        Self { tx_states }
+        Self { tx_states, unknown_contract_tx_cnt: 0, raw_tx_cnt: 0 }
     }
 
     /// Obtain a mutable reference to shared transaction states, and parse execution hints for each
@@ -98,7 +102,9 @@ impl ParallelExecutionHints {
     /// no conflicts between transactions, making the `Mutex` approach unnecessarily verbose and
     /// cumbersome.
     #[fastrace::trace]
-    pub(crate) fn parse_hints(&self, txs: Arc<Vec<TxEnv>>) {
+    pub(crate) fn parse_hints(&mut self, txs: Arc<Vec<TxEnv>>) {
+        let num_unknown_contract_tx = AtomicU64::new(0);
+        let num_raw_tx = AtomicU64::new(0);
         // Utilize fork-join utility to process transactions in parallel
         fork_join_util(txs.len(), None, |start_tx, end_tx, _| {
             #[allow(invalid_reference_casting)]
@@ -122,18 +128,26 @@ impl ParallelExecutionHints {
                             &tx_env.data,
                             rw_set,
                         ) {
+                            num_unknown_contract_tx.fetch_add(1, Ordering::Relaxed);
                             rw_set.insert_location(
                                 LocationAndType::Basic(to_address),
                                 RWType::WriteOnly,
                             );
                         }
-                    } else if to_address != tx_env.caller {
-                        rw_set
-                            .insert_location(LocationAndType::Basic(to_address), RWType::ReadWrite);
+                    } else {
+                        num_raw_tx.fetch_add(1, Ordering::Relaxed);
+                        if to_address != tx_env.caller {
+                            rw_set.insert_location(
+                                LocationAndType::Basic(to_address),
+                                RWType::ReadWrite,
+                            );
+                        }
                     }
                 }
             }
         });
+        self.unknown_contract_tx_cnt = num_unknown_contract_tx.load(Ordering::Acquire);
+        self.raw_tx_cnt = num_raw_tx.load(Ordering::Acquire);
     }
 
     /// This function computes the storage slot using the provided slot number and a vector of

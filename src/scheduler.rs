@@ -5,14 +5,13 @@ use crate::{
     storage::{SchedulerDB, State},
     tx_dependency::{DependentTxsVec, TxDependency},
     GrevmError, LocationAndType, ResultAndTransition, TransactionStatus, TxId, CPU_CORES,
-    GREVM_RUNTIME, MAX_NUM_ROUND,
+    DEBUG_BOTTLENECK, GREVM_RUNTIME, MAX_NUM_ROUND,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use atomic::Atomic;
 use dashmap::DashSet;
 use fastrace::Span;
-use lazy_static::lazy_static;
-use metrics::{gauge, histogram};
+use metrics::{counter, gauge, histogram};
 use revm::{
     primitives::{
         AccountInfo, Address, Bytecode, EVMError, Env, ExecutionResult, SpecId, TxEnv, B256, U256,
@@ -32,6 +31,7 @@ use tokio::sync::Notify;
 use tracing::info;
 
 struct ExecuteMetrics {
+    block_height: metrics::Counter,
     /// Number of times parallel execution is called.
     parallel_execute_calls: metrics::Gauge,
     /// Number of times sequential execution is called.
@@ -75,11 +75,16 @@ struct ExecuteMetrics {
     commit_transition_time: metrics::Histogram,
     /// Time taken to execute transactions in sequential(in nanoseconds).
     sequential_execute_time: metrics::Histogram,
+    /// Number of transactions that failed to parse contract
+    unknown_contract_tx_cnt: metrics::Histogram,
+    /// Number of raw transactions
+    raw_tx_cnt: metrics::Histogram,
 }
 
 impl Default for ExecuteMetrics {
     fn default() -> Self {
         Self {
+            block_height: counter!("grevm.block_height"),
             parallel_execute_calls: gauge!("grevm.parallel_round_calls"),
             sequential_execute_calls: gauge!("grevm.sequential_execute_calls"),
             total_tx_cnt: histogram!("grevm.total_tx_cnt"),
@@ -100,6 +105,8 @@ impl Default for ExecuteMetrics {
             merge_write_set_time: histogram!("grevm.merge_write_set_time"),
             commit_transition_time: histogram!("grevm.commit_transition_time"),
             sequential_execute_time: histogram!("grevm.sequential_execute_time"),
+            unknown_contract_tx_cnt: histogram!("grevm.unknown_contract_tx_cnt"),
+            raw_tx_cnt: histogram!("grevm.raw_tx_cnt"),
         }
     }
 }
@@ -107,6 +114,7 @@ impl Default for ExecuteMetrics {
 /// Collect metrics and report
 #[derive(Default)]
 struct ExecuteMetricsCollector {
+    block_height: u64,
     parallel_execute_calls: u64,
     sequential_execute_calls: u64,
     total_tx_cnt: u64,
@@ -127,11 +135,14 @@ struct ExecuteMetricsCollector {
     merge_write_set_time: u64,
     commit_transition_time: u64,
     sequential_execute_time: u64,
+    unknown_contract_tx_cnt: u64,
+    raw_tx_cnt: u64,
 }
 
 impl ExecuteMetricsCollector {
     fn report(&self) {
         let execute_metrics = ExecuteMetrics::default();
+        execute_metrics.block_height.absolute(self.block_height);
         execute_metrics.parallel_execute_calls.set(self.parallel_execute_calls as f64);
         execute_metrics.sequential_execute_calls.set(self.sequential_execute_calls as f64);
         execute_metrics.total_tx_cnt.record(self.total_tx_cnt as f64);
@@ -152,6 +163,8 @@ impl ExecuteMetricsCollector {
         execute_metrics.merge_write_set_time.record(self.merge_write_set_time as f64);
         execute_metrics.commit_transition_time.record(self.commit_transition_time as f64);
         execute_metrics.sequential_execute_time.record(self.sequential_execute_time as f64);
+        execute_metrics.unknown_contract_tx_cnt.record(self.unknown_contract_tx_cnt as f64);
+        execute_metrics.raw_tx_cnt.record(self.raw_tx_cnt as f64);
     }
 }
 
@@ -327,7 +340,6 @@ where
         let coinbase = env.block.coinbase;
         let num_partitions = *CPU_CORES * 2 + 1; // 2 * cpu + 1 for initial partition number
         let num_txs = txs.len();
-        info!("Parallel execute {} txs of SpecId {:?}", num_txs, spec_id);
         Self {
             spec_id,
             env,
@@ -348,9 +360,10 @@ where
 
     /// Get the partitioned transactions by dependencies.
     #[fastrace::trace]
-    pub(crate) fn partition_transactions(&mut self) {
+    pub(crate) fn partition_transactions(&mut self, round: usize) {
         // compute and assign partitioned_txs
         let start = Instant::now();
+        self.tx_dependencies.round = Some(round);
         self.partitioned_txs = self.tx_dependencies.fetch_best_partitions(self.num_partitions);
         self.num_partitions = self.partitioned_txs.len();
         let mut max = 0;
@@ -412,13 +425,15 @@ where
         let start = Instant::now();
         let mut merged_write_set: HashMap<LocationAndType, BTreeSet<TxId>> = HashMap::new();
         let mut end_skip_id = self.num_finality_txs;
-        for txid in self.num_finality_txs..self.tx_states.len() {
-            if self.tx_states[txid].tx_status == TransactionStatus::SkipValidation &&
-                end_skip_id == txid
-            {
-                end_skip_id += 1;
-            } else {
-                break;
+        if !(*DEBUG_BOTTLENECK) {
+            for txid in self.num_finality_txs..self.tx_states.len() {
+                if self.tx_states[txid].tx_status == TransactionStatus::SkipValidation &&
+                    end_skip_id == txid
+                {
+                    end_skip_id += 1;
+                } else {
+                    break;
+                }
             }
         }
         if end_skip_id != self.tx_states.len() {
@@ -438,8 +453,7 @@ where
     /// and there is no need to record the dependency and dependent relationships of these
     /// transactions. Thus achieving the purpose of pruning.
     #[fastrace::trace]
-    fn update_and_pruning_dependency(&mut self) {
-        let num_finality_txs = self.num_finality_txs;
+    fn update_and_pruning_dependency(&mut self, num_finality_txs: usize) {
         if num_finality_txs == self.txs.len() {
             return;
         }
@@ -524,6 +538,13 @@ where
                 }
             }
         });
+        if *DEBUG_BOTTLENECK && self.num_finality_txs == 0 {
+            // Use the read-write set to build accurate dependencies,
+            // and try to find the bottleneck
+            self.update_and_pruning_dependency(0);
+            self.tx_dependencies.round = None;
+            self.tx_dependencies.fetch_best_partitions(self.num_partitions);
+        }
         miner_involved_txs.into_iter().collect()
     }
 
@@ -531,12 +552,12 @@ where
     /// If the smallest TxID is a conflict transaction, return an error.
     #[fastrace::trace]
     fn find_continuous_min_txid(&mut self) -> Result<usize, GrevmError<DB::Error>> {
-        let mut min_execute_time = Duration::from_secs(u64::MAX);
+        let mut sum_execute_time = Duration::from_secs(0);
         let mut max_execute_time = Duration::from_secs(0);
         for executor in &self.partition_executors {
             let mut executor = executor.write().unwrap();
             self.metrics.reusable_tx_cnt += executor.metrics.reusable_tx_cnt;
-            min_execute_time = min_execute_time.min(executor.metrics.execute_time);
+            sum_execute_time += executor.metrics.execute_time;
             max_execute_time = max_execute_time.max(executor.metrics.execute_time);
             if executor.assigned_txs[0] == self.num_finality_txs &&
                 self.tx_states[self.num_finality_txs].tx_status == TransactionStatus::Conflict
@@ -549,7 +570,9 @@ where
         let mut conflict_tx_cnt = 0;
         let mut unconfirmed_tx_cnt = 0;
         let mut finality_tx_cnt = 0;
-        self.metrics.partition_et_diff += (max_execute_time - min_execute_time).as_nanos() as u64;
+        let avg_execution_time =
+            sum_execute_time.as_nanos() / self.partition_executors.len() as u128;
+        self.metrics.partition_et_diff += (max_execute_time.as_nanos() - avg_execution_time) as u64;
         #[allow(invalid_reference_casting)]
         let tx_states =
             unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
@@ -651,7 +674,7 @@ where
         let miner_involved_txs = self.generate_unconfirmed_txs();
         let finality_tx_cnt = self.find_continuous_min_txid()?;
         // update and pruning tx dependencies
-        self.update_and_pruning_dependency();
+        self.update_and_pruning_dependency(self.num_finality_txs);
         self.commit_transition(finality_tx_cnt)?;
         let mut rewards_accumulators = RewardsAccumulators::new();
         for txid in miner_involved_txs {
@@ -721,10 +744,12 @@ where
     #[fastrace::trace]
     fn parse_hints(&mut self) {
         let start = Instant::now();
-        let hints = ParallelExecutionHints::new(self.tx_states.clone());
+        let mut hints = ParallelExecutionHints::new(self.tx_states.clone());
         hints.parse_hints(self.txs.clone());
         self.tx_dependencies.init_tx_dependency(self.tx_states.clone());
         self.metrics.parse_hints_time += start.elapsed().as_nanos() as u64;
+        self.metrics.unknown_contract_tx_cnt += hints.unknown_contract_tx_cnt;
+        self.metrics.raw_tx_cnt += hints.raw_tx_cnt;
     }
 
     #[fastrace::trace]
@@ -734,6 +759,15 @@ where
         with_hints: bool,
         num_partitions: Option<usize>,
     ) -> Result<ExecuteOutput, GrevmError<DB::Error>> {
+        let block_height: u64 = self.env.block.number.try_into().unwrap_or(0);
+        info!(
+            "Parallel execute {} txs: block={}, SpecId={:?}",
+            self.txs.len(),
+            block_height,
+            self.spec_id
+        );
+        self.metrics.block_height = block_height;
+        self.tx_dependencies.block_height = block_height;
         if with_hints {
             self.parse_hints();
         }
@@ -754,7 +788,7 @@ where
             let mut round = 0;
             while round < MAX_NUM_ROUND {
                 if self.num_finality_txs < self.txs.len() {
-                    self.partition_transactions();
+                    self.partition_transactions(round);
                     if self.num_partitions == 1 && !force_parallel {
                         break;
                     }

@@ -122,13 +122,10 @@ where
                 *evm.tx_mut() = tx.clone();
                 evm.db_mut().current_txid = txid;
                 evm.db_mut().raw_transfer = true; // no need to wait miner rewards
-                let mut raw_transfer = true;
-                if let Ok(Some(info)) = evm.db_mut().basic(tx.caller) {
-                    raw_transfer = info.is_empty_code_hash();
-                }
+                let mut raw_transfer = false;
                 if let TxKind::Call(to) = tx.transact_to {
                     if let Ok(Some(info)) = evm.db_mut().basic(to) {
-                        raw_transfer &= info.is_empty_code_hash();
+                        raw_transfer = info.is_empty_code_hash();
                     }
                 }
                 evm.db_mut().raw_transfer = raw_transfer;

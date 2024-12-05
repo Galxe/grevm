@@ -28,3 +28,6 @@ jobs:
 
       - name: Run cargo fmt
         run: cargo +nightly fmt --check
+
+      - name: Run cargo check
+        run: RUSTFLAGS="-D warnings" cargo check

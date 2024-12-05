@@ -144,7 +144,7 @@ pub(crate) fn compare_evm_execute<DB>(
 
         let snapshot = recorder.snapshotter().snapshot();
         for (key, _, _, value) in snapshot.into_vec() {
-            println!("metrics: {} => value: {:?}", key.key().name(), value);
+            println!("metrics: {} => value: {:?}", key.key(), value);
             if let Some(metric) = parallel_metrics.get(key.key().name()) {
                 let v = match value {
                     DebugValue::Counter(v) => v as usize,
