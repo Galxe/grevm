@@ -1,9 +1,9 @@
 use crate::{
     async_commit::AsyncCommit,
     hint::ParallelExecutionHints,
-    queue::LockFreeQueue,
     storage::{CacheDB, CachedStorageData},
     tx_dependency::TxDependency,
+    utils::LockFreeQueue,
     LocationAndType, MemoryEntry, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
     TxState, TxVersion, CONCURRENT_LEVEL,
 };
@@ -122,7 +122,8 @@ where
         }
     }
 
-    fn async_commit(&self) {
+    fn async_commit(&self, task_queue: &LockFreeQueue<Task>) {
+        let mut start = Instant::now();
         let mut num_commit = 0;
         while !self.abort.load(Ordering::Relaxed) && num_commit < self.block_size {
             let finality_idx = self.finality_idx.load(Ordering::Relaxed);
@@ -136,6 +137,20 @@ where
                     self.commiter.lock().commit(result, &self.cache);
                     num_commit += 1;
                 }
+            }
+            if (Instant::now() - start).as_millis() > 8_000 {
+                start = Instant::now();
+                println!(
+                    "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
+                    self.finality_idx.load(Ordering::Acquire),
+                    self.validation_idx.load(Ordering::Acquire),
+                    self.execution_idx.load(Ordering::Acquire)
+                );
+                let status: Vec<(TxId, TransactionStatus)> =
+                    self.tx_states.iter().map(|s| s.read().status.clone()).enumerate().collect();
+                println!("transaction status: {:?}", status);
+                self.tx_dependency.lock().print();
+                println!("task queue size: {}", task_queue.len());
             }
         }
     }
@@ -156,7 +171,7 @@ where
         let task_queue = LockFreeQueue::new(concurrency_level * 4);
         thread::scope(|scope| {
             scope.spawn(|| {
-                self.async_commit();
+                self.async_commit(&task_queue);
             });
             scope.spawn(|| {
                 self.assign_tasks(&task_queue);
@@ -400,7 +415,6 @@ where
     }
 
     fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>) {
-        let mut start = Instant::now();
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
@@ -450,47 +464,26 @@ where
             let num_execute = task_queue.capacity() - task_queue.len();
             if num_execute > 0 {
                 let mut tx_dependency = self.tx_dependency.lock();
-                if let Some((tasks, continuous_id)) = tx_dependency.next(num_execute) {
-                    for execute_id in tasks.into_iter() {
-                        let mut tx = self.tx_states[execute_id].write();
-                        if !matches!(
-                            tx.status,
-                            TransactionStatus::Initial | TransactionStatus::Conflict
-                        ) {
-                            tx_dependency.remove(execute_id);
-                            continue;
-                        }
-                        execution_idx = max(execution_idx, continuous_id);
-                        tx.status = TransactionStatus::Executing;
-                        tx.incarnation += 1;
-                        task_queue
-                            .push(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
-                        num_tasks += 1;
+                for execute_id in tx_dependency.next(num_execute) {
+                    let mut tx = self.tx_states[execute_id].write();
+                    if !matches!(
+                        tx.status,
+                        TransactionStatus::Initial | TransactionStatus::Conflict
+                    ) {
+                        tx_dependency.remove(execute_id);
+                        continue;
                     }
+                    execution_idx = max(execution_idx, execute_id + 1);
+                    tx.status = TransactionStatus::Executing;
+                    tx.incarnation += 1;
+                    task_queue.push(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
+                    num_tasks += 1;
                 }
             }
             self.execution_idx.store(execution_idx, Ordering::Release);
 
             if num_tasks == 0 {
                 thread::yield_now();
-                if (Instant::now() - start).as_millis() > 8_000 {
-                    start = Instant::now();
-                    println!(
-                        "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
-                        self.finality_idx.load(Ordering::Acquire),
-                        self.validation_idx.load(Ordering::Acquire),
-                        self.execution_idx.load(Ordering::Acquire)
-                    );
-                    let status: Vec<(TxId, TransactionStatus)> = self
-                        .tx_states
-                        .iter()
-                        .map(|s| s.read().status.clone())
-                        .enumerate()
-                        .collect();
-                    println!("transaction status: {:?}", status);
-                    self.tx_dependency.lock().print();
-                    println!("task queue size: {}", task_queue.len());
-                }
             }
         }
     }
@@ -499,7 +492,7 @@ where
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
-            if let Some(task) = task_queue.pop() {
+            if let Some(task) = task_queue.multi_pop() {
                 return Some(task);
             } else {
                 thread::yield_now();
