@@ -2,7 +2,7 @@ use crate::{
     async_commit::AsyncCommit,
     hint::ParallelExecutionHints,
     storage::{CacheDB, CachedStorageData},
-    tx_dependency::TxDependency,
+    tx_dependency::{TxDependency, UpdateDependency},
     utils::LockFreeQueue,
     LocationAndType, MemoryEntry, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
     TxState, TxVersion, CONCURRENT_LEVEL,
@@ -45,7 +45,7 @@ where
     cache: CachedStorageData,
     tx_states: Vec<RwLock<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
-    tx_dependency: Mutex<TxDependency>,
+    tx_dependency: TxDependency,
 
     mv_memory: MVMemory,
 
@@ -113,7 +113,7 @@ where
             cache: CachedStorageData::new(),
             tx_states: (0..num_txs).map(|_| RwLock::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
-            tx_dependency: Mutex::new(tx_dependency),
+            tx_dependency,
             mv_memory: MVMemory::new(),
             finality_idx: AtomicUsize::new(0),
             validation_idx: AtomicUsize::new(0),
@@ -149,7 +149,7 @@ where
                 let status: Vec<(TxId, TransactionStatus)> =
                     self.tx_states.iter().map(|s| s.read().status.clone()).enumerate().collect();
                 println!("transaction status: {:?}", status);
-                self.tx_dependency.lock().print();
+                self.tx_dependency.print();
                 println!("task queue size: {}", task_queue.len());
             }
         }
@@ -169,12 +169,16 @@ where
     ) -> Result<(), EVMError<DB::Error>> {
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
         let task_queue = LockFreeQueue::new(concurrency_level * 4);
+        let async_update_lock = Mutex::new(());
         thread::scope(|scope| {
             scope.spawn(|| {
                 self.async_commit(&task_queue);
             });
             scope.spawn(|| {
-                self.assign_tasks(&task_queue);
+                self.assign_tasks(&task_queue, &async_update_lock);
+            });
+            scope.spawn(|| {
+                self.async_update_dependency(&async_update_lock);
             });
             for _ in 0..concurrency_level {
                 scope.spawn(|| {
@@ -264,16 +268,15 @@ where
                     if !rewards_accumulated {
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        let dep_txs = self.finality_idx.load(Ordering::Relaxed)..txid;
-                        let mut tx_dependency = self.tx_dependency.lock();
-                        tx_dependency.add(txid, dep_txs);
+                        let dep_txs = (self.finality_idx.load(Ordering::Relaxed)..txid).collect();
+                        self.tx_dependency.update(UpdateDependency::Add(txid, dep_txs));
                     } else {
                         let dep_txs = self.generate_dependent_txs(txid, &read_set);
-                        let mut tx_dependency = self.tx_dependency.lock();
-                        tx_dependency.add(txid, dep_txs);
+                        self.tx_dependency
+                            .update(UpdateDependency::Add(txid, dep_txs.into_iter().collect()))
                     }
                 } else {
-                    self.tx_dependency.lock().remove(txid);
+                    self.tx_dependency.update(UpdateDependency::Remove(txid));
                 }
                 *last_result = Some(TransactionResult {
                     read_set,
@@ -313,7 +316,8 @@ where
                 }
                 {
                     let dep_txs = self.generate_dependent_txs(txid, &read_set);
-                    self.tx_dependency.lock().add(txid, dep_txs);
+                    self.tx_dependency
+                        .update(UpdateDependency::Add(txid, dep_txs.into_iter().collect()));
                 }
                 *last_result =
                     Some(TransactionResult { read_set, write_set, execute_result: Err(e) });
@@ -377,7 +381,7 @@ where
             self.mark_estimate(txid, incarnation, &result.write_set);
             // update dependency
             let dep_txs = self.generate_dependent_txs(txid, &result.read_set);
-            self.tx_dependency.lock().add(txid, dep_txs);
+            self.tx_dependency.update(UpdateDependency::Add(txid, dep_txs.into_iter().collect()));
         }
     }
 
@@ -414,11 +418,26 @@ where
         dep_ids
     }
 
-    fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>) {
+    fn async_update_dependency(&self, async_update_lock: &Mutex<()>) {
+        #[allow(invalid_reference_casting)]
+        let mut tx_dependency =
+            unsafe { &mut *(&self.tx_dependency as *const TxDependency as *mut TxDependency) };
+        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
+            !self.abort.load(Ordering::Relaxed) {
+            let merged = tx_dependency.merge_event(async_update_lock);
+            if merged == 0 {
+                thread::yield_now();
+            }
+        }
+    }
+
+    fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>, async_update_lock: &Mutex<()>) {
+        #[allow(invalid_reference_casting)]
+        let mut tx_dependency =
+            unsafe { &mut *(&self.tx_dependency as *const TxDependency as *mut TxDependency) };
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
-            let mut num_tasks = 0;
             let mut finality_idx = self.finality_idx.load(Ordering::Acquire);
             let mut validation_idx = self.validation_idx.load(Ordering::Acquire);
             let mut execution_idx = self.execution_idx.load(Ordering::Acquire);
@@ -429,6 +448,7 @@ where
                     match tx.status {
                         TransactionStatus::Unconfirmed => {
                             tx.status = TransactionStatus::Finality;
+                            tx_dependency.commit(finality_idx);
                             finality_idx += 1;
                         }
                         TransactionStatus::Conflict | TransactionStatus::Executed => {
@@ -444,8 +464,10 @@ where
                 self.finality_idx.store(finality_idx, Ordering::Release);
             }
 
+            let mut num_tasks = 0;
             // Prior to submit validation task
-            while validation_idx < execution_idx {
+            let num_validation = task_queue.capacity() - task_queue.len();
+            while validation_idx < execution_idx && num_tasks < num_validation {
                 let mut tx = self.tx_states[validation_idx].write();
                 if matches!(tx.status, TransactionStatus::Executed | TransactionStatus::Unconfirmed)
                 {
@@ -463,14 +485,13 @@ where
             // Submit execution task
             let num_execute = task_queue.capacity() - task_queue.len();
             if num_execute > 0 {
-                let mut tx_dependency = self.tx_dependency.lock();
-                for execute_id in tx_dependency.next(num_execute) {
+                for execute_id in tx_dependency.next(num_execute, async_update_lock) {
                     let mut tx = self.tx_states[execute_id].write();
                     if !matches!(
                         tx.status,
                         TransactionStatus::Initial | TransactionStatus::Conflict
                     ) {
-                        tx_dependency.remove(execute_id);
+                        tx_dependency.update(UpdateDependency::Remove(execute_id));
                         continue;
                     }
                     execution_idx = max(execution_idx, execute_id + 1);
