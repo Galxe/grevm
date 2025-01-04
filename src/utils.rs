@@ -133,17 +133,19 @@ pub struct OrderedSet {
 
 impl OrderedSet {
     pub fn new(capacity: usize, all_onboard: bool) -> Self {
-        let bucket_num = if capacity % BUCKET_SIZE == 0 {
-            capacity / BUCKET_SIZE
-        } else {
-            capacity / BUCKET_SIZE + 1
-        };
+        let remainder = capacity % BUCKET_SIZE;
+        let bucket_num =
+            if remainder == 0 { capacity / BUCKET_SIZE } else { capacity / BUCKET_SIZE + 1 };
+        let mut bucket_onboard = vec![if all_onboard { BUCKET_SIZE as u8 } else { 0 }; bucket_num];
+        if all_onboard && remainder != 0 {
+            bucket_onboard[bucket_num - 1] = remainder as u8;
+        }
         Self {
             capacity,
             len: if all_onboard { capacity } else { 0 },
             min_index: 0,
             item_onboard: vec![all_onboard; capacity],
-            bucket_onboard: vec![if all_onboard { BUCKET_SIZE as u8 } else { 0 }; bucket_num],
+            bucket_onboard,
         }
     }
 
@@ -220,9 +222,7 @@ impl OrderedSet {
                             }
                             next_min += 1;
                         }
-                        if !find_min {
-                            panic!("Unreachable");
-                        }
+                        assert!(find_min)
                     }
                 }
             }
@@ -236,9 +236,7 @@ impl OrderedSet {
         if self.len == 0 {
             return None;
         }
-        if !self.item_onboard[self.min_index] {
-            panic!("Unreachable");
-        }
+        assert!(self.item_onboard[self.min_index]);
         let first = self.min_index;
         self.remove(first);
         Some(first)

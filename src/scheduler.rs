@@ -264,13 +264,10 @@ where
                     if !rewards_accumulated {
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        let dep_txs = self.finality_idx.load(Ordering::Relaxed)..txid;
-                        let mut tx_dependency = self.tx_dependency.lock();
-                        tx_dependency.add(txid, dep_txs);
+                        self.tx_dependency.lock().add(txid, Some(txid - 1));
                     } else {
-                        let dep_txs = self.generate_dependent_txs(txid, &read_set);
-                        let mut tx_dependency = self.tx_dependency.lock();
-                        tx_dependency.add(txid, dep_txs);
+                        let dep_tx = self.generate_dependent_tx(txid, &read_set);
+                        self.tx_dependency.lock().add(txid, dep_tx);
                     }
                 } else {
                     self.tx_dependency.lock().remove(txid);
@@ -312,8 +309,8 @@ where
                     tx_state.status = TransactionStatus::Conflict;
                 }
                 {
-                    let dep_txs = self.generate_dependent_txs(txid, &read_set);
-                    self.tx_dependency.lock().add(txid, dep_txs);
+                    let dep_tx = self.generate_dependent_tx(txid, &read_set);
+                    self.tx_dependency.lock().add(txid, dep_tx);
                 }
                 *last_result =
                     Some(TransactionResult { read_set, write_set, execute_result: Err(e) });
@@ -376,8 +373,8 @@ where
             // mark write set as estimate
             self.mark_estimate(txid, incarnation, &result.write_set);
             // update dependency
-            let dep_txs = self.generate_dependent_txs(txid, &result.read_set);
-            self.tx_dependency.lock().add(txid, dep_txs);
+            let dep_tx = self.generate_dependent_tx(txid, &result.read_set);
+            self.tx_dependency.lock().add(txid, dep_tx);
         }
     }
 
@@ -393,32 +390,36 @@ where
         }
     }
 
-    fn generate_dependent_txs(
+    fn generate_dependent_tx(
         &self,
         txid: TxId,
         read_set: &HashMap<LocationAndType, ReadVersion>,
-    ) -> HashSet<TxId> {
-        let mut dep_ids = HashSet::new();
+    ) -> Option<TxId> {
+        let mut max_dep_id = None;
         for location in read_set.keys() {
             if let Some(written_transactions) = self.mv_memory.get(location) {
                 // To prevent dependency explosion, only add the tx with the highest TxId in
                 // written_transactions
                 if let Some((dep_id, _)) = written_transactions.range(..txid).next_back() {
                     let dep_id = *dep_id;
-                    if dep_id > self.finality_idx.load(Ordering::Relaxed) {
-                        dep_ids.insert(dep_id);
+                    if (max_dep_id.is_none() || dep_id > max_dep_id.unwrap()) &&
+                        dep_id >= self.finality_idx.load(Ordering::Relaxed)
+                    {
+                        max_dep_id = Some(dep_id);
+                        if dep_id == txid - 1 {
+                            return max_dep_id;
+                        }
                     }
                 }
             }
         }
-        dep_ids
+        max_dep_id
     }
 
     fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>) {
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
-            let mut num_tasks = 0;
             let mut finality_idx = self.finality_idx.load(Ordering::Acquire);
             let mut validation_idx = self.validation_idx.load(Ordering::Acquire);
             let mut execution_idx = self.execution_idx.load(Ordering::Acquire);
@@ -445,7 +446,9 @@ where
             }
 
             // Prior to submit validation task
-            while validation_idx < execution_idx {
+            let mut num_tasks = 0;
+            let num_validation = task_queue.capacity() - task_queue.len();
+            while validation_idx < execution_idx && num_tasks < num_validation {
                 let mut tx = self.tx_states[validation_idx].write();
                 if matches!(tx.status, TransactionStatus::Executed | TransactionStatus::Unconfirmed)
                 {
@@ -465,6 +468,10 @@ where
             if num_execute > 0 {
                 let mut tx_dependency = self.tx_dependency.lock();
                 for execute_id in tx_dependency.next(num_execute) {
+                    if execute_id < finality_idx {
+                        tx_dependency.remove(execute_id);
+                        continue;
+                    }
                     let mut tx = self.tx_states[execute_id].write();
                     if !matches!(
                         tx.status,

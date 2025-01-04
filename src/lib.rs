@@ -13,7 +13,7 @@ use std::{cmp::min, thread};
 
 lazy_static! {
     static ref CONCURRENT_LEVEL: usize =
-        thread::available_parallelism().map(|n| n.get()).unwrap_or(8) * 2 + 1;
+        thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 }
 
 type TxId = usize;

@@ -2,9 +2,11 @@ use revm::primitives::{
     alloy_primitives::U160, keccak256, ruint::UintTryFrom, Address, Bytes, TxEnv, TxKind, B256,
     U256,
 };
-use std::sync::Arc;
+use std::{cmp::max, sync::Arc};
 
-use crate::{fork_join_util, tx_dependency::TxDependency, LocationAndType, TxId};
+use crate::{
+    fork_join_util, tx_dependency::TxDependency, utils::OrderedSet, LocationAndType, TxId,
+};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 
 /// This module provides functionality for parsing and handling execution hints
@@ -101,20 +103,26 @@ impl ParallelExecutionHints {
     fn generate_dependency(&self) -> TxDependency {
         let num_txs = self.txs.len();
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
-        let mut dependent_txs = vec![HashSet::new(); num_txs];
+        let mut dependent_tx: Vec<Option<TxId>> = vec![None; num_txs];
         let mut affect_txs = vec![HashSet::new(); num_txs];
+        let mut no_dep_txs = OrderedSet::new(num_txs, true);
         for (txid, rw_set) in self.rw_set.iter().enumerate() {
             for location in rw_set.read_set.iter() {
                 if let Some(previous) = last_write_tx.get(location) {
-                    dependent_txs[txid].insert(*previous);
-                    affect_txs[*previous].insert(txid);
+                    let previous = *previous;
+                    let new_dep = dependent_tx[txid].map_or(previous, |dep| max(dep, previous));
+                    dependent_tx[txid] = Some(new_dep);
+                    affect_txs[previous].insert(txid);
                 }
+            }
+            if dependent_tx[txid].is_some() {
+                no_dep_txs.remove(txid);
             }
             for location in rw_set.write_set.iter() {
                 last_write_tx.insert(location.clone(), txid);
             }
         }
-        TxDependency::create(dependent_txs, affect_txs)
+        TxDependency::create(dependent_tx, affect_txs, no_dep_txs)
     }
 
     #[fastrace::trace]

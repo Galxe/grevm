@@ -146,7 +146,7 @@ fn native_with_same_sender() {
 
 #[test]
 fn native_with_all_related() {
-    let block_size = 1000;
+    let block_size = 10000;
     let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = (0..block_size)

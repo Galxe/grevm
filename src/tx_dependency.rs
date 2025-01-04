@@ -2,7 +2,7 @@ use crate::{utils::OrderedSet, TxId};
 use ahash::AHashSet as HashSet;
 
 pub struct TxDependency {
-    dependent_txs: Vec<HashSet<TxId>>,
+    dependent_tx: Vec<Option<TxId>>,
     affect_txs: Vec<HashSet<TxId>>,
     no_dep_txs: OrderedSet,
 }
@@ -10,22 +10,18 @@ pub struct TxDependency {
 impl TxDependency {
     pub fn new(num_txs: usize) -> Self {
         Self {
-            dependent_txs: vec![HashSet::new(); num_txs],
+            dependent_tx: vec![None; num_txs],
             affect_txs: vec![HashSet::new(); num_txs],
             no_dep_txs: OrderedSet::new(num_txs, true),
         }
     }
 
-    pub fn create(dependent_txs: Vec<HashSet<TxId>>, affect_txs: Vec<HashSet<TxId>>) -> Self {
-        assert_eq!(dependent_txs.len(), affect_txs.len());
-        let num_txs = dependent_txs.len();
-        let mut no_dep_txs = OrderedSet::new(num_txs, false);
-        for (txid, dep) in dependent_txs.iter().enumerate() {
-            if dep.is_empty() {
-                no_dep_txs.insert(txid);
-            }
-        }
-        Self { dependent_txs, affect_txs, no_dep_txs }
+    pub fn create(
+        dependent_tx: Vec<Option<TxId>>,
+        affect_txs: Vec<HashSet<TxId>>,
+        no_dep_txs: OrderedSet,
+    ) -> Self {
+        Self { dependent_tx, affect_txs, no_dep_txs }
     }
 
     pub fn next(&mut self, num: usize) -> Vec<TxId> {
@@ -43,33 +39,36 @@ impl TxDependency {
     pub fn remove(&mut self, txid: TxId) {
         let affect_txs = std::mem::take(&mut self.affect_txs[txid]);
         for affect_tx in affect_txs {
-            self.dependent_txs[affect_tx].remove(&txid);
-            if self.dependent_txs[affect_tx].is_empty() {
+            if self.dependent_tx[affect_tx] == Some(txid) {
+                self.dependent_tx[affect_tx] = None;
                 self.no_dep_txs.insert(affect_tx);
             }
         }
     }
 
-    pub fn add<D: IntoIterator<Item = TxId>>(&mut self, txid: TxId, dependent_txs: D) {
-        for dep_id in dependent_txs {
-            self.dependent_txs[txid].insert(dep_id);
-            self.affect_txs[dep_id].insert(txid);
-            if self.dependent_txs[dep_id].is_empty() {
-                self.no_dep_txs.insert(dep_id);
+    pub fn add(&mut self, txid: TxId, dep_id: Option<TxId>) {
+        if let Some(dep_id) = dep_id {
+            assert!(dep_id < txid);
+            if self.dependent_tx[txid].is_none() || dep_id > self.dependent_tx[txid].unwrap() {
+                self.dependent_tx[txid] = Some(dep_id);
+                self.affect_txs[dep_id].insert(txid);
+                if self.dependent_tx[dep_id].is_none() {
+                    self.no_dep_txs.insert(dep_id);
+                }
             }
-        }
-        if self.dependent_txs[txid].is_empty() {
+        } else {
+            assert!(self.dependent_tx[txid].is_none());
             self.no_dep_txs.insert(txid);
         }
     }
 
     pub fn print(&self) {
         println!("no_dep_txs: {:?}", self.no_dep_txs.to_set());
-        let dependent_txs: Vec<(TxId, HashSet<TxId>)> =
-            self.dependent_txs.clone().into_iter().enumerate().collect();
+        let dependent_tx: Vec<(TxId, Option<TxId>)> =
+            self.dependent_tx.clone().into_iter().enumerate().collect();
         let affect_txs: Vec<(TxId, HashSet<TxId>)> =
             self.affect_txs.clone().into_iter().enumerate().collect();
-        println!("dependent_txs: {:?}", dependent_txs);
+        println!("dependent_tx: {:?}", dependent_tx);
         println!("affect_txs: {:?}", affect_txs);
     }
 }
