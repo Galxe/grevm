@@ -30,10 +30,11 @@ enum TransactionStatus {
     Finality,
 }
 
-#[derive(Debug, PartialEq, Default, Clone)]
+#[derive(Debug, Default)]
 struct TxState {
     pub status: TransactionStatus,
     pub incarnation: usize,
+    pub dependency: Option<TxId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

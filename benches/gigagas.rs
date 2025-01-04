@@ -58,6 +58,8 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let txs = Arc::new(txs);
 
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
+    let mut iter_loop = 0;
+    let report_metrics = rand::thread_rng().gen_range(0..10);
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
@@ -75,6 +77,19 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
                 );
                 executor.parallel_execute(None).unwrap();
             });
+            if iter_loop == report_metrics {
+                let snapshot = recorder.snapshotter().snapshot();
+                println!("\n>>>> {} metrics: <<<<", name);
+                for (key, _, _, value) in snapshot.into_vec() {
+                    let value = match value {
+                        DebugValue::Counter(v) => v as usize,
+                        DebugValue::Gauge(v) => v.0 as usize,
+                        DebugValue::Histogram(v) => v.last().cloned().map_or(0, |ov| ov.0 as usize),
+                    };
+                    println!("{} => {:?}", key.key().name(), value);
+                }
+            }
+            iter_loop += 1;
         })
     });
 

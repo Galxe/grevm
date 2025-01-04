@@ -10,6 +10,7 @@ use crate::{
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
 use dashmap::DashMap;
+use metrics::histogram;
 use parking_lot::{Mutex, RwLock};
 use revm::{Evm, EvmBuilder};
 use revm_primitives::{db::DatabaseRef, EVMError, Env, SpecId, TxEnv, TxKind};
@@ -29,6 +30,93 @@ pub type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 #[auto_impl(&)]
 pub trait RewardsAccumulator {
     fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128>;
+}
+
+struct ExecuteMetrics {
+    /// Total number of transactions.
+    total_tx_cnt: metrics::Histogram,
+    conflict_cnt: metrics::Histogram,
+    validation_cnt: metrics::Histogram,
+    execution_cnt: metrics::Histogram,
+    reset_validation_idx_cnt: metrics::Histogram,
+    useless_dependent_update: metrics::Histogram,
+
+    conflict_by_miner: metrics::Histogram,
+    conflict_by_error: metrics::Histogram,
+    conflict_by_estimate: metrics::Histogram,
+    conflict_by_version: metrics::Histogram,
+    onetime_with_dependency: metrics::Histogram,
+    no_dependency_txs: metrics::Histogram,
+}
+
+impl Default for ExecuteMetrics {
+    fn default() -> Self {
+        Self {
+            total_tx_cnt: histogram!("grevm.total_tx_cnt"),
+            conflict_cnt: histogram!("grevm.conflict_cnt"),
+            validation_cnt: histogram!("grevm.validation_cnt"),
+            execution_cnt: histogram!("grevm.execution_cnt"),
+            reset_validation_idx_cnt: histogram!("grevm.reset_validation_idx_cnt"),
+            useless_dependent_update: histogram!("grevm.useless_dependent_update"),
+            conflict_by_miner: histogram!("grevm.conflict_by_miner"),
+            conflict_by_error: histogram!("grevm.conflict_by_error"),
+            conflict_by_estimate: histogram!("grevm.conflict_by_estimate"),
+            conflict_by_version: histogram!("grevm.conflict_by_version"),
+            onetime_with_dependency: histogram!("grevm.onetime_with_dependency"),
+            no_dependency_txs: histogram!("grevm.no_dependency_txs"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ExecuteMetricsCollector {
+    total_tx_cnt: AtomicUsize,
+    conflict_cnt: AtomicUsize,
+    validation_cnt: AtomicUsize,
+    execution_cnt: AtomicUsize,
+    reset_validation_idx_cnt: AtomicUsize,
+    useless_dependent_update: AtomicUsize,
+
+    conflict_by_miner: AtomicUsize,
+    conflict_by_error: AtomicUsize,
+    conflict_by_estimate: AtomicUsize,
+    conflict_by_version: AtomicUsize,
+    onetime_with_dependency: AtomicUsize,
+    no_dependency_txs: AtomicUsize,
+}
+
+impl ExecuteMetricsCollector {
+    fn report(&self) {
+        let execute_metrics = ExecuteMetrics::default();
+        execute_metrics.total_tx_cnt.record(self.total_tx_cnt.load(Ordering::Relaxed) as f64);
+        execute_metrics.conflict_cnt.record(self.conflict_cnt.load(Ordering::Relaxed) as f64);
+        execute_metrics.validation_cnt.record(self.validation_cnt.load(Ordering::Relaxed) as f64);
+        execute_metrics.execution_cnt.record(self.execution_cnt.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .reset_validation_idx_cnt
+            .record(self.reset_validation_idx_cnt.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .useless_dependent_update
+            .record(self.useless_dependent_update.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .conflict_by_miner
+            .record(self.conflict_by_miner.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .conflict_by_error
+            .record(self.conflict_by_error.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .conflict_by_estimate
+            .record(self.conflict_by_estimate.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .conflict_by_version
+            .record(self.conflict_by_version.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .onetime_with_dependency
+            .record(self.onetime_with_dependency.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .no_dependency_txs
+            .record(self.no_dependency_txs.load(Ordering::Relaxed) as f64);
+    }
 }
 
 pub struct Scheduler<DB, C>
@@ -54,6 +142,7 @@ where
     execution_idx: AtomicUsize,
 
     abort: AtomicBool,
+    metrics: ExecuteMetricsCollector,
 }
 
 impl<DB, C> RewardsAccumulator for Scheduler<DB, C>
@@ -119,6 +208,7 @@ where
             validation_idx: AtomicUsize::new(0),
             execution_idx: AtomicUsize::new(0),
             abort: AtomicBool::new(false),
+            metrics: ExecuteMetricsCollector::default(),
         }
     }
 
@@ -167,6 +257,7 @@ where
         &self,
         concurrency_level: Option<usize>,
     ) -> Result<(), EVMError<DB::Error>> {
+        self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
         let task_queue = LockFreeQueue::new(concurrency_level * 4);
         thread::scope(|scope| {
@@ -203,6 +294,7 @@ where
                 });
             }
         });
+        self.metrics.report();
         if self.abort.load(Ordering::Relaxed) {
             let result = self.tx_results[self.finality_idx.load(Ordering::Relaxed)].lock();
             if let Some(result) = result.as_ref() {
@@ -220,6 +312,7 @@ where
     where
         RA: RewardsAccumulator,
     {
+        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
         let finality_idx = self.finality_idx.load(Ordering::Relaxed);
         let TxVersion { txid, incarnation } = tx_version;
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
@@ -261,11 +354,14 @@ where
                 }
 
                 if conflict {
+                    self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
                     if !rewards_accumulated {
+                        self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
                         self.tx_dependency.lock().add(txid, Some(txid - 1));
                     } else {
+                        self.metrics.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
                         let dep_tx = self.generate_dependent_tx(txid, &read_set);
                         self.tx_dependency.lock().add(txid, dep_tx);
                     }
@@ -279,6 +375,8 @@ where
                 });
             }
             Err(e) => {
+                self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
+                self.metrics.conflict_by_error.fetch_add(1, Ordering::Relaxed);
                 let mut read_set = evm.db_mut().take_read_set();
                 let mut write_set = HashSet::new();
                 read_set
@@ -322,6 +420,7 @@ where
     }
 
     fn validate(&self, tx_version: TxVersion) {
+        self.metrics.validation_cnt.fetch_add(1, Ordering::Relaxed);
         let TxVersion { txid, incarnation } = tx_version;
         // check the read version of read set
         let mut conflict = false;
@@ -333,13 +432,15 @@ where
             panic!("Error transaction should take as conflict before validating");
         }
 
+        let mut dependency: Option<TxId> = None;
         for (location, version) in result.read_set.iter() {
             if let Some(written_transactions) = self.mv_memory.get(location) {
-                if let Some((previous_id, latest_version)) =
+                if let Some((&previous_id, latest_version)) =
                     written_transactions.range(..txid).next_back()
                 {
+                    dependency = Some(dependency.map_or(previous_id, |d| max(d, previous_id)));
                     if let ReadVersion::MvMemory(version) = version {
-                        if version.txid != *previous_id ||
+                        if version.txid != previous_id ||
                             version.incarnation != latest_version.incarnation
                         {
                             conflict = true;
@@ -367,13 +468,25 @@ where
             }
             tx_state.status =
                 if conflict { TransactionStatus::Conflict } else { TransactionStatus::Unconfirmed };
+            tx_state.dependency = dependency.clone();
         }
 
         if conflict {
+            self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
+            self.metrics.conflict_by_version.fetch_add(1, Ordering::Relaxed);
             // mark write set as estimate
             self.mark_estimate(txid, incarnation, &result.write_set);
             // update dependency
-            let dep_tx = self.generate_dependent_tx(txid, &result.read_set);
+            let dep_tx = match dependency {
+                None => None,
+                Some(dep) => {
+                    if dep >= self.finality_idx.load(Ordering::Relaxed) {
+                        Some(dep)
+                    } else {
+                        None
+                    }
+                }
+            };
             self.tx_dependency.lock().add(txid, dep_tx);
         }
     }
@@ -400,8 +513,7 @@ where
             if let Some(written_transactions) = self.mv_memory.get(location) {
                 // To prevent dependency explosion, only add the tx with the highest TxId in
                 // written_transactions
-                if let Some((dep_id, _)) = written_transactions.range(..txid).next_back() {
-                    let dep_id = *dep_id;
+                if let Some((&dep_id, _)) = written_transactions.range(..txid).next_back() {
                     if (max_dep_id.is_none() || dep_id > max_dep_id.unwrap()) &&
                         dep_id >= self.finality_idx.load(Ordering::Relaxed)
                     {
@@ -431,8 +543,16 @@ where
                         TransactionStatus::Unconfirmed => {
                             tx.status = TransactionStatus::Finality;
                             finality_idx += 1;
+                            if tx.dependency.is_none() {
+                                self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
+                            } else if tx.incarnation == 1 {
+                                self.metrics
+                                    .onetime_with_dependency
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         TransactionStatus::Conflict | TransactionStatus::Executed => {
+                            self.metrics.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
                             // Subsequent transactions after conflict need to be revalidated
                             validation_idx = finality_idx;
                             break;
@@ -469,6 +589,7 @@ where
                 let mut tx_dependency = self.tx_dependency.lock();
                 for execute_id in tx_dependency.next(num_execute) {
                     if execute_id < finality_idx {
+                        self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
                         tx_dependency.remove(execute_id);
                         continue;
                     }
@@ -477,6 +598,7 @@ where
                         tx.status,
                         TransactionStatus::Initial | TransactionStatus::Conflict
                     ) {
+                        self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
                         tx_dependency.remove(execute_id);
                         continue;
                     }

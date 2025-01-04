@@ -108,8 +108,7 @@ impl ParallelExecutionHints {
         let mut no_dep_txs = OrderedSet::new(num_txs, true);
         for (txid, rw_set) in self.rw_set.iter().enumerate() {
             for location in rw_set.read_set.iter() {
-                if let Some(previous) = last_write_tx.get(location) {
-                    let previous = *previous;
+                if let Some(&previous) = last_write_tx.get(location) {
                     let new_dep = dependent_tx[txid].map_or(previous, |dep| max(dep, previous));
                     dependent_tx[txid] = Some(new_dep);
                     affect_txs[previous].insert(txid);

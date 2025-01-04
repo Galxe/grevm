@@ -157,14 +157,14 @@ pub(crate) fn compare_evm_execute<DB>(
 
         let snapshot = recorder.snapshotter().snapshot();
         for (key, _, _, value) in snapshot.into_vec() {
+            let value = match value {
+                DebugValue::Counter(v) => v as usize,
+                DebugValue::Gauge(v) => v.0 as usize,
+                DebugValue::Histogram(v) => v.last().cloned().map_or(0, |ov| ov.0 as usize),
+            };
             println!("metrics: {} => value: {:?}", key.key().name(), value);
             if let Some(metric) = parallel_metrics.get(key.key().name()) {
-                let v = match value {
-                    DebugValue::Counter(v) => v as usize,
-                    DebugValue::Gauge(v) => v.0 as usize,
-                    DebugValue::Histogram(v) => v.last().cloned().map_or(0, |ov| ov.0 as usize),
-                };
-                assert_eq!(*metric, v);
+                assert_eq!(*metric, value);
             }
         }
         result
