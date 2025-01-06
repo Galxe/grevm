@@ -45,7 +45,8 @@ struct ExecuteMetrics {
     conflict_by_error: metrics::Histogram,
     conflict_by_estimate: metrics::Histogram,
     conflict_by_version: metrics::Histogram,
-    onetime_with_dependency: metrics::Histogram,
+    one_attempt_with_dependency: metrics::Histogram,
+    more_attempts_with_dependency: metrics::Histogram,
     no_dependency_txs: metrics::Histogram,
 }
 
@@ -62,7 +63,8 @@ impl Default for ExecuteMetrics {
             conflict_by_error: histogram!("grevm.conflict_by_error"),
             conflict_by_estimate: histogram!("grevm.conflict_by_estimate"),
             conflict_by_version: histogram!("grevm.conflict_by_version"),
-            onetime_with_dependency: histogram!("grevm.onetime_with_dependency"),
+            one_attempt_with_dependency: histogram!("grevm.one_attempt_with_dependency"),
+            more_attempts_with_dependency: histogram!("grevm.more_attempts_with_dependency"),
             no_dependency_txs: histogram!("grevm.no_dependency_txs"),
         }
     }
@@ -81,7 +83,8 @@ struct ExecuteMetricsCollector {
     conflict_by_error: AtomicUsize,
     conflict_by_estimate: AtomicUsize,
     conflict_by_version: AtomicUsize,
-    onetime_with_dependency: AtomicUsize,
+    one_attempt_with_dependency: AtomicUsize,
+    more_attempts_with_dependency: AtomicUsize,
     no_dependency_txs: AtomicUsize,
 }
 
@@ -111,8 +114,11 @@ impl ExecuteMetricsCollector {
             .conflict_by_version
             .record(self.conflict_by_version.load(Ordering::Relaxed) as f64);
         execute_metrics
-            .onetime_with_dependency
-            .record(self.onetime_with_dependency.load(Ordering::Relaxed) as f64);
+            .one_attempt_with_dependency
+            .record(self.one_attempt_with_dependency.load(Ordering::Relaxed) as f64);
+        execute_metrics
+            .more_attempts_with_dependency
+            .record(self.more_attempts_with_dependency.load(Ordering::Relaxed) as f64);
         execute_metrics
             .no_dependency_txs
             .record(self.no_dependency_txs.load(Ordering::Relaxed) as f64);
@@ -365,7 +371,9 @@ where
                         let dep_tx = self.generate_dependent_tx(txid, &read_set);
                         self.tx_dependency.lock().add(txid, dep_tx);
                     }
-                } else {
+                } else if write_set.len() < 8 {
+                    // When write set is large, the transaction can be more complex
+                    // Update dependency when finality
                     self.tx_dependency.lock().remove(txid);
                 }
                 *last_result = Some(TransactionResult {
@@ -537,18 +545,26 @@ where
             let mut execution_idx = self.execution_idx.load(Ordering::Acquire);
             // Confirm the finality and conflict status
             if finality_idx < validation_idx {
+                let mut tx_dependency = self.tx_dependency.lock();
                 while finality_idx < validation_idx {
                     let mut tx = self.tx_states[finality_idx].write();
                     match tx.status {
                         TransactionStatus::Unconfirmed => {
                             tx.status = TransactionStatus::Finality;
+                            tx_dependency.commit(finality_idx);
                             finality_idx += 1;
                             if tx.dependency.is_none() {
                                 self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
-                            } else if tx.incarnation == 1 {
-                                self.metrics
-                                    .onetime_with_dependency
-                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                if tx.incarnation == 1 {
+                                    self.metrics
+                                        .one_attempt_with_dependency
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else if tx.incarnation > 2 {
+                                    self.metrics
+                                        .more_attempts_with_dependency
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         TransactionStatus::Conflict | TransactionStatus::Executed => {
@@ -590,7 +606,7 @@ where
                 for execute_id in tx_dependency.next(num_execute) {
                     if execute_id < finality_idx {
                         self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                        tx_dependency.remove(execute_id);
+                        tx_dependency.commit(execute_id);
                         continue;
                     }
                     let mut tx = self.tx_states[execute_id].write();
@@ -599,7 +615,7 @@ where
                         TransactionStatus::Initial | TransactionStatus::Conflict
                     ) {
                         self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                        tx_dependency.remove(execute_id);
+                        tx_dependency.commit(execute_id);
                         continue;
                     }
                     execution_idx = max(execution_idx, execute_id + 1);

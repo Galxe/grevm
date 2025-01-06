@@ -4,6 +4,7 @@ use ahash::AHashSet as HashSet;
 pub struct TxDependency {
     dependent_tx: Vec<Option<TxId>>,
     affect_txs: Vec<HashSet<TxId>>,
+    key_tx: Vec<bool>,
     no_dep_txs: OrderedSet,
 }
 
@@ -12,6 +13,7 @@ impl TxDependency {
         Self {
             dependent_tx: vec![None; num_txs],
             affect_txs: vec![HashSet::new(); num_txs],
+            key_tx: vec![false; num_txs],
             no_dep_txs: OrderedSet::new(num_txs, true),
         }
     }
@@ -21,7 +23,9 @@ impl TxDependency {
         affect_txs: Vec<HashSet<TxId>>,
         no_dep_txs: OrderedSet,
     ) -> Self {
-        Self { dependent_tx, affect_txs, no_dep_txs }
+        assert_eq!(dependent_tx.len(), affect_txs.len());
+        let num_txs = dependent_tx.len();
+        Self { dependent_tx, affect_txs, key_tx: vec![false; num_txs], no_dep_txs }
     }
 
     pub fn next(&mut self, num: usize) -> Vec<TxId> {
@@ -36,13 +40,21 @@ impl TxDependency {
         txs
     }
 
-    pub fn remove(&mut self, txid: TxId) {
-        let affect_txs = std::mem::take(&mut self.affect_txs[txid]);
-        for affect_tx in affect_txs {
-            if self.dependent_tx[affect_tx] == Some(txid) {
-                self.dependent_tx[affect_tx] = None;
-                self.no_dep_txs.insert(affect_tx);
+    pub fn commit(&mut self, txid: TxId) {
+        if !self.affect_txs[txid].is_empty() {
+            let affect_txs = std::mem::take(&mut self.affect_txs[txid]);
+            for affect_tx in affect_txs {
+                if self.dependent_tx[affect_tx] == Some(txid) {
+                    self.dependent_tx[affect_tx] = None;
+                    self.no_dep_txs.insert(affect_tx);
+                }
             }
+        }
+    }
+
+    pub fn remove(&mut self, txid: TxId) {
+        if !self.key_tx[txid] {
+            self.commit(txid);
         }
     }
 
@@ -56,8 +68,8 @@ impl TxDependency {
                     self.no_dep_txs.insert(dep_id);
                 }
             }
-        } else {
-            assert!(self.dependent_tx[txid].is_none());
+            self.key_tx[self.dependent_tx[txid].unwrap()] = true;
+        } else if self.dependent_tx[txid].is_none() {
             self.no_dep_txs.insert(txid);
         }
     }
