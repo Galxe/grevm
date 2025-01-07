@@ -66,3 +66,4 @@ lto = "fat"
 update-test-submodule = ["update-submodule-test-data", "update-submodule-ethereum-tests"]
 update-submodule-test-data = []
 update-submodule-ethereum-tests = []
+block-stm = []

@@ -146,6 +146,7 @@ where
     finality_idx: AtomicUsize,
     validation_idx: AtomicUsize,
     execution_idx: AtomicUsize,
+    ready_to_validate_idx: AtomicUsize,
 
     abort: AtomicBool,
     metrics: ExecuteMetricsCollector,
@@ -193,7 +194,11 @@ where
         with_hints: bool,
     ) -> Self {
         let num_txs = txs.len();
+        #[cfg(feature = "block-stm")]
+        let tx_dependency = TxDependency::new(num_txs);
+        #[cfg(not(feature = "block-stm"))]
         let tx_dependency = if with_hints {
+            #[cfg(not(feature = "block-stm"))]
             ParallelExecutionHints::new(txs.clone()).parse_hints()
         } else {
             TxDependency::new(num_txs)
@@ -213,11 +218,51 @@ where
             finality_idx: AtomicUsize::new(0),
             validation_idx: AtomicUsize::new(0),
             execution_idx: AtomicUsize::new(0),
+            ready_to_validate_idx: AtomicUsize::new(0),
             abort: AtomicBool::new(false),
             metrics: ExecuteMetricsCollector::default(),
         }
     }
 
+    #[cfg(feature = "block-stm")]
+    fn async_commit(&self) {
+        let mut num_commit = 0;
+        let mut read_to_validate = 0;
+        while num_commit < self.block_size && !self.abort.load(Ordering::Relaxed) {
+            while read_to_validate < self.block_size {
+                let tx_state = self.tx_states[read_to_validate].read().status.clone();
+                if matches!(tx_state, TransactionStatus::Initial | TransactionStatus::Executing) {
+                    break;
+                } else {
+                    read_to_validate += 1;
+                    self.ready_to_validate_idx.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if self.tx_states[num_commit].read().status == TransactionStatus::Unconfirmed {
+                let mut tx = self.tx_states[num_commit].write();
+                tx.status = TransactionStatus::Finality;
+                if tx.dependency.is_none() {
+                    self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    if tx.incarnation == 1 {
+                        self.metrics.one_attempt_with_dependency.fetch_add(1, Ordering::Relaxed);
+                    } else if tx.incarnation > 2 {
+                        self.metrics.more_attempts_with_dependency.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let result =
+                    self.tx_results[num_commit].lock().as_ref().unwrap().execute_result.clone();
+                let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
+                self.commiter.lock().commit(result, &self.cache);
+                num_commit += 1;
+                self.finality_idx.fetch_add(1, Ordering::Relaxed);
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+
+    #[cfg(not(feature = "block-stm"))]
     fn async_commit(&self, task_queue: &LockFreeQueue<Task>) {
         let mut start = Instant::now();
         let mut num_commit = 0;
@@ -238,9 +283,9 @@ where
                 start = Instant::now();
                 println!(
                     "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
-                    self.finality_idx.load(Ordering::Acquire),
-                    self.validation_idx.load(Ordering::Acquire),
-                    self.execution_idx.load(Ordering::Acquire)
+                    self.finality_idx.load(Ordering::Relaxed),
+                    self.validation_idx.load(Ordering::Relaxed),
+                    self.execution_idx.load(Ordering::Relaxed)
                 );
                 let status: Vec<(TxId, TransactionStatus)> =
                     self.tx_states.iter().map(|s| s.read().status.clone()).enumerate().collect();
@@ -265,14 +310,21 @@ where
     ) -> Result<(), EVMError<DB::Error>> {
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
-        let task_queue = LockFreeQueue::new(concurrency_level * 4);
+        let task_queue: LockFreeQueue<Task> = LockFreeQueue::new(concurrency_level * 4);
         thread::scope(|scope| {
+            #[cfg(feature = "block-stm")]
             scope.spawn(|| {
-                self.async_commit(&task_queue);
+                self.async_commit();
             });
-            scope.spawn(|| {
-                self.assign_tasks(&task_queue);
-            });
+            #[cfg(not(feature = "block-stm"))]
+            {
+                scope.spawn(|| {
+                    self.async_commit(&task_queue);
+                });
+                scope.spawn(|| {
+                    self.assign_tasks(&task_queue);
+                });
+            }
             for _ in 0..concurrency_level {
                 scope.spawn(|| {
                     let mut cache_db = CacheDB::new(
@@ -287,14 +339,22 @@ where
                         .with_spec_id(self.spec_id.clone())
                         .with_env(Box::new(self.env.clone()))
                         .build();
-                    while let Some(task) = self.next(&task_queue) {
-                        match task {
-                            Task::Execution(tx_version) => {
-                                self.execute(&mut evm, tx_version);
+                    loop {
+                        #[cfg(feature = "block-stm")]
+                        let task = self.next();
+                        #[cfg(not(feature = "block-stm"))]
+                        let task = self.next(&task_queue);
+                        if let Some(task) = task {
+                            match task {
+                                Task::Execution(tx_version) => {
+                                    self.execute(&mut evm, tx_version);
+                                }
+                                Task::Validation(tx_version) => {
+                                    self.validate(tx_version);
+                                }
                             }
-                            Task::Validation(tx_version) => {
-                                self.validate(tx_version);
-                            }
+                        } else {
+                            break;
                         }
                     }
                 });
@@ -358,16 +418,28 @@ where
                         TransactionStatus::Executed
                     };
                 }
-
+                // update metrics
                 if conflict {
                     self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
                     if !rewards_accumulated {
                         self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.metrics.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                #[cfg(feature = "block-stm")]
+                if conflict {
+                    self.execution_idx.fetch_min(txid, Ordering::Relaxed);
+                } else {
+                    self.validation_idx.fetch_min(txid, Ordering::Relaxed);
+                }
+                #[cfg(not(feature = "block-stm"))]
+                if conflict {
+                    if !rewards_accumulated {
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
                         self.tx_dependency.lock().add(txid, Some(txid - 1));
                     } else {
-                        self.metrics.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
                         let dep_tx = self.generate_dependent_tx(txid, &read_set);
                         self.tx_dependency.lock().add(txid, dep_tx);
                     }
@@ -414,6 +486,9 @@ where
                     }
                     tx_state.status = TransactionStatus::Conflict;
                 }
+                #[cfg(feature = "block-stm")]
+                self.execution_idx.fetch_min(txid, Ordering::Relaxed);
+                #[cfg(not(feature = "block-stm"))]
                 {
                     let dep_tx = self.generate_dependent_tx(txid, &read_set);
                     self.tx_dependency.lock().add(txid, dep_tx);
@@ -484,18 +559,23 @@ where
             self.metrics.conflict_by_version.fetch_add(1, Ordering::Relaxed);
             // mark write set as estimate
             self.mark_estimate(txid, incarnation, &result.write_set);
-            // update dependency
-            let dep_tx = match dependency {
-                None => None,
-                Some(dep) => {
-                    if dep >= self.finality_idx.load(Ordering::Relaxed) {
-                        Some(dep)
-                    } else {
-                        None
+            #[cfg(feature = "block-stm")]
+            self.execution_idx.fetch_min(txid, Ordering::Relaxed);
+            #[cfg(not(feature = "block-stm"))]
+            {
+                // update dependency
+                let dep_tx = match dependency {
+                    None => None,
+                    Some(dep) => {
+                        if dep >= self.finality_idx.load(Ordering::Relaxed) {
+                            Some(dep)
+                        } else {
+                            None
+                        }
                     }
-                }
-            };
-            self.tx_dependency.lock().add(txid, dep_tx);
+                };
+                self.tx_dependency.lock().add(txid, dep_tx);
+            }
         }
     }
 
@@ -540,9 +620,9 @@ where
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
-            let mut finality_idx = self.finality_idx.load(Ordering::Acquire);
-            let mut validation_idx = self.validation_idx.load(Ordering::Acquire);
-            let mut execution_idx = self.execution_idx.load(Ordering::Acquire);
+            let mut finality_idx = self.finality_idx.load(Ordering::Relaxed);
+            let mut validation_idx = self.validation_idx.load(Ordering::Relaxed);
+            let mut execution_idx = self.execution_idx.load(Ordering::Relaxed);
             // Confirm the finality and conflict status
             if finality_idx < validation_idx {
                 let mut tx_dependency = self.tx_dependency.lock();
@@ -578,7 +658,7 @@ where
                         }
                     }
                 }
-                self.finality_idx.store(finality_idx, Ordering::Release);
+                self.finality_idx.store(finality_idx, Ordering::Relaxed);
             }
 
             // Prior to submit validation task
@@ -597,7 +677,7 @@ where
                     break;
                 }
             }
-            self.validation_idx.store(validation_idx, Ordering::Release);
+            self.validation_idx.store(validation_idx, Ordering::Relaxed);
 
             // Submit execution task
             let num_execute = task_queue.capacity() - task_queue.len();
@@ -625,7 +705,7 @@ where
                     num_tasks += 1;
                 }
             }
-            self.execution_idx.store(execution_idx, Ordering::Release);
+            self.execution_idx.store(execution_idx, Ordering::Relaxed);
 
             if num_tasks == 0 {
                 thread::yield_now();
@@ -633,7 +713,55 @@ where
         }
     }
 
-    pub fn next(&self, task_queue: &LockFreeQueue<Task>) -> Option<Task> {
+    #[cfg(feature = "block-stm")]
+    fn next(&self) -> Option<Task> {
+        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
+            !self.abort.load(Ordering::Relaxed)
+        {
+            let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+            while validation_idx < self.execution_idx.load(Ordering::Relaxed) &&
+                validation_idx < self.ready_to_validate_idx.load(Ordering::Relaxed)
+            {
+                let validation_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);
+                if validation_idx < self.block_size {
+                    let mut tx = self.tx_states[validation_idx].write();
+                    if matches!(
+                        tx.status,
+                        TransactionStatus::Executed | TransactionStatus::Unconfirmed
+                    ) {
+                        tx.status = TransactionStatus::Validating;
+                        return Some(Task::Validation(TxVersion::new(
+                            validation_idx,
+                            tx.incarnation,
+                        )));
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            while self.execution_idx.load(Ordering::Relaxed) < self.block_size {
+                let execution_idx = self.execution_idx.fetch_add(1, Ordering::Relaxed);
+                if execution_idx < self.block_size {
+                    let mut tx = self.tx_states[execution_idx].write();
+                    if matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict)
+                    {
+                        tx.status = TransactionStatus::Executing;
+                        tx.incarnation += 1;
+                        return Some(Task::Execution(TxVersion::new(execution_idx, tx.incarnation)));
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            thread::yield_now();
+        }
+        None
+    }
+
+    #[cfg(not(feature = "block-stm"))]
+    fn next(&self, task_queue: &LockFreeQueue<Task>) -> Option<Task> {
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
