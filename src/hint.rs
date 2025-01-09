@@ -1,13 +1,13 @@
+use crate::{
+    fork_join_util, tx_dependency::TxDependency, LocationAndType, TransactionStatus, TxId, TxState,
+};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use parking_lot::Mutex;
 use revm::primitives::{
     alloy_primitives::U160, keccak256, ruint::UintTryFrom, Address, Bytes, TxEnv, TxKind, B256,
     U256,
 };
-use std::{cmp::max, sync::Arc};
-
-use crate::{
-    fork_join_util, tx_dependency::TxDependency, utils::OrderedSet, LocationAndType, TxId,
-};
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use std::sync::{atomic::AtomicUsize, Arc};
 
 /// This module provides functionality for parsing and handling execution hints
 /// for parallel transaction execution in the context of Ethereum-like blockchains.
@@ -100,32 +100,43 @@ impl ParallelExecutionHints {
     }
 
     #[fastrace::trace]
-    fn generate_dependency(&self) -> TxDependency {
+    fn generate_dependency(&self) -> (TxDependency, Vec<Mutex<TxState>>) {
         let num_txs = self.txs.len();
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
-        let mut dependent_tx: Vec<Option<TxId>> = vec![None; num_txs];
+        let mut dependent_txs = vec![HashSet::new(); num_txs];
         let mut affect_txs = vec![HashSet::new(); num_txs];
-        let mut no_dep_txs = OrderedSet::new(num_txs, true);
         for (txid, rw_set) in self.rw_set.iter().enumerate() {
             for location in rw_set.read_set.iter() {
                 if let Some(&previous) = last_write_tx.get(location) {
-                    let new_dep = dependent_tx[txid].map_or(previous, |dep| max(dep, previous));
-                    dependent_tx[txid] = Some(new_dep);
+                    dependent_txs[txid].insert(previous);
                     affect_txs[previous].insert(txid);
                 }
-            }
-            if dependent_tx[txid].is_some() {
-                no_dep_txs.remove(txid);
             }
             for location in rw_set.write_set.iter() {
                 last_write_tx.insert(location.clone(), txid);
             }
         }
-        TxDependency::create(dependent_tx, affect_txs, no_dep_txs)
+        let mut dependent_cnt = Vec::with_capacity(num_txs);
+        let mut tx_states = Vec::with_capacity(num_txs);
+        for deps in dependent_txs {
+            let mut state = TxState::default();
+            if !deps.is_empty() {
+                state.status = TransactionStatus::Aborting;
+            }
+            dependent_cnt.push(AtomicUsize::new(deps.len()));
+            tx_states.push(Mutex::new(state));
+        }
+        (
+            TxDependency::create(
+                dependent_cnt,
+                affect_txs.into_iter().map(|txs| Mutex::new(txs)).collect(),
+            ),
+            tx_states,
+        )
     }
 
     #[fastrace::trace]
-    pub(crate) fn parse_hints(&self) -> TxDependency {
+    pub(crate) fn parse_hints(&self) -> (TxDependency, Vec<Mutex<TxState>>) {
         let txs = self.txs.clone();
         // Utilize fork-join utility to process transactions in parallel
         fork_join_util(txs.len(), None, |start_tx, end_tx, _| {

@@ -1,86 +1,60 @@
-use crate::{utils::OrderedSet, TxId};
+use crate::TxId;
 use ahash::AHashSet as HashSet;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static LONG_DEPENDENCY: usize = 4;
 
 pub struct TxDependency {
-    dependent_tx: Vec<Option<TxId>>,
-    affect_txs: Vec<HashSet<TxId>>,
-    key_tx: Vec<bool>,
-    no_dep_txs: OrderedSet,
+    dependent_cnt: Vec<AtomicUsize>,
+    affect_txs: Vec<Mutex<HashSet<TxId>>>,
 }
 
 impl TxDependency {
     pub fn new(num_txs: usize) -> Self {
         Self {
-            dependent_tx: vec![None; num_txs],
-            affect_txs: vec![HashSet::new(); num_txs],
-            key_tx: vec![false; num_txs],
-            no_dep_txs: OrderedSet::new(num_txs, true),
+            dependent_cnt: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
+            affect_txs: (0..num_txs).map(|_| Default::default()).collect(),
         }
     }
 
-    pub fn create(
-        dependent_tx: Vec<Option<TxId>>,
-        affect_txs: Vec<HashSet<TxId>>,
-        no_dep_txs: OrderedSet,
-    ) -> Self {
-        assert_eq!(dependent_tx.len(), affect_txs.len());
-        let num_txs = dependent_tx.len();
-        Self { dependent_tx, affect_txs, key_tx: vec![false; num_txs], no_dep_txs }
+    pub fn create(dependent_cnt: Vec<AtomicUsize>, affect_txs: Vec<Mutex<HashSet<TxId>>>) -> Self {
+        assert_eq!(dependent_cnt.len(), affect_txs.len());
+        Self { dependent_cnt, affect_txs }
     }
 
-    pub fn next(&mut self, num: usize) -> Vec<TxId> {
-        let mut txs = Vec::with_capacity(num);
-        for _ in 0..num {
-            if let Some(txid) = self.no_dep_txs.pop_first() {
-                txs.push(txid);
-            } else {
-                break;
-            }
-        }
-        txs
+    pub fn is_read(&self, txid: TxId) -> bool {
+        self.dependent_cnt[txid].load(Ordering::Acquire) == 0
     }
 
-    pub fn commit(&mut self, txid: TxId) {
-        if !self.affect_txs[txid].is_empty() {
-            let affect_txs = std::mem::take(&mut self.affect_txs[txid]);
-            for affect_tx in affect_txs {
-                if self.dependent_tx[affect_tx] == Some(txid) {
-                    self.dependent_tx[affect_tx] = None;
-                    self.no_dep_txs.insert(affect_tx);
+    pub fn remove(&self, txid: TxId) -> Vec<TxId> {
+        let mut ready_txs = vec![];
+        let mut txs = self.affect_txs[txid].lock();
+        if !txs.is_empty() {
+            for &affect_id in txs.iter() {
+                let dependent_cnt = self.dependent_cnt[affect_id].fetch_sub(1, Ordering::AcqRel);
+                assert!(dependent_cnt > 0);
+                if dependent_cnt == 1 {
+                    ready_txs.push(affect_id);
                 }
             }
+            txs.clear();
         }
+        ready_txs
     }
 
-    pub fn remove(&mut self, txid: TxId) {
-        if !self.key_tx[txid] {
-            self.commit(txid);
-        }
-    }
-
-    pub fn add(&mut self, txid: TxId, dep_id: Option<TxId>) {
-        if let Some(dep_id) = dep_id {
-            assert!(dep_id < txid);
-            if self.dependent_tx[txid].is_none() || dep_id > self.dependent_tx[txid].unwrap() {
-                self.dependent_tx[txid] = Some(dep_id);
-                self.affect_txs[dep_id].insert(txid);
-                if self.dependent_tx[dep_id].is_none() {
-                    self.no_dep_txs.insert(dep_id);
-                }
-            }
-            self.key_tx[self.dependent_tx[txid].unwrap()] = true;
-        } else if self.dependent_tx[txid].is_none() {
-            self.no_dep_txs.insert(txid);
-        }
+    pub fn add(&self, txid: TxId, blocking_tx: TxId) {
+        let mut affect = self.affect_txs[blocking_tx].lock();
+        assert!(affect.insert(txid));
+        self.dependent_cnt[txid].fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn print(&self) {
-        println!("no_dep_txs: {:?}", self.no_dep_txs.to_set());
-        let dependent_tx: Vec<(TxId, Option<TxId>)> =
-            self.dependent_tx.clone().into_iter().enumerate().collect();
+        let dependent_cnt: Vec<(TxId, usize)> =
+            self.dependent_cnt.iter().map(|cnt| cnt.load(Ordering::Acquire)).enumerate().collect();
         let affect_txs: Vec<(TxId, HashSet<TxId>)> =
-            self.affect_txs.clone().into_iter().enumerate().collect();
-        println!("dependent_tx: {:?}", dependent_tx);
+            self.affect_txs.iter().map(|txs| (*txs.lock()).clone()).enumerate().collect();
+        println!("dependent_cnt: {:?}", dependent_cnt);
         println!("affect_txs: {:?}", affect_txs);
     }
 }

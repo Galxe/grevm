@@ -1,6 +1,6 @@
 use crate::{
     scheduler::{MVMemory, RewardsAccumulator},
-    AccountBasic, LocationAndType, MemoryEntry, MemoryValue, ReadVersion, TxVersion,
+    AccountBasic, LocationAndType, MemoryEntry, MemoryValue, ReadVersion, TxId, TxVersion,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use dashmap::DashMap;
@@ -27,7 +27,7 @@ where
     read_accounts: HashMap<Address, AccountBasic>,
     current_tx: TxVersion,
     rewards_accumulated: bool,
-    visit_estimate: bool,
+    estimate_txs: HashSet<TxId>,
 }
 
 impl<'a, DB, RA> CacheDB<'a, DB, RA>
@@ -52,7 +52,7 @@ where
             read_accounts: HashMap::new(),
             current_tx: TxVersion::new(0, 0),
             rewards_accumulated: true,
-            visit_estimate: false,
+            estimate_txs: HashSet::new(),
         }
     }
 
@@ -61,15 +61,15 @@ where
         self.read_set.clear();
         self.read_accounts.clear();
         self.rewards_accumulated = true;
-        self.visit_estimate = false;
+        self.estimate_txs.clear();
     }
 
     pub fn rewards_accumulated(&self) -> bool {
         self.rewards_accumulated
     }
 
-    pub fn visit_estimate(&self) -> bool {
-        self.visit_estimate
+    pub fn take_estimate_txs(&mut self) -> HashSet<TxId> {
+        std::mem::take(&mut self.estimate_txs)
     }
 
     pub fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
@@ -163,7 +163,7 @@ where
         let location = LocationAndType::Basic(address.clone());
         // 1. read from multi-version memory
         if let Some(written_transactions) = self.mv_memory.get(&location) {
-            if let Some((txid, entry)) =
+            if let Some((&txid, entry)) =
                 written_transactions.range(..self.current_tx.txid).next_back()
             {
                 if let MemoryValue::Basic(info) = &entry.data {
@@ -177,7 +177,10 @@ where
                             Some(info.code_hash)
                         },
                     };
-                    read_version = ReadVersion::MvMemory(TxVersion::new(*txid, entry.incarnation));
+                    if entry.estimate {
+                        self.estimate_txs.insert(txid);
+                    }
+                    read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                 }
             }
         }
@@ -255,12 +258,15 @@ where
         let location = LocationAndType::Code(code_hash.clone());
         // 1. read from multi-version memory
         if let Some(written_transactions) = self.mv_memory.get(&location) {
-            if let Some((txid, entry)) =
+            if let Some((&txid, entry)) =
                 written_transactions.range(..self.current_tx.txid).next_back()
             {
                 if let MemoryValue::Code(code) = &entry.data {
                     result = Some(code.clone());
-                    read_version = ReadVersion::MvMemory(TxVersion::new(*txid, entry.incarnation));
+                    if entry.estimate {
+                        self.estimate_txs.insert(txid);
+                    }
+                    read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                 }
             }
         }
@@ -288,12 +294,15 @@ where
         let location = LocationAndType::Storage(address.clone(), index.clone());
         // 1. read from multi-version memory
         if let Some(written_transactions) = self.mv_memory.get(&location) {
-            if let Some((txid, entry)) =
+            if let Some((&txid, entry)) =
                 written_transactions.range(..self.current_tx.txid).next_back()
             {
                 if let MemoryValue::Storage(slot) = &entry.data {
                     result = Some(slot.clone());
-                    read_version = ReadVersion::MvMemory(TxVersion::new(*txid, entry.incarnation));
+                    if entry.estimate {
+                        self.estimate_txs.insert(txid);
+                    }
+                    read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                 }
             }
         }
