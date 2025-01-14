@@ -330,7 +330,8 @@ where
                 // only the miner involved in transaction should accumulate the rewards of finality
                 // txs return true if the tx doesn't visit the miner account
                 let rewards_accumulated = evm.db().rewards_accumulated();
-                let conflict = !rewards_accumulated || evm.db().visit_estimate();
+                let mut blocking_txs = evm.db_mut().take_estimate_txs();
+                let conflict = !rewards_accumulated || !blocking_txs.is_empty();
                 let read_set = evm.db_mut().take_read_set();
                 let write_set = evm.db().update_mv_memory(&result_and_state.state, conflict);
 

@@ -60,6 +60,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
     let mut iter_loop = 0;
     let report_metrics = rand::thread_rng().gen_range(0..10);
+    let with_hints = std::env::var("WITH_HINTS").map_or(true, |s| s.parse().unwrap());
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
@@ -73,7 +74,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
                     black_box(txs.clone()),
                     black_box(db.clone()),
                     black_box(commiter),
-                    true,
+                    with_hints,
                 );
                 executor.parallel_execute(None).unwrap();
             });
@@ -101,6 +102,33 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     });
 
     group.finish();
+}
+
+fn bench_worst_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
+    let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
+    let accounts = common::mock_block_accounts(common::START_ADDRESS, block_size);
+    let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
+    db.latency_us = db_latency_us;
+    bench(
+        c,
+        "Worst Raw Transfers",
+        db,
+        (0..block_size)
+            .map(|i| {
+                // tx(i) => tx(i+1), all transactions should execute sequentially.
+                let from = Address::from(U160::from(common::START_ADDRESS + i));
+                let to = Address::from(U160::from(common::START_ADDRESS + i + 1));
+                TxEnv {
+                    caller: from,
+                    transact_to: TransactTo::Call(to),
+                    value: U256::from(1),
+                    gas_limit: common::TRANSFER_GAS_LIMIT,
+                    gas_price: U256::from(1),
+                    ..TxEnv::default()
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
 }
 
 fn bench_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
@@ -191,6 +219,12 @@ fn benchmark_gigagas(c: &mut Criterion) {
     let filter: String = std::env::var("FILTER").unwrap_or_default();
     let filter: HashSet<&str> = filter.split(',').filter(|s| !s.is_empty()).collect();
 
+    if filter.is_empty() || filter.contains("worst_raw_transfers") {
+        bench_worst_raw_transfers(c, db_latency_us);
+    }
+    if filter.is_empty() || filter.contains("worst_erc20") {
+        bench_worst_erc20(c, db_latency_us);
+    }
     if filter.is_empty() || filter.contains("raw_transfers") {
         bench_raw_transfers(c, db_latency_us);
     }
@@ -211,6 +245,33 @@ fn benchmark_gigagas(c: &mut Criterion) {
     }
 
     fastrace::flush();
+}
+
+fn bench_worst_erc20(c: &mut Criterion, db_latency_us: u64) {
+    let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
+    let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(block_size, 1);
+    let miner = common::mock_miner_account();
+    state.insert(miner.0, miner.1);
+    let mut txs = Vec::with_capacity(block_size);
+    let sca = sca[0];
+    for i in 0..eoa.len() {
+        let addr = eoa[i].clone();
+        let recipient = if i == eoa.len() - 1 { eoa[i].clone() } else { eoa[i + 1].clone() };
+        let tx = TxEnv {
+            caller: addr,
+            transact_to: TransactTo::Call(sca),
+            value: U256::from(0),
+            gas_limit: erc20::GAS_LIMIT,
+            gas_price: U256::from(1),
+            data: ERC20Token::transfer(recipient, U256::from(900)),
+            ..TxEnv::default()
+        };
+        txs.push(tx);
+    }
+    let mut db = InMemoryDB::new(state, bytecodes, Default::default());
+    db.latency_us = db_latency_us;
+
+    bench(c, "Worst ERC20", db, txs);
 }
 
 fn bench_erc20(c: &mut Criterion, db_latency_us: u64) {
