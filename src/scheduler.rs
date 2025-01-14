@@ -494,10 +494,6 @@ where
 
     fn validate(&self, tx_version: TxVersion) -> Option<Task> {
         let TxVersion { txid, incarnation } = tx_version;
-        let mut tx_state = self.tx_states[txid].lock();
-        if tx_state.incarnation != incarnation {
-            panic!("Inconsistent incarnation when validating");
-        }
         self.metrics.validation_cnt.fetch_add(1, Ordering::Relaxed);
         // check the read version of read set
         let mut conflict = false;
@@ -544,6 +540,10 @@ where
             self.mark_estimate(txid, incarnation, &result.write_set);
         }
         // update transaction status
+        let mut tx_state = self.tx_states[txid].lock();
+        if tx_state.incarnation != incarnation {
+            panic!("Inconsistent incarnation when validating");
+        }
         tx_state.has_dependency = has_dependency;
         if conflict {
             self.reset_validation_idx(txid);
