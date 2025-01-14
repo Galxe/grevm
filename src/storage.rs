@@ -221,7 +221,7 @@ where
     fn load_cache_account(&mut self, address: Address) -> Result<&mut CacheAccount, DB::Error> {
         match self.state.cache.accounts.entry(address) {
             hash_map::Entry::Vacant(entry) => {
-                let info = self.database.basic_ref(address)?;
+                let info = tokio::task::block_in_place(|| self.database.basic_ref(address))?;
                 Ok(entry.insert(into_cache_account(info)))
             }
             hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
@@ -355,7 +355,8 @@ where
         let res = match self.state.cache.contracts.entry(code_hash) {
             hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
             hash_map::Entry::Vacant(entry) => {
-                let code = self.database.code_by_hash_ref(code_hash)?;
+                let code =
+                    tokio::task::block_in_place(|| self.database.code_by_hash_ref(code_hash))?;
                 entry.insert(code.clone());
                 Ok(code)
             }
@@ -371,7 +372,8 @@ where
         match self.state.block_hashes.entry(number) {
             btree_map::Entry::Occupied(entry) => Ok(*entry.get()),
             btree_map::Entry::Vacant(entry) => {
-                let ret = *entry.insert(self.database.block_hash_ref(number)?);
+                let ret = *entry
+                    .insert(tokio::task::block_in_place(|| self.database.block_hash_ref(number))?);
 
                 // prune all hashes that are older than BLOCK_HASH_HISTORY
                 let last_block = number.saturating_sub(BLOCK_HASH_HISTORY);
