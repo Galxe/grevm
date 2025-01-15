@@ -28,6 +28,7 @@ where
     current_tx: TxVersion,
     rewards_accumulated: bool,
     estimate_txs: HashSet<TxId>,
+    self_destructed: bool,
 }
 
 impl<'a, DB, RA> CacheDB<'a, DB, RA>
@@ -53,6 +54,7 @@ where
             current_tx: TxVersion::new(0, 0),
             rewards_accumulated: true,
             estimate_txs: HashSet::new(),
+            self_destructed: false,
         }
     }
 
@@ -62,6 +64,7 @@ where
         self.read_accounts.clear();
         self.rewards_accumulated = true;
         self.estimate_txs.clear();
+        self.self_destructed = false;
     }
 
     pub fn rewards_accumulated(&self) -> bool {
@@ -70,6 +73,10 @@ where
 
     pub fn take_estimate_txs(&mut self) -> HashSet<TxId> {
         std::mem::take(&mut self.estimate_txs)
+    }
+
+    pub fn is_selfdestructed(&self) -> bool {
+        self.self_destructed
     }
 
     pub fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
@@ -84,7 +91,20 @@ where
         let mut write_set = HashSet::new();
         for (address, account) in changes {
             if account.is_selfdestructed() {
-                todo!()
+                let memory_entry = MemoryEntry::new(
+                    self.current_tx.incarnation,
+                    MemoryValue::SelfDestructed,
+                    estimate,
+                );
+                self.mv_memory
+                    .entry(LocationAndType::Code(address.clone()))
+                    .or_default()
+                    .insert(self.current_tx.txid, memory_entry.clone());
+                self.mv_memory
+                    .entry(LocationAndType::Basic(address.clone()))
+                    .or_default()
+                    .insert(self.current_tx.txid, memory_entry);
+                continue;
             }
 
             // If the account is touched, it means that the account's state has been modified
@@ -99,7 +119,7 @@ where
                     account.info.code.is_some() &&
                     read_account.map_or(true, |account| account.code_hash.is_none());
                 if new_contract {
-                    let location = LocationAndType::Code(account.info.code_hash);
+                    let location = LocationAndType::Code(address.clone());
                     write_set.insert(location.clone());
                     self.mv_memory.entry(location).or_default().insert(
                         self.current_tx.txid,
@@ -146,13 +166,60 @@ where
 
         write_set
     }
+
+    fn code_by_address(
+        &mut self,
+        address: Address,
+        code_hash: B256,
+    ) -> Result<Bytecode, DB::Error> {
+        let mut result = None;
+        let mut read_version = ReadVersion::Storage;
+        let location = LocationAndType::Code(address);
+        // 1. read from multi-version memory
+        if let Some(written_transactions) = self.mv_memory.get(&location) {
+            if let Some((&txid, entry)) =
+                written_transactions.range(..self.current_tx.txid).next_back()
+            {
+                match &entry.data {
+                    MemoryValue::Code(code) => {
+                        result = Some(code.clone());
+                        if entry.estimate {
+                            self.estimate_txs.insert(txid);
+                        }
+                        read_version =
+                            ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                    }
+                    MemoryValue::SelfDestructed => {
+                        panic!("Can't visit self-destructed code");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // 2. read from database
+        if result.is_none() {
+            let location = LocationAndType::CodeHash(code_hash);
+            if let Some(code) = self.cache.get(&location) {
+                if let MemoryValue::Code(code) = code.value() {
+                    result = Some(code.clone());
+                }
+            } else {
+                let code = self.db.code_by_hash_ref(code_hash.clone())?;
+                let code = to_analysed(code);
+                result = Some(code.clone());
+                self.cache.insert(location.clone(), MemoryValue::Code(code));
+            };
+        }
+
+        self.read_set.insert(location, read_version);
+        Ok(result.expect("No bytecode"))
+    }
 }
 
 impl<'a, DB, RA> Database for CacheDB<'a, DB, RA>
 where
     DB: DatabaseRef,
     RA: RewardsAccumulator,
-    DB::Error: Clone,
 {
     type Error = DB::Error;
 
@@ -162,30 +229,41 @@ where
         let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, code_hash: None };
         let location = LocationAndType::Basic(address.clone());
         // 1. read from multi-version memory
+        let mut self_destructed = false;
         if let Some(written_transactions) = self.mv_memory.get(&location) {
             if let Some((&txid, entry)) =
                 written_transactions.range(..self.current_tx.txid).next_back()
             {
-                if let MemoryValue::Basic(info) = &entry.data {
-                    result = Some(info.clone());
-                    read_account = AccountBasic {
-                        balance: info.balance,
-                        nonce: info.nonce,
-                        code_hash: if info.is_empty_code_hash() {
-                            None
-                        } else {
-                            Some(info.code_hash)
-                        },
-                    };
-                    if entry.estimate {
-                        self.estimate_txs.insert(txid);
+                match &entry.data {
+                    MemoryValue::Basic(info) => {
+                        result = Some(info.clone());
+                        read_account = AccountBasic {
+                            balance: info.balance,
+                            nonce: info.nonce,
+                            code_hash: if info.is_empty_code_hash() {
+                                None
+                            } else {
+                                Some(info.code_hash)
+                            },
+                        };
+                        if entry.estimate {
+                            self.estimate_txs.insert(txid);
+                        }
+                        read_version =
+                            ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
-                    read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                    MemoryValue::SelfDestructed => {
+                        self.self_destructed = true;
+                        self_destructed = true;
+                        read_version =
+                            ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                    }
+                    _ => {}
                 }
             }
         }
         // 2. read from database
-        if result.is_none() {
+        if !self_destructed && result.is_none() {
             if let Some(info) = self.cache.get(&location) {
                 if let MemoryValue::Basic(info) = info.value() {
                     read_account = AccountBasic {
@@ -233,8 +311,9 @@ where
         }
 
         if let Some(info) = &mut result {
-            // use code_by_hash to read Bytecode
-            info.code = None;
+            if !info.is_empty_code_hash() && info.code.is_none() {
+                info.code = Some(self.code_by_address(address.clone(), info.code_hash)?);
+            }
             if inc_rewards != 0 {
                 info.balance = info.balance.saturating_add(U256::from(inc_rewards));
             }
@@ -253,39 +332,7 @@ where
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        let mut result = None;
-        let mut read_version = ReadVersion::Storage;
-        let location = LocationAndType::Code(code_hash.clone());
-        // 1. read from multi-version memory
-        if let Some(written_transactions) = self.mv_memory.get(&location) {
-            if let Some((&txid, entry)) =
-                written_transactions.range(..self.current_tx.txid).next_back()
-            {
-                if let MemoryValue::Code(code) = &entry.data {
-                    result = Some(code.clone());
-                    if entry.estimate {
-                        self.estimate_txs.insert(txid);
-                    }
-                    read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
-                }
-            }
-        }
-        // 2. read from database
-        if result.is_none() {
-            if let Some(code) = self.cache.get(&location) {
-                if let MemoryValue::Code(code) = code.value() {
-                    result = Some(code.clone());
-                }
-            } else {
-                let code = self.db.code_by_hash_ref(code_hash.clone())?;
-                let code = to_analysed(code);
-                result = Some(code.clone());
-                self.cache.insert(location.clone(), MemoryValue::Code(code));
-            };
-        }
-
-        self.read_set.insert(location, read_version);
-        Ok(result.expect("No bytecode"))
+        self.db.code_by_hash_ref(code_hash)
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -314,14 +361,10 @@ where
                 }
             } else {
                 let mut new_ca = false;
-                if let Some(account) = self.read_accounts.get(&address) {
-                    if let Some(code_hash) = account.code_hash {
-                        if let Some(ReadVersion::MvMemory(_)) =
-                            self.read_set.get(&LocationAndType::Code(code_hash))
-                        {
-                            new_ca = true;
-                        }
-                    }
+                if let Some(ReadVersion::MvMemory(_)) =
+                    self.read_set.get(&LocationAndType::Code(address.clone()))
+                {
+                    new_ca = true;
                 }
                 let slot =
                     if new_ca { U256::default() } else { self.db.storage_ref(address, index)? };

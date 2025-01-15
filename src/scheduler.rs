@@ -4,22 +4,25 @@ use crate::{
     storage::{CacheDB, CachedStorageData},
     tx_dependency::TxDependency,
     utils::LockFreeQueue,
-    LocationAndType, MemoryEntry, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
-    TxState, TxVersion, CONCURRENT_LEVEL,
+    AbortReason, LocationAndType, MemoryEntry, ReadVersion, Task, TransactionResult,
+    TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
 use dashmap::DashMap;
 use metrics::histogram;
 use parking_lot::{Mutex, RwLock};
-use revm::{Evm, EvmBuilder};
-use revm_primitives::{db::DatabaseRef, EVMError, Env, SpecId, TxEnv, TxKind};
+use revm::{Evm, EvmBuilder, StateBuilder};
+use revm_primitives::{
+    db::{DatabaseCommit, DatabaseRef},
+    EVMError, Env, SpecId, TxEnv, TxKind,
+};
 use std::{
     cmp::max,
     collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::Instant,
@@ -148,6 +151,7 @@ where
     execution_idx: AtomicUsize,
 
     abort: AtomicBool,
+    abort_reason: OnceLock<AbortReason>,
     metrics: ExecuteMetricsCollector,
 }
 
@@ -214,6 +218,7 @@ where
             validation_idx: AtomicUsize::new(0),
             execution_idx: AtomicUsize::new(0),
             abort: AtomicBool::new(false),
+            abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
         }
     }
@@ -221,6 +226,7 @@ where
     fn async_commit(&self, task_queue: &LockFreeQueue<Task>) {
         let mut start = Instant::now();
         let mut num_commit = 0;
+        let mut commiter = self.commiter.lock();
         while !self.abort.load(Ordering::Relaxed) && num_commit < self.block_size {
             let finality_idx = self.finality_idx.load(Ordering::Relaxed);
             if num_commit == finality_idx {
@@ -230,7 +236,7 @@ where
                     let result =
                         self.tx_results[num_commit].lock().as_ref().unwrap().execute_result.clone();
                     let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
-                    self.commiter.lock().commit(result, &self.cache);
+                    commiter.commit(result, &self.cache);
                     num_commit += 1;
                 }
             }
@@ -300,18 +306,59 @@ where
                 });
             }
         });
+        self.post_execute()
+    }
+
+    fn post_execute(&self) -> Result<(), EVMError<DB::Error>> {
         self.metrics.report();
         if self.abort.load(Ordering::Relaxed) {
-            let result = self.tx_results[self.finality_idx.load(Ordering::Relaxed)].lock();
-            if let Some(result) = result.as_ref() {
-                if let Err(e) = &result.execute_result {
-                    return Err(e.clone());
+            if let Some(abort_reason) = self.abort_reason.get() {
+                match abort_reason {
+                    AbortReason::EvmError => {
+                        let result =
+                            self.tx_results[self.finality_idx.load(Ordering::Relaxed)].lock();
+                        if let Some(result) = result.as_ref() {
+                            if let Err(e) = &result.execute_result {
+                                return Err(e.clone());
+                            }
+                        }
+                        panic!("Wrong abort transaction")
+                    }
+                    AbortReason::SelfDestructed => {
+                        return self.fallback_sequential();
+                    }
                 }
             }
-            panic!("Wrong abort transaction")
-        } else {
-            Ok(())
         }
+        Ok(())
+    }
+
+    fn fallback_sequential(&self) -> Result<(), EVMError<DB::Error>> {
+        let mut commiter = self.commiter.lock();
+        let results = commiter.get_results();
+        if results.len() == self.block_size {
+            return Ok(());
+        }
+        results.clear();
+
+        let db = StateBuilder::new().with_bundle_update().with_database_ref(&self.db).build();
+        let mut evm = EvmBuilder::default()
+            .with_db(db)
+            .with_spec_id(self.spec_id)
+            .with_env(Box::new(self.env.clone()))
+            .build();
+        for txid in 0..self.block_size {
+            *evm.tx_mut() = self.txs[txid].clone();
+            let result_and_state = evm.transact()?;
+            evm.db_mut().commit(result_and_state.state.clone());
+            results.push(result_and_state);
+        }
+        return Ok(());
+    }
+
+    fn abort(&self, abort_reason: AbortReason) {
+        self.abort_reason.get_or_init(|| abort_reason);
+        self.abort.store(true, Ordering::Relaxed);
     }
 
     fn execute<RA>(&self, evm: &mut Evm<'_, (), &mut CacheDB<DB, RA>>, tx_version: TxVersion)
@@ -324,6 +371,10 @@ where
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         *evm.tx_mut() = self.txs[txid].clone();
         let result = evm.transact_lazy_reward();
+        if evm.db().is_selfdestructed() {
+            self.abort(AbortReason::SelfDestructed);
+            return;
+        }
 
         match result {
             Ok(result_and_state) => {
@@ -336,6 +387,7 @@ where
                 let write_set = evm.db().update_mv_memory(&result_and_state.state, conflict);
 
                 let mut last_result = self.tx_results[txid].lock();
+
                 if let Some(last_result) = last_result.as_ref() {
                     for location in &last_result.write_set {
                         if !write_set.contains(location) {
@@ -410,7 +462,7 @@ where
                     execute_result: Err(e),
                 });
                 if finality_idx == txid {
-                    self.abort.store(true, Ordering::Relaxed);
+                    self.abort(AbortReason::EvmError);
                 }
             }
         }

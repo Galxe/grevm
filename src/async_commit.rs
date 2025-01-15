@@ -6,6 +6,10 @@ use revm_primitives::{
 
 pub trait AsyncCommit {
     fn commit(&mut self, result_and_state: ResultAndState, cache: &CachedStorageData);
+
+    fn push(&mut self, result_and_state: ResultAndState);
+
+    fn get_results(&mut self) -> &mut Vec<ResultAndState>;
 }
 
 pub struct StateAsyncCommit {
@@ -54,6 +58,14 @@ impl AsyncCommit for StateAsyncCommit {
         prev_miner.info = miner_account.info.clone();
         self.results.push(result_and_state);
     }
+
+    fn push(&mut self, result_and_state: ResultAndState) {
+        self.results.push(result_and_state);
+    }
+
+    fn get_results(&mut self) -> &mut Vec<ResultAndState> {
+        &mut self.results
+    }
 }
 
 pub struct TransitionAsyncCommit {
@@ -70,6 +82,14 @@ impl TransitionAsyncCommit {
 
 impl AsyncCommit for TransitionAsyncCommit {
     fn commit(&mut self, result_and_state: ResultAndState, cache: &CachedStorageData) {
+        todo!()
+    }
+
+    fn push(&mut self, result_and_state: ResultAndState) {
+        todo!()
+    }
+
+    fn get_results(&mut self) -> &mut Vec<ResultAndState> {
         todo!()
     }
 }

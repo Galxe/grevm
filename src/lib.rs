@@ -68,9 +68,12 @@ struct AccountBasic {
 enum MemoryValue {
     Basic(AccountInfo),
     Code(Bytecode),
+    CodeHash(Bytecode),
     Storage(U256),
+    SelfDestructed,
 }
 
+#[derive(Debug, Clone)]
 struct MemoryEntry {
     incarnation: usize,
     data: MemoryValue,
@@ -89,7 +92,9 @@ enum LocationAndType {
 
     Storage(Address, U256),
 
-    Code(B256),
+    Code(Address),
+
+    CodeHash(B256),
 }
 
 struct TransactionResult<DBError> {
@@ -108,6 +113,11 @@ impl Default for Task {
     fn default() -> Self {
         Task::Execution(TxVersion::new(0, 0))
     }
+}
+
+enum AbortReason {
+    EvmError,
+    SelfDestructed,
 }
 
 /// Utility function for parallel execution using fork-join pattern.
