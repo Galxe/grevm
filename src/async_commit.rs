@@ -40,10 +40,14 @@ impl StateAsyncCommit {
 
 impl AsyncCommit for StateAsyncCommit {
     fn commit(&mut self, mut result_and_state: ResultAndState, _cache: &CachedStorageData) {
+        let mut clean_prev = false;
         if self.miner_account.is_none() {
             let mut miner = Account::default();
             miner.status = AccountStatus::Touched | AccountStatus::LoadedAsNotExisting;
             self.miner_account = Some(miner);
+            if result_and_state.rewards == 0 {
+                clean_prev = true;
+            }
         } else if let Some(miner) = &mut self.miner_account {
             miner.status = AccountStatus::Touched;
         }
@@ -56,6 +60,9 @@ impl AsyncCommit for StateAsyncCommit {
             miner_account.info.balance.saturating_add(U256::from(result_and_state.rewards));
         miner_account.info.balance = new_balance;
         prev_miner.info = miner_account.info.clone();
+        if clean_prev {
+            self.miner_account.take();
+        }
         self.results.push(result_and_state);
     }
 

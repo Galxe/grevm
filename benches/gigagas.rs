@@ -60,7 +60,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
     let mut iter_loop = 0;
     let report_metrics = rand::thread_rng().gen_range(0..10);
-    let with_hints = std::env::var("WITH_HINTS").map_or(true, |s| s.parse().unwrap());
+    let with_hints = std::env::var("WITH_HINTS").map_or(false, |s| s.parse().unwrap());
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
@@ -118,6 +118,38 @@ fn bench_worst_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
                 // tx(i) => tx(i+1), all transactions should execute sequentially.
                 let from = Address::from(U160::from(common::START_ADDRESS + i));
                 let to = Address::from(U160::from(common::START_ADDRESS + i + 1));
+                TxEnv {
+                    caller: from,
+                    transact_to: TransactTo::Call(to),
+                    value: U256::from(1),
+                    gas_limit: common::TRANSFER_GAS_LIMIT,
+                    gas_price: U256::from(1),
+                    ..TxEnv::default()
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn bench_half_chained_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
+    let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
+    let worst_len = block_size / 2;
+    let accounts = common::mock_block_accounts(common::START_ADDRESS, block_size);
+    let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
+    db.latency_us = db_latency_us;
+    bench(
+        c,
+        "Half Chained Worst Raw Transfers",
+        db,
+        (0..block_size)
+            .map(|i| {
+                // tx(i) => tx(i+1), all transactions should execute sequentially.
+                let from = Address::from(U160::from(common::START_ADDRESS + i));
+                let to = if i < worst_len {
+                    Address::from(U160::from(common::START_ADDRESS + i + 1))
+                } else {
+                    Address::from(U160::from(common::START_ADDRESS + i))
+                };
                 TxEnv {
                     caller: from,
                     transact_to: TransactTo::Call(to),
@@ -219,29 +251,46 @@ fn benchmark_gigagas(c: &mut Criterion) {
     let filter: String = std::env::var("FILTER").unwrap_or_default();
     let filter: HashSet<&str> = filter.split(',').filter(|s| !s.is_empty()).collect();
 
-    if filter.is_empty() || filter.contains("worst_raw_transfers") {
-        bench_worst_raw_transfers(c, db_latency_us);
-    }
-    if filter.is_empty() || filter.contains("worst_erc20") {
-        bench_worst_erc20(c, db_latency_us);
-    }
-    if filter.is_empty() || filter.contains("raw_transfers") {
+    if !filter.is_empty() && filter.contains("independent") {
         bench_raw_transfers(c, db_latency_us);
-    }
-    if filter.is_empty() || filter.contains("dependent_raw_transfers") {
-        bench_dependent_raw_transfers(c, db_latency_us, num_eoa, hot_ratio);
-    }
-    if filter.is_empty() || filter.contains("erc20") {
         bench_erc20(c, db_latency_us);
-    }
-    if filter.is_empty() || filter.contains("dependent_erc20") {
-        bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
-    }
-    if filter.is_empty() || filter.contains("uniswap") {
         bench_uniswap(c, db_latency_us);
-    }
-    if filter.is_empty() || filter.contains("hybrid") {
+    } else if !filter.is_empty() && filter.contains("dependent") {
+        bench_dependent_raw_transfers(c, db_latency_us, num_eoa, hot_ratio);
+        bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
         bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
+    } else if !filter.is_empty() && filter.contains("worst") {
+        bench_worst_raw_transfers(c, db_latency_us);
+        bench_worst_erc20(c, db_latency_us);
+        bench_half_chained_raw_transfers(c, db_latency_us);
+    } else {
+        if filter.is_empty() || filter.contains("raw_transfers") {
+            bench_raw_transfers(c, db_latency_us);
+        }
+        if filter.is_empty() || filter.contains("dependent_raw_transfers") {
+            bench_dependent_raw_transfers(c, db_latency_us, num_eoa, hot_ratio);
+        }
+        if filter.is_empty() || filter.contains("erc20") {
+            bench_erc20(c, db_latency_us);
+        }
+        if filter.is_empty() || filter.contains("dependent_erc20") {
+            bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
+        }
+        if filter.is_empty() || filter.contains("half_chained_raw_transfers") {
+            bench_half_chained_raw_transfers(c, db_latency_us);
+        }
+        if filter.is_empty() || filter.contains("worst_raw_transfers") {
+            bench_worst_raw_transfers(c, db_latency_us);
+        }
+        if filter.is_empty() || filter.contains("worst_erc20") {
+            bench_worst_erc20(c, db_latency_us);
+        }
+        if filter.is_empty() || filter.contains("uniswap") {
+            bench_uniswap(c, db_latency_us);
+        }
+        if filter.is_empty() || filter.contains("hybrid") {
+            bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
+        }
     }
 
     fastrace::flush();
