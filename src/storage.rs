@@ -1,16 +1,105 @@
 use crate::{
+    fork_join_util,
     scheduler::{MVMemory, RewardsAccumulator},
     AccountBasic, LocationAndType, MemoryEntry, MemoryValue, ReadVersion, TxId, TxVersion,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use dashmap::DashMap;
-use revm::interpreter::analysis::to_analysed;
+use parking_lot::Mutex;
+use revm::{
+    db::{states::bundle_state::BundleRetention, AccountRevert, BundleAccount, BundleState},
+    interpreter::analysis::to_analysed,
+    TransitionState,
+};
 use revm_primitives::{
     db::{Database, DatabaseRef},
     AccountInfo, Address, Bytecode, EvmState, B256, KECCAK_EMPTY, U256,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub type CachedStorageData = DashMap<LocationAndType, MemoryValue>;
+
+pub trait ParallelBundleState {
+    fn parallel_apply_transitions_and_create_reverts(
+        &mut self,
+        transitions: TransitionState,
+        retention: BundleRetention,
+    );
+}
+
+impl ParallelBundleState for BundleState {
+    fn parallel_apply_transitions_and_create_reverts(
+        &mut self,
+        transitions: TransitionState,
+        retention: BundleRetention,
+    ) {
+        if !self.state.is_empty() {
+            self.apply_transitions_and_create_reverts(transitions, retention);
+            return;
+        }
+
+        let include_reverts = retention.includes_reverts();
+        // pessimistically pre-allocate assuming _all_ accounts changed.
+        let reverts_capacity = if include_reverts { transitions.transitions.len() } else { 0 };
+        let transitions = transitions.transitions;
+        let addresses: Vec<Address> = transitions.keys().cloned().collect();
+        let reverts: Vec<Option<(Address, AccountRevert)>> = vec![None; reverts_capacity];
+        let bundle_state: Vec<Option<(Address, BundleAccount)>> = vec![None; transitions.len()];
+        let state_size = AtomicUsize::new(0);
+        let contracts = Mutex::new(std::collections::HashMap::new());
+
+        fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
+            #[allow(invalid_reference_casting)]
+            let reverts = unsafe {
+                &mut *(&reverts as *const Vec<Option<(Address, AccountRevert)>>
+                    as *mut Vec<Option<(Address, AccountRevert)>>)
+            };
+            #[allow(invalid_reference_casting)]
+            let addresses =
+                unsafe { &mut *(&addresses as *const Vec<Address> as *mut Vec<Address>) };
+            #[allow(invalid_reference_casting)]
+            let bundle_state = unsafe {
+                &mut *(&bundle_state as *const Vec<Option<(Address, BundleAccount)>>
+                    as *mut Vec<Option<(Address, BundleAccount)>>)
+            };
+
+            for pos in start_pos..end_pos {
+                let address = addresses[pos];
+                let transition = transitions.get(&address).cloned().unwrap();
+                // add new contract if it was created/changed.
+                if let Some((hash, new_bytecode)) = transition.has_new_contract() {
+                    contracts.lock().insert(hash, new_bytecode.clone());
+                }
+                let present_bundle = transition.present_bundle_account();
+                let revert = transition.create_revert();
+                if let Some(revert) = revert {
+                    state_size.fetch_add(present_bundle.size_hint(), Ordering::Relaxed);
+                    bundle_state[pos] = Some((address, present_bundle));
+                    if include_reverts {
+                        reverts[pos] = Some((address, revert));
+                    }
+                }
+            }
+        });
+        self.state_size = state_size.load(Ordering::Acquire);
+
+        // much faster than bundle_state.into_iter().filter_map(|r| r).collect()
+        self.state.reserve(transitions.len());
+        for bundle in bundle_state {
+            if let Some((address, state)) = bundle {
+                self.state.insert(address, state);
+            }
+        }
+        let mut final_reverts = Vec::with_capacity(reverts_capacity);
+        for revert in reverts {
+            if let Some(r) = revert {
+                final_reverts.push(r);
+            }
+        }
+        self.reverts.push(final_reverts);
+        self.contracts = contracts.into_inner();
+    }
+}
 
 pub(crate) struct CacheDB<'a, DB, RA>
 where
@@ -190,7 +279,8 @@ where
                             ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
                     MemoryValue::SelfDestructed => {
-                        panic!("Can't visit self-destructed code");
+                        self.self_destructed = true;
+                        result = Some(Bytecode::default());
                     }
                     _ => {}
                 }

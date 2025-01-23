@@ -136,8 +136,7 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 tx: Default::default(),
             };
             let db = InMemoryDB::new(accounts.clone(), bytecodes, Default::default());
-            let commiter = StateAsyncCommit::new(env.block.coinbase, &db);
-            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), db, commiter, true);
+            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), Arc::new(db), true);
 
             match (
                 test.expect_exception.as_deref(),
@@ -149,13 +148,17 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                         commiter.take_result()
                     });
                     assert_eq!(results.len(), 1);
+                    let state = executor.with_commiter(|commiter| {
+                        commiter.take_bundle()
+                    });
                     // This is overly strict as we only need the newly created account's code to be empty.
                     // Extracting such account is unjustified complexity so let's live with this for now.
-                    results.iter().all(|accounts| {
-                        accounts.state.values().all(|account| {
-                            account.info.is_empty_code_hash()
-                        })
-                    });
+                    assert!(state.state.values().all(|account| {
+                        match &account.info {
+                            Some(account) => account.is_empty_code_hash(),
+                            None => true,
+                        }
+                    }));
                 }
                 // Remaining tests that expect execution to fail -> match error
                 (Some(exception), Err(error)) => {
@@ -187,23 +190,30 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                         commiter.take_result()
                     });
                     assert_eq!(results.len(), 1);
-                    let logs = results[0].clone().result.into_logs();
+                    let logs = results[0].clone().into_logs();
                     let logs_root = log_rlp_hash(&logs);
                     assert_eq!(logs_root, test.logs, "Mismatched logs root for {path:?}");
 
+                    let state = executor.with_commiter(|commiter| {
+                        commiter.take_bundle()
+                    });
                     // This is a good reference for a minimal state/DB commitment logic for
                     // pevm/revm to meet the Ethereum specs throughout the eras.
-                    for result_and_state in results {
-                        for (address, account) in result_and_state.state {
+                    for (address, bundle) in state.state {
+                        if bundle.info.is_some() {
                             let chain_state_account = accounts.entry(address).or_default();
-                            for (index, slot) in account.storage.iter() {
+                            for (index, slot) in bundle.storage.iter() {
                                 chain_state_account.storage.insert(*index, slot.present_value);
                             }
+                        }
+                        if let Some(account) = bundle.info {
                             let chain_state_account = accounts.entry(address).or_default();
-                            chain_state_account.info.balance = account.info.balance;
-                            chain_state_account.info.nonce = account.info.nonce;
-                            chain_state_account.info.code_hash = account.info.code_hash;
-                            chain_state_account.info.code = account.info.code;
+                            chain_state_account.info.balance = account.balance;
+                            chain_state_account.info.nonce = account.nonce;
+                            chain_state_account.info.code_hash = account.code_hash;
+                            chain_state_account.info.code = account.code;
+                        } else {
+                            accounts.remove(&address);
                         }
                     }
                     // TODO: Implement our own state root calculation function to remove

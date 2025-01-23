@@ -61,19 +61,20 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut iter_loop = 0;
     let report_metrics = rand::thread_rng().gen_range(0..10);
     let with_hints = std::env::var("WITH_HINTS").map_or(false, |s| s.parse().unwrap());
+    if std::env::var("ASYNC_COMMIT_STATE").is_err() {
+        std::env::set_var("ASYNC_COMMIT_STATE", "false");
+    }
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
             let root = Span::root(format!("{name} Grevm Parallel"), SpanContext::random());
             let _guard = root.set_local_parent();
             metrics::with_local_recorder(&recorder, || {
-                let commiter = StateAsyncCommit::new(env.block.coinbase, db.as_ref());
                 let mut executor = Scheduler::new(
                     black_box(SpecId::LATEST),
                     black_box(env.clone()),
                     black_box(txs.clone()),
                     black_box(db.clone()),
-                    black_box(commiter),
                     with_hints,
                 );
                 executor.parallel_execute(None).unwrap();
@@ -246,7 +247,7 @@ fn benchmark_gigagas(c: &mut Criterion) {
 
     // TODO(gravity): Create options from toml file if there are more
     let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);
-    let num_eoa = std::env::var("NUM_EOA").map(|s| s.parse().unwrap()).unwrap_or(0);
+    let num_eoa = std::env::var("NUM_EOA").map(|s| s.parse().unwrap()).unwrap_or(100000);
     let hot_ratio = std::env::var("HOT_RATIO").map(|s| s.parse().unwrap()).unwrap_or(0.0);
     let filter: String = std::env::var("FILTER").unwrap_or_default();
     let filter: HashSet<&str> = filter.split(',').filter(|s| !s.is_empty()).collect();
