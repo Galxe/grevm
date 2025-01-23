@@ -158,6 +158,6 @@ where
     });
 }
 
-pub use storage::ParallelBundleState;
 pub use async_commit::StateAsyncCommit;
 pub use scheduler::Scheduler;
+pub use storage::ParallelBundleState;

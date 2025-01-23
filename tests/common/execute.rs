@@ -2,7 +2,7 @@ use crate::common::{storage::InMemoryDB, MINER_ADDRESS};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use alloy_chains::NamedChain;
-use grevm::{Scheduler, StateAsyncCommit};
+use grevm::Scheduler;
 use revm::{
     db::{
         states::{bundle_state::BundleRetention, StorageSlot},

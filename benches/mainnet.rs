@@ -7,10 +7,16 @@ use std::sync::Arc;
 
 use crate::common::execute_revm_sequential;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use grevm::{Scheduler, StateAsyncCommit};
+use grevm::Scheduler;
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use rand::Rng;
 
 fn benchmark_mainnet(c: &mut Criterion) {
     let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);
+    let with_hints = std::env::var("WITH_HINTS").map_or(false, |s| s.parse().unwrap());
+    if std::env::var("ASYNC_COMMIT_STATE").is_err() {
+        std::env::set_var("ASYNC_COMMIT_STATE", "false");
+    }
 
     common::for_each_block_from_disk(|env, txs, mut db| {
         db.latency_us = db_latency_us;
@@ -28,16 +34,36 @@ fn benchmark_mainnet(c: &mut Criterion) {
             })
         });
 
+        let mut iter_loop = 0;
+        let report_metrics = rand::thread_rng().gen_range(0..10);
         group.bench_function("Grevm Parallel", |b| {
             b.iter(|| {
-                let mut executor = Scheduler::new(
-                    black_box(env.spec_id()),
-                    black_box(env.env.as_ref().clone()),
-                    black_box(txs.clone()),
-                    black_box(db.clone()),
-                    true,
-                );
-                executor.parallel_execute(None).unwrap();
+                let recorder = DebuggingRecorder::new();
+                metrics::with_local_recorder(&recorder, || {
+                    let mut executor = Scheduler::new(
+                        black_box(env.spec_id()),
+                        black_box(env.env.as_ref().clone()),
+                        black_box(txs.clone()),
+                        black_box(db.clone()),
+                        with_hints,
+                    );
+                    executor.parallel_execute(None).unwrap();
+                });
+                if iter_loop == report_metrics {
+                    let snapshot = recorder.snapshotter().snapshot();
+                    println!("\n>>>> Block {}({} txs) metrics: <<<<", number, num_txs);
+                    for (key, _, _, value) in snapshot.into_vec() {
+                        let value = match value {
+                            DebugValue::Counter(v) => v as usize,
+                            DebugValue::Gauge(v) => v.0 as usize,
+                            DebugValue::Histogram(v) => {
+                                v.last().cloned().map_or(0, |ov| ov.0 as usize)
+                            }
+                        };
+                        println!("{} => {:?}", key.key().name(), value);
+                    }
+                }
+                iter_loop += 1;
             })
         });
     });

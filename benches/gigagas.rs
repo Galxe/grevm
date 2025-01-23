@@ -18,7 +18,7 @@ use common::storage::InMemoryDB;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use fastrace::{collector::Config, prelude::*};
 use fastrace_jaeger::JaegerReporter;
-use grevm::{Scheduler, StateAsyncCommit};
+use grevm::Scheduler;
 use metrics::{SharedString, Unit};
 use metrics_util::{
     debugging::{DebugValue, DebuggingRecorder},
@@ -67,8 +67,6 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
-            let root = Span::root(format!("{name} Grevm Parallel"), SpanContext::random());
-            let _guard = root.set_local_parent();
             metrics::with_local_recorder(&recorder, || {
                 let mut executor = Scheduler::new(
                     black_box(SpecId::LATEST),

@@ -13,7 +13,7 @@
 
 use crate::common::storage::InMemoryDB;
 use alloy_chains::NamedChain;
-use grevm::{Scheduler, StateAsyncCommit};
+use grevm::Scheduler;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use revm::{
     db::PlainAccount,
