@@ -2,7 +2,7 @@ use ahash::AHashSet as HashSet;
 use std::{
     cell::UnsafeCell,
     cmp::min,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     thread,
 };
 
@@ -11,7 +11,7 @@ static BUCKET_SIZE: usize = 64;
 pub struct LockFreeQueue<T> {
     capacity: usize,
     // read_for_write & data
-    buffer: Vec<UnsafeCell<(AtomicBool, T)>>,
+    buffer: Vec<UnsafeCell<T>>,
     head: AtomicUsize,
     tail: AtomicUsize,
 }
@@ -20,102 +20,46 @@ unsafe impl<T> Sync for LockFreeQueue<T> {}
 
 impl<T> LockFreeQueue<T>
 where
-    T: Default,
+    T: Default + Clone,
 {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.next_power_of_two();
-        let buffer = (0..capacity)
-            .map(|_| UnsafeCell::new((AtomicBool::new(true), Default::default())))
-            .collect();
+        let buffer = (0..capacity).map(|_| UnsafeCell::default()).collect();
         Self { capacity, buffer, head: AtomicUsize::new(0), tail: AtomicUsize::new(0) }
     }
-
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-
     pub fn len(&self) -> usize {
         self.tail.load(Ordering::Acquire) - self.head.load(Ordering::Acquire)
     }
-
     pub fn push(&self, item: T) {
         loop {
             let head = self.head.load(Ordering::Acquire);
             let tail = self.tail.load(Ordering::Relaxed);
             if tail - head < self.capacity {
-                let loc = unsafe { &mut (*self.buffer[tail % self.capacity].get()) };
-                while !loc.0.load(Ordering::Relaxed) {
-                    thread::yield_now();
+                unsafe {
+                    *self.buffer[tail % self.capacity].get() = item;
                 }
-                loc.1 = item;
-                loc.0.store(false, Ordering::Relaxed);
                 self.tail.store(tail + 1, Ordering::Release);
                 return;
             }
             thread::yield_now();
         }
     }
-
-    pub fn multi_push(&self, item: T) {
-        loop {
-            let head = self.head.load(Ordering::Acquire);
-            let tail = self.tail.load(Ordering::Relaxed);
-
-            if tail - head < self.capacity &&
-                self.tail
-                    .compare_exchange(tail, tail + 1, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let loc = unsafe { &mut (*self.buffer[tail % self.capacity].get()) };
-                while !loc.0.load(Ordering::Relaxed) {
-                    thread::yield_now();
-                }
-                loc.1 = item;
-                loc.0.store(false, Ordering::Relaxed);
-                return;
-            }
-            thread::yield_now();
-        }
-    }
-
-    pub fn pop(&self) -> Option<T> {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-
-        if head == tail {
-            None
-        } else {
-            let loc = unsafe { &mut (*self.buffer[head % self.capacity].get()) };
-            while loc.0.load(Ordering::Relaxed) {
-                thread::yield_now();
-            }
-            let item = std::mem::take(&mut loc.1);
-            loc.0.store(true, Ordering::Relaxed);
-            self.head.store(head + 1, Ordering::Release);
-            Some(item)
-        }
-    }
-
     pub fn multi_pop(&self) -> Option<T> {
         loop {
             let head = self.head.load(Ordering::Relaxed);
             let tail = self.tail.load(Ordering::Acquire);
-
             if head == tail {
                 return None;
             }
-
+            let item = unsafe { (*self.buffer[head % self.capacity].get()).clone() };
             if self
                 .head
                 .compare_exchange(head, head + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                let loc = unsafe { &mut (*self.buffer[head % self.capacity].get()) };
-                while loc.0.load(Ordering::Relaxed) {
-                    thread::yield_now();
-                }
-                let item = std::mem::take(&mut loc.1);
-                loc.0.store(true, Ordering::Relaxed);
                 return Some(item);
             }
             thread::yield_now();

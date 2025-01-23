@@ -1,5 +1,5 @@
 use crate::{
-    async_commit::AsyncCommit,
+    async_commit::StateAsyncCommit,
     hint::ParallelExecutionHints,
     storage::{CacheDB, CachedStorageData},
     tx_dependency::TxDependency,
@@ -128,17 +128,16 @@ impl ExecuteMetricsCollector {
     }
 }
 
-pub struct Scheduler<DB, C>
+pub struct Scheduler<DB>
 where
     DB: DatabaseRef,
-    C: AsyncCommit,
 {
     spec_id: SpecId,
     env: Env,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
-    db: DB,
-    commiter: Mutex<C>,
+    db: Arc<DB>,
+    commiter: Mutex<StateAsyncCommit<Arc<DB>>>,
     cache: CachedStorageData,
     tx_states: Vec<Mutex<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
@@ -155,10 +154,9 @@ where
     metrics: ExecuteMetricsCollector,
 }
 
-impl<DB, C> RewardsAccumulator for Scheduler<DB, C>
+impl<DB> RewardsAccumulator for Scheduler<DB>
 where
     DB: DatabaseRef,
-    C: AsyncCommit,
 {
     fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128> {
         // register miner accumulator
@@ -182,33 +180,27 @@ where
     }
 }
 
-impl<DB, C> Scheduler<DB, C>
+impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync,
-    C: AsyncCommit + Send,
 {
-    pub fn new(
-        spec_id: SpecId,
-        env: Env,
-        txs: Arc<Vec<TxEnv>>,
-        db: DB,
-        commiter: C,
-        with_hints: bool,
-    ) -> Self {
+    pub fn new(spec_id: SpecId, env: Env, txs: Arc<Vec<TxEnv>>, db: DB, with_hints: bool) -> Self {
         let num_txs = txs.len();
         let tx_dependency = if with_hints {
             ParallelExecutionHints::new(txs.clone()).parse_hints()
         } else {
             TxDependency::new(num_txs)
         };
+        let db = Arc::new(db);
+        let coinbase = env.block.coinbase;
         Self {
             spec_id,
             env,
             block_size: num_txs,
             txs,
-            db,
-            commiter: Mutex::new(commiter),
+            db: db.clone(),
+            commiter: Mutex::new(StateAsyncCommit::new(coinbase, db.clone())),
             cache: CachedStorageData::new(),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
@@ -227,16 +219,31 @@ where
         let mut start = Instant::now();
         let mut num_commit = 0;
         let mut commiter = self.commiter.lock();
+        let async_commit_state =
+            std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap());
         while !self.abort.load(Ordering::Relaxed) && num_commit < self.block_size {
             let finality_idx = self.finality_idx.load(Ordering::Relaxed);
             if num_commit == finality_idx {
                 thread::yield_now();
             } else {
                 while num_commit < finality_idx {
-                    let result =
-                        self.tx_results[num_commit].lock().as_ref().unwrap().execute_result.clone();
-                    let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
-                    commiter.commit(result, &self.cache);
+                    if async_commit_state {
+                        let tx = self.tx_results[num_commit].lock();
+                        let result = tx.as_ref().unwrap().execute_result.clone();
+                        let read_set = &tx.as_ref().unwrap().read_set;
+                        let mut basic_set = Vec::with_capacity(read_set.len());
+                        let mut other_set = Vec::with_capacity(read_set.len());
+                        for (location, _) in read_set {
+                            if let LocationAndType::Basic(_) = location {
+                                basic_set.push(location.clone());
+                            } else {
+                                other_set.push(location.clone());
+                            }
+                        }
+                        basic_set.extend(other_set);
+                        let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
+                        commiter.commit(result, basic_set, &self.cache);
+                    }
                     num_commit += 1;
                 }
             }
@@ -259,7 +266,7 @@ where
 
     pub fn with_commiter<F, R>(&self, func: F) -> R
     where
-        F: FnOnce(&mut C) -> R,
+        F: FnOnce(&mut StateAsyncCommit<Arc<DB>>) -> R,
     {
         let mut commiter = self.commiter.lock();
         func(&mut *commiter)
@@ -272,6 +279,7 @@ where
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
         let task_queue = LockFreeQueue::new(concurrency_level * 4);
+        self.commiter.lock().init().map_err(|e| EVMError::Database(e))?;
         thread::scope(|scope| {
             scope.spawn(|| {
                 self.async_commit(&task_queue);
@@ -335,24 +343,26 @@ where
 
     fn fallback_sequential(&self) -> Result<(), EVMError<DB::Error>> {
         let mut commiter = self.commiter.lock();
-        let results = commiter.get_results();
-        if results.len() == self.block_size {
+        let num_commit = commiter.results.len();
+        if num_commit == self.block_size {
             return Ok(());
         }
-        results.clear();
 
-        let db = StateBuilder::new().with_bundle_update().with_database_ref(&self.db).build();
-        let mut evm = EvmBuilder::default()
-            .with_db(db)
-            .with_spec_id(self.spec_id)
-            .with_env(Box::new(self.env.clone()))
-            .build();
-        for txid in 0..self.block_size {
-            *evm.tx_mut() = self.txs[txid].clone();
-            let result_and_state = evm.transact()?;
-            evm.db_mut().commit(result_and_state.state.clone());
-            results.push(result_and_state);
+        let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
+        {
+            let mut evm = EvmBuilder::default()
+                .with_db(&mut commiter.state)
+                .with_spec_id(self.spec_id)
+                .with_env(Box::new(self.env.clone()))
+                .build();
+            for txid in num_commit..self.block_size {
+                *evm.tx_mut() = self.txs[txid].clone();
+                let result_and_state = evm.transact()?;
+                evm.db_mut().commit(result_and_state.state);
+                sequential_results.push(result_and_state.result);
+            }
         }
+        commiter.results.extend(sequential_results);
         return Ok(());
     }
 
@@ -361,7 +371,7 @@ where
         self.abort.store(true, Ordering::Relaxed);
     }
 
-    fn execute<RA>(&self, evm: &mut Evm<'_, (), &mut CacheDB<DB, RA>>, tx_version: TxVersion)
+    fn execute<RA>(&self, evm: &mut Evm<'_, (), &mut CacheDB<Arc<DB>, RA>>, tx_version: TxVersion)
     where
         RA: RewardsAccumulator,
     {
@@ -369,7 +379,9 @@ where
         let finality_idx = self.finality_idx.load(Ordering::Relaxed);
         let TxVersion { txid, incarnation } = tx_version;
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
-        *evm.tx_mut() = self.txs[txid].clone();
+        let mut tx_env = self.txs[txid].clone();
+        tx_env.nonce = None;
+        *evm.tx_mut() = tx_env;
         let result = evm.transact_lazy_reward();
         if evm.db().is_selfdestructed() {
             self.abort(AbortReason::SelfDestructed);
@@ -387,7 +399,6 @@ where
                 let write_set = evm.db().update_mv_memory(&result_and_state.state, conflict);
 
                 let mut last_result = self.tx_results[txid].lock();
-
                 if let Some(last_result) = last_result.as_ref() {
                     for location in &last_result.write_set {
                         if !write_set.contains(location) {
@@ -506,6 +517,12 @@ where
                 conflict = true;
             }
         }
+        if conflict {
+            self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
+            self.metrics.conflict_by_version.fetch_add(1, Ordering::Relaxed);
+            // mark write set as estimate
+            self.mark_estimate(txid, &result.write_set);
+        }
 
         // update transaction status
         {
@@ -519,10 +536,6 @@ where
         }
 
         if conflict {
-            self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
-            self.metrics.conflict_by_version.fetch_add(1, Ordering::Relaxed);
-            // mark write set as estimate
-            self.mark_estimate(txid, &result.write_set);
             // update dependency
             let dep_tx = dependency.and_then(|dep| {
                 if dep >= self.finality_idx.load(Ordering::Relaxed) {
@@ -578,14 +591,13 @@ where
             let mut validation_idx = self.validation_idx.load(Ordering::Acquire);
             let mut execution_idx = self.execution_idx.load(Ordering::Acquire);
             // Confirm the finality and conflict status
+            let origin_finality_idx = finality_idx;
             if finality_idx < validation_idx {
-                let mut tx_dependency = self.tx_dependency.lock();
                 while finality_idx < validation_idx {
                     let mut tx = self.tx_states[finality_idx].lock();
                     match tx.status {
                         TransactionStatus::Unconfirmed => {
                             tx.status = TransactionStatus::Finality;
-                            tx_dependency.commit(finality_idx);
                             finality_idx += 1;
                             if !tx.has_dependency {
                                 self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
@@ -612,7 +624,13 @@ where
                         }
                     }
                 }
-                self.finality_idx.store(finality_idx, Ordering::Release);
+                if finality_idx > origin_finality_idx {
+                    self.finality_idx.store(finality_idx, Ordering::Release);
+                    let mut tx_dependency = self.tx_dependency.lock();
+                    for txid in origin_finality_idx..finality_idx {
+                        tx_dependency.commit(txid);
+                    }
+                }
             }
 
             // Prior to submit validation task
@@ -648,8 +666,10 @@ where
                         tx.status,
                         TransactionStatus::Initial | TransactionStatus::Conflict
                     ) {
-                        self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                        tx_dependency.commit(execute_id);
+                        if tx.status != TransactionStatus::Executing {
+                            self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
+                            tx_dependency.remove(execute_id);
+                        }
                         continue;
                     }
                     execution_idx = max(execution_idx, execute_id + 1);

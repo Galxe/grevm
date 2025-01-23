@@ -30,13 +30,11 @@ fn benchmark_mainnet(c: &mut Criterion) {
 
         group.bench_function("Grevm Parallel", |b| {
             b.iter(|| {
-                let commiter = StateAsyncCommit::new(env.block.coinbase, db.as_ref());
                 let mut executor = Scheduler::new(
                     black_box(env.spec_id()),
                     black_box(env.env.as_ref().clone()),
                     black_box(txs.clone()),
                     black_box(db.clone()),
-                    black_box(commiter),
                     true,
                 );
                 executor.parallel_execute(None).unwrap();
