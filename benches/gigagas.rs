@@ -25,7 +25,10 @@ use metrics_util::{
     CompositeKey, MetricKind,
 };
 use rand::Rng;
-use revm::primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256};
+use revm::{
+    db::states::ParallelState,
+    primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256},
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -67,12 +70,13 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
+            let state = ParallelState::new(db.clone(), true);
             metrics::with_local_recorder(&recorder, || {
                 let mut executor = Scheduler::new(
                     black_box(SpecId::LATEST),
                     black_box(env.clone()),
                     black_box(txs.clone()),
-                    black_box(db.clone()),
+                    black_box(state),
                     with_hints,
                 );
                 executor.parallel_execute(None).unwrap();

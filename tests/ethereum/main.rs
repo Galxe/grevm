@@ -13,10 +13,13 @@
 
 use crate::common::storage::InMemoryDB;
 use alloy_chains::NamedChain;
-use grevm::Scheduler;
+use grevm::{ParallelTakeBundle, Scheduler};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use revm::{
-    db::PlainAccount,
+    db::{
+        states::{bundle_state::BundleRetention, ParallelState},
+        PlainAccount,
+    },
     primitives::{
         calc_excess_blob_gas, ruint::ParseError, AccountInfo, BlobExcessGasAndPrice, BlockEnv,
         Bytecode, CfgEnv, Env as RevmEnv, TransactTo, TxEnv, KECCAK_EMPTY,
@@ -136,7 +139,7 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 tx: Default::default(),
             };
             let db = InMemoryDB::new(accounts.clone(), bytecodes, Default::default());
-            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), Arc::new(db), true);
+            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), ParallelState::new(db, true), true);
 
             match (
                 test.expect_exception.as_deref(),
@@ -144,13 +147,9 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
             ) {
                 // EIP-2681
                 (Some("TransactionException.NONCE_IS_MAX"), Ok(exec_results)) => {
-                    let results = executor.with_commiter(|commiter| {
-                        commiter.take_result()
-                    });
+                    let (results, mut state) = executor.take_result_and_state();
+                    let state = state.parallel_take_bundle(BundleRetention::Reverts);
                     assert_eq!(results.len(), 1);
-                    let state = executor.with_commiter(|commiter| {
-                        commiter.take_bundle()
-                    });
                     // This is overly strict as we only need the newly created account's code to be empty.
                     // Extracting such account is unjustified complexity so let's live with this for now.
                     assert!(state.state.values().all(|account| {
@@ -186,17 +185,12 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 }
                 // Tests that exepect execution to succeed -> match post state root
                 (None, Ok(_)) => {
-                    let results = executor.with_commiter(|commiter| {
-                        commiter.take_result()
-                    });
+                    let (results, mut state) = executor.take_result_and_state();
+                    let state = state.parallel_take_bundle(BundleRetention::Reverts);
                     assert_eq!(results.len(), 1);
                     let logs = results[0].clone().into_logs();
                     let logs_root = log_rlp_hash(&logs);
                     assert_eq!(logs_root, test.logs, "Mismatched logs root for {path:?}");
-
-                    let state = executor.with_commiter(|commiter| {
-                        commiter.take_bundle()
-                    });
                     // This is a good reference for a minimal state/DB commitment logic for
                     // pevm/revm to meet the Ethereum specs throughout the eras.
                     for (address, bundle) in state.state {

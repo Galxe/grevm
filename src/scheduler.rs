@@ -1,21 +1,18 @@
 use crate::{
-    async_commit::StateAsyncCommit,
-    hint::ParallelExecutionHints,
-    storage::{CacheDB, CachedStorageData},
-    tx_dependency::TxDependency,
-    utils::LockFreeQueue,
-    AbortReason, LocationAndType, MemoryEntry, ReadVersion, Task, TransactionResult,
-    TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
+    async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
+    tx_dependency::TxDependency, utils::LockFreeQueue, AbortReason, LocationAndType, MemoryEntry,
+    ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
+    CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
 use dashmap::DashMap;
 use metrics::histogram;
 use parking_lot::{Mutex, RwLock};
-use revm::{Evm, EvmBuilder, StateBuilder};
+use revm::{db::states::ParallelState, Evm, EvmBuilder, StateBuilder};
 use revm_primitives::{
     db::{DatabaseCommit, DatabaseRef},
-    EVMError, Env, SpecId, TxEnv, TxKind,
+    EVMError, Env, ExecutionResult, SpecId, TxEnv, TxKind,
 };
 use std::{
     cmp::max,
@@ -29,11 +26,6 @@ use std::{
 };
 
 pub type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
-
-#[auto_impl(&)]
-pub trait RewardsAccumulator {
-    fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128>;
-}
 
 struct ExecuteMetrics {
     /// Total number of transactions.
@@ -136,9 +128,8 @@ where
     env: Env,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
-    db: Arc<DB>,
-    commiter: Mutex<StateAsyncCommit<Arc<DB>>>,
-    cache: CachedStorageData,
+    state: ParallelState<DB>,
+    results: Mutex<Vec<ExecutionResult>>,
     tx_states: Vec<Mutex<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
     tx_dependency: Mutex<TxDependency>,
@@ -148,36 +139,11 @@ where
     finality_idx: AtomicUsize,
     validation_idx: AtomicUsize,
     execution_idx: AtomicUsize,
+    num_commit: AtomicUsize,
 
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason>,
     metrics: ExecuteMetricsCollector,
-}
-
-impl<DB> RewardsAccumulator for Scheduler<DB>
-where
-    DB: DatabaseRef,
-{
-    fn accumulate(&self, from: Option<TxId>, to: TxId) -> Option<u128> {
-        // register miner accumulator
-        if to > 0 {
-            if self.tx_states[to - 1].lock().status != TransactionStatus::Finality {
-                return None;
-            }
-        }
-        let mut rewards = 0;
-        for prev in from.unwrap_or(0)..to {
-            let tx_result = self.tx_results[prev].lock();
-            let Some(result) = tx_result.as_ref() else {
-                return None;
-            };
-            let Ok(result) = &result.execute_result else {
-                return None;
-            };
-            rewards += result.rewards;
-        }
-        Some(rewards)
-    }
 }
 
 impl<DB> Scheduler<DB>
@@ -189,7 +155,7 @@ where
         spec_id: SpecId,
         env: Env,
         txs: Arc<Vec<TxEnv>>,
-        db: Arc<DB>,
+        state: ParallelState<DB>,
         with_hints: bool,
     ) -> Self {
         let num_txs = txs.len();
@@ -198,15 +164,13 @@ where
         } else {
             TxDependency::new(num_txs)
         };
-        let coinbase = env.block.coinbase;
         Self {
             spec_id,
             env,
             block_size: num_txs,
             txs,
-            db: db.clone(),
-            commiter: Mutex::new(StateAsyncCommit::new(coinbase, db)),
-            cache: CachedStorageData::new(),
+            state,
+            results: Mutex::new(vec![]),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
             tx_dependency: Mutex::new(tx_dependency),
@@ -214,16 +178,21 @@ where
             finality_idx: AtomicUsize::new(0),
             validation_idx: AtomicUsize::new(0),
             execution_idx: AtomicUsize::new(0),
+            num_commit: AtomicUsize::new(0),
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
         }
     }
 
-    fn async_commit(&self, task_queue: &LockFreeQueue<Task>) {
+    fn async_commit(
+        &self,
+        commiter: &Mutex<StateAsyncCommit<DB>>,
+        task_queue: &LockFreeQueue<Task>,
+    ) {
         let mut start = Instant::now();
         let mut num_commit = 0;
-        let mut commiter = self.commiter.lock();
+        let mut commiter = commiter.lock();
         let async_commit_state =
             std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap());
         while !self.abort.load(Ordering::Relaxed) && num_commit < self.block_size {
@@ -235,21 +204,11 @@ where
                     if async_commit_state {
                         let tx = self.tx_results[num_commit].lock();
                         let result = tx.as_ref().unwrap().execute_result.clone();
-                        let read_set = &tx.as_ref().unwrap().read_set;
-                        let mut basic_set = Vec::with_capacity(read_set.len());
-                        let mut other_set = Vec::with_capacity(read_set.len());
-                        for (location, _) in read_set {
-                            if let LocationAndType::Basic(_) = location {
-                                basic_set.push(location.clone());
-                            } else {
-                                other_set.push(location.clone());
-                            }
-                        }
-                        basic_set.extend(other_set);
                         let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
-                        commiter.commit(result, basic_set, &self.cache);
+                        commiter.commit(result);
                     }
                     num_commit += 1;
+                    self.num_commit.fetch_add(1, Ordering::Relaxed);
                 }
             }
             if (Instant::now() - start).as_millis() > 8_000 {
@@ -269,16 +228,15 @@ where
         }
     }
 
-    pub fn with_commiter<F, R>(&self, func: F) -> R
-    where
-        F: FnOnce(&mut StateAsyncCommit<Arc<DB>>) -> R,
-    {
-        let mut commiter = self.commiter.lock();
-        func(&mut *commiter)
+    fn state_mut(&self) -> &mut ParallelState<DB> {
+        #[allow(invalid_reference_casting)]
+        unsafe {
+            &mut *(&self.state as *const ParallelState<DB> as *mut ParallelState<DB>)
+        }
     }
 
-    pub fn take_commiter(mut self) -> StateAsyncCommit<Arc<DB>> {
-        self.commiter.into_inner()
+    pub fn take_result_and_state(mut self) -> (Vec<ExecutionResult>, ParallelState<DB>) {
+        (self.results.into_inner(), self.state)
     }
 
     pub fn parallel_execute(
@@ -288,10 +246,11 @@ where
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
         let task_queue = LockFreeQueue::new(concurrency_level * 4);
-        self.commiter.lock().init().map_err(|e| EVMError::Database(e))?;
+        let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
+        commiter.lock().init().map_err(|e| EVMError::Database(e))?;
         thread::scope(|scope| {
             scope.spawn(|| {
-                self.async_commit(&task_queue);
+                self.async_commit(&commiter, &task_queue);
             });
             scope.spawn(|| {
                 self.assign_tasks(&task_queue);
@@ -300,10 +259,9 @@ where
                 scope.spawn(|| {
                     let mut cache_db = CacheDB::new(
                         self.env.block.coinbase,
-                        &self.db,
-                        &self.cache,
+                        &self.state,
                         &self.mv_memory,
-                        &self,
+                        &self.num_commit,
                     );
                     let mut evm = EvmBuilder::default()
                         .with_db(&mut cache_db)
@@ -323,6 +281,7 @@ where
                 });
             }
         });
+        self.results.lock().extend(commiter.lock().take_result());
         self.post_execute()
     }
 
@@ -351,16 +310,17 @@ where
     }
 
     fn fallback_sequential(&self) -> Result<(), EVMError<DB::Error>> {
-        let mut commiter = self.commiter.lock();
-        let num_commit = commiter.results.len();
+        let mut results = self.results.lock();
+        let num_commit = results.len();
         if num_commit == self.block_size {
             return Ok(());
         }
 
         let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
+        let state_mut = self.state_mut();
         {
             let mut evm = EvmBuilder::default()
-                .with_db(&mut commiter.state)
+                .with_db(state_mut)
                 .with_spec_id(self.spec_id)
                 .with_env(Box::new(self.env.clone()))
                 .build();
@@ -371,7 +331,7 @@ where
                 sequential_results.push(result_and_state.result);
             }
         }
-        commiter.results.extend(sequential_results);
+        results.extend(sequential_results);
         return Ok(());
     }
 
@@ -380,12 +340,13 @@ where
         self.abort.store(true, Ordering::Relaxed);
     }
 
-    fn execute<RA>(&self, evm: &mut Evm<'_, (), &mut CacheDB<Arc<DB>, RA>>, tx_version: TxVersion)
-    where
-        RA: RewardsAccumulator,
-    {
+    fn execute(
+        &self,
+        evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
+        tx_version: TxVersion,
+    ) {
         self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-        let finality_idx = self.finality_idx.load(Ordering::Relaxed);
+        let num_commit = self.num_commit.load(Ordering::Relaxed);
         let TxVersion { txid, incarnation } = tx_version;
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         let mut tx_env = self.txs[txid].clone();
@@ -481,7 +442,7 @@ where
                     write_set,
                     execute_result: Err(e),
                 });
-                if finality_idx == txid {
+                if num_commit == txid {
                     self.abort(AbortReason::EvmError);
                 }
             }

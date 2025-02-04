@@ -160,4 +160,4 @@ where
 
 pub use async_commit::StateAsyncCommit;
 pub use scheduler::Scheduler;
-pub use storage::ParallelBundleState;
+pub use storage::{ParallelBundleState, ParallelTakeBundle};

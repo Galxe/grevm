@@ -4,8 +4,9 @@ mod common;
 use std::sync::Arc;
 
 use common::storage::InMemoryDB;
-use grevm::Scheduler;
+use grevm::{ParallelTakeBundle, Scheduler};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use revm::db::states::{bundle_state::BundleRetention, ParallelState};
 use revm_primitives::{EnvWithHandlerCfg, TxEnv};
 
 /// Return gas used
@@ -26,7 +27,8 @@ fn test_execute(
     let recorder = DebuggingRecorder::new();
     let with_hints = std::env::var("WITH_HINTS").map_or(false, |s| s.parse().unwrap());
     let parallel_result = metrics::with_local_recorder(&recorder, || {
-        let mut executor = Scheduler::new(env.spec_id(), *env.env, txs, db, with_hints);
+        let state = ParallelState::new(db.clone(), true);
+        let mut executor = Scheduler::new(env.spec_id(), *env.env, txs, state, with_hints);
         executor.parallel_execute(None).unwrap();
 
         let snapshot = recorder.snapshotter().snapshot();
@@ -38,9 +40,8 @@ fn test_execute(
             };
             println!("metrics: {} => value: {:?}", key.key().name(), value);
         }
-        let result = executor.with_commiter(|commiter| commiter.take_result());
-        let bundle = executor.with_commiter(|commiter| commiter.take_bundle());
-        (result, bundle)
+        let (results, mut state) = executor.take_result_and_state();
+        (results, state.parallel_take_bundle(BundleRetention::Reverts))
     });
 
     common::compare_execution_result(&reth_result.0, &parallel_result.0);

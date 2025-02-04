@@ -2,10 +2,10 @@ use crate::common::{storage::InMemoryDB, MINER_ADDRESS};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use alloy_chains::NamedChain;
-use grevm::Scheduler;
+use grevm::{ParallelTakeBundle, Scheduler};
 use revm::{
     db::{
-        states::{bundle_state::BundleRetention, StorageSlot},
+        states::{bundle_state::BundleRetention, ParallelState, StorageSlot},
         AccountRevert, BundleAccount, BundleState, PlainAccount,
     },
     primitives::{
@@ -130,7 +130,7 @@ pub(crate) fn compare_evm_execute<DB>(
     with_hints: bool,
     parallel_metrics: HashMap<&str, usize>,
 ) where
-    DB: DatabaseRef + Send + Sync + 'static,
+    DB: DatabaseRef + Send + Sync,
     DB::Error: Send + Sync + Clone + Debug,
 {
     // create registry for metrics
@@ -144,12 +144,11 @@ pub(crate) fn compare_evm_execute<DB>(
 
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
+        let state = ParallelState::new(db.clone(), true);
         let mut executor =
-            Scheduler::new(SpecId::LATEST, env.clone(), txs.clone(), db.clone(), with_hints);
+            Scheduler::new(SpecId::LATEST, env.clone(), txs.clone(), state, with_hints);
         // set determined partitions
         executor.parallel_execute(Some(23)).expect("parallel execute failed");
-        let result = executor.with_commiter(|commiter| commiter.take_result());
-        let bundle = executor.with_commiter(|commiter| commiter.take_bundle());
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
 
         let snapshot = recorder.snapshotter().snapshot();
@@ -164,7 +163,8 @@ pub(crate) fn compare_evm_execute<DB>(
                 assert_eq!(*metric, value);
             }
         }
-        (result, bundle)
+        let (results, mut state) = executor.take_result_and_state();
+        (results, state.parallel_take_bundle(BundleRetention::Reverts))
     });
 
     let start = Instant::now();
