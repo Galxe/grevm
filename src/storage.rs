@@ -126,9 +126,8 @@ where
     read_set: HashMap<LocationAndType, ReadVersion>,
     read_accounts: HashMap<Address, AccountBasic>,
     current_tx: TxVersion,
-    rewards_accumulated: bool,
+    accurate_origin: bool,
     estimate_txs: HashSet<TxId>,
-    self_destructed: bool,
 }
 
 impl<'a, DB> CacheDB<'a, DB>
@@ -149,9 +148,8 @@ where
             read_set: HashMap::new(),
             read_accounts: HashMap::new(),
             current_tx: TxVersion::new(0, 0),
-            rewards_accumulated: true,
+            accurate_origin: true,
             estimate_txs: HashSet::new(),
-            self_destructed: false,
         }
     }
 
@@ -159,21 +157,16 @@ where
         self.current_tx = tx_version;
         self.read_set.clear();
         self.read_accounts.clear();
-        self.rewards_accumulated = true;
+        self.accurate_origin = true;
         self.estimate_txs.clear();
-        self.self_destructed = false;
     }
 
-    pub fn rewards_accumulated(&self) -> bool {
-        self.rewards_accumulated
+    pub fn read_accurate_origin(&self) -> bool {
+        self.accurate_origin
     }
 
     pub fn take_estimate_txs(&mut self) -> HashSet<TxId> {
         std::mem::take(&mut self.estimate_txs)
-    }
-
-    pub fn is_selfdestructed(&self) -> bool {
-        self.self_destructed
     }
 
     pub fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
@@ -290,8 +283,14 @@ where
                             ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
                     MemoryValue::SelfDestructed => {
-                        self.self_destructed = true;
-                        result = Some(Bytecode::default());
+                        if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
+                            // make sure read after the latest self-destructed
+                            read_version =
+                                ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                        } else {
+                            self.accurate_origin = false;
+                            result = Some(Bytecode::default());
+                        }
                     }
                     _ => {}
                 }
@@ -317,8 +316,7 @@ where
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut result = None;
         if address == self.coinbase {
-            self.rewards_accumulated =
-                self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid;
+            self.accurate_origin = self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid;
             result = self.db.basic_ref(address.clone())?;
         } else {
             let mut read_version = ReadVersion::Storage;
@@ -348,10 +346,14 @@ where
                                 ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                         }
                         MemoryValue::SelfDestructed => {
-                            self.self_destructed = true;
-                            result = Some(AccountInfo::default());
-                            read_version =
-                                ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                            if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
+                                // make sure read after the latest self-destructed
+                                read_version =
+                                    ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                            } else {
+                                self.accurate_origin = false;
+                                result = Some(AccountInfo::default());
+                            }
                         }
                         _ => {}
                     }

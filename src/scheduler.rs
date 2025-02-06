@@ -286,7 +286,6 @@ where
     }
 
     fn post_execute(&self) -> Result<(), EVMError<DB::Error>> {
-        self.metrics.report();
         if self.abort.load(Ordering::Relaxed) {
             if let Some(abort_reason) = self.abort_reason.get() {
                 match abort_reason {
@@ -306,10 +305,11 @@ where
                 }
             }
         }
+        self.metrics.report();
         Ok(())
     }
 
-    fn fallback_sequential(&self) -> Result<(), EVMError<DB::Error>> {
+    pub fn fallback_sequential(&self) -> Result<(), EVMError<DB::Error>> {
         let mut results = self.results.lock();
         let num_commit = results.len();
         if num_commit == self.block_size {
@@ -353,18 +353,14 @@ where
         tx_env.nonce = None;
         *evm.tx_mut() = tx_env;
         let result = evm.transact_lazy_reward();
-        if evm.db().is_selfdestructed() {
-            self.abort(AbortReason::SelfDestructed);
-            return;
-        }
 
         match result {
             Ok(result_and_state) => {
                 // only the miner involved in transaction should accumulate the rewards of finality
                 // txs return true if the tx doesn't visit the miner account
-                let rewards_accumulated = evm.db().rewards_accumulated();
+                let read_accurate_origin = evm.db().read_accurate_origin();
                 let blocking_txs = evm.db_mut().take_estimate_txs();
-                let conflict = !rewards_accumulated || !blocking_txs.is_empty();
+                let conflict = !read_accurate_origin || !blocking_txs.is_empty();
                 let read_set = evm.db_mut().take_read_set();
                 let write_set = evm.db().update_mv_memory(&result_and_state.state, conflict);
 
@@ -395,7 +391,7 @@ where
 
                 if conflict {
                     self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
-                    if !rewards_accumulated {
+                    if !read_accurate_origin {
                         self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
