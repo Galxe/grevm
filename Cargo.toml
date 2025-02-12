@@ -14,6 +14,7 @@ ahash = { version = "0.8.11", features = ["serde"] }
 rayon = "1.10.0"
 atomic = "0.6.0"
 parking_lot = "0.12"
+crossbeam = "0.8"
 
 # Alloy
 alloy-chains = "0.1.18"

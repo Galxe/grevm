@@ -263,6 +263,7 @@ fn benchmark_gigagas(c: &mut Criterion) {
         bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
         bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
     } else if !filter.is_empty() && filter.contains("worst") {
+        bench_worst_uniswap(c, db_latency_us, num_eoa, hot_ratio);
         bench_worst_raw_transfers(c, db_latency_us);
         bench_worst_erc20(c, db_latency_us);
         bench_half_chained_raw_transfers(c, db_latency_us);
@@ -393,6 +394,54 @@ fn bench_uniswap(c: &mut Criterion, db_latency_us: u64) {
     let mut db = InMemoryDB::new(final_state, final_bytecodes, Default::default());
     db.latency_us = db_latency_us;
     bench(c, "Independent Uniswap", db, final_txs);
+}
+
+fn bench_worst_uniswap(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {
+    let block_size = (GIGA_GAS as f64 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
+    let num_uniswap = (GIGA_GAS as f64 * 0.5 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
+
+    let mut state = common::mock_block_accounts(common::START_ADDRESS, num_eoa);
+    let eoa_addresses = state.keys().cloned().collect::<Vec<_>>();
+    let mut txs = Vec::with_capacity(block_size);
+
+    let mut bytecodes = HashMap::default();
+    const NUM_UNISWAP_CLUSTER: usize = 1;
+    for _ in 0..NUM_UNISWAP_CLUSTER {
+        let (uniswap_contract_accounts, uniswap_bytecodes, single_swap_address) =
+            uniswap::generate_contract_accounts(&eoa_addresses);
+        state.extend(uniswap_contract_accounts);
+        bytecodes.extend(uniswap_bytecodes);
+        for _ in 0..(num_uniswap / NUM_UNISWAP_CLUSTER) {
+            let data_bytes = if rand::random::<u64>() % 2 == 0 {
+                SingleSwap::sell_token0(U256::from(2000))
+            } else {
+                SingleSwap::sell_token1(U256::from(2000))
+            };
+
+            txs.push(TxEnv {
+                caller: Address::from(U160::from(
+                    common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio),
+                )),
+                gas_limit: uniswap::GAS_LIMIT,
+                gas_price: U256::from(0xb2d05e07u64),
+                transact_to: TransactTo::Call(single_swap_address),
+                data: data_bytes,
+                ..TxEnv::default()
+            })
+        }
+    }
+
+    for _ in 0..num_uniswap {
+        let (cluster_state, cluster_bytecodes, cluster_txs) = uniswap::generate_cluster(1, 1);
+        state.extend(cluster_state);
+        bytecodes.extend(cluster_bytecodes);
+        txs.extend(cluster_txs);
+    }
+
+    let mut db = InMemoryDB::new(state, bytecodes, Default::default());
+    db.latency_us = db_latency_us;
+
+    bench(c, "Half Worst Uniswap", db, txs);
 }
 
 fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {

@@ -1,11 +1,13 @@
-use crate::{utils::OrderedSet, TxId};
+use crate::TxId;
 use ahash::AHashSet as HashSet;
+use std::collections::BTreeSet;
 
 pub struct TxDependency {
     dependent_tx: Vec<Option<TxId>>,
     affect_txs: Vec<HashSet<TxId>>,
     key_tx: Vec<bool>,
-    no_dep_txs: OrderedSet,
+    update_cnt: Vec<usize>,
+    no_dep_txs: BTreeSet<TxId>,
 }
 
 impl TxDependency {
@@ -14,27 +16,47 @@ impl TxDependency {
             dependent_tx: vec![None; num_txs],
             affect_txs: vec![HashSet::new(); num_txs],
             key_tx: vec![false; num_txs],
-            no_dep_txs: OrderedSet::new(num_txs, true),
+            update_cnt: vec![0; num_txs],
+            no_dep_txs: (0..num_txs).collect(),
         }
     }
 
     pub fn create(
         dependent_tx: Vec<Option<TxId>>,
         affect_txs: Vec<HashSet<TxId>>,
-        no_dep_txs: OrderedSet,
+        no_dep_txs: BTreeSet<TxId>,
     ) -> Self {
         assert_eq!(dependent_tx.len(), affect_txs.len());
         let num_txs = dependent_tx.len();
-        Self { dependent_tx, affect_txs, key_tx: vec![false; num_txs], no_dep_txs }
+        Self {
+            dependent_tx,
+            affect_txs,
+            key_tx: vec![false; num_txs],
+            update_cnt: vec![0; num_txs],
+            no_dep_txs,
+        }
     }
 
-    pub fn next(&mut self, num: usize) -> Vec<TxId> {
-        let mut txs = Vec::with_capacity(num);
-        for _ in 0..num {
-            if let Some(txid) = self.no_dep_txs.pop_first() {
-                txs.push(txid);
-            } else {
-                break;
+    pub fn next(&mut self, finality_idx: TxId) -> Vec<TxId> {
+        let mut txs = vec![];
+        if let Some(txid) = self.no_dep_txs.pop_first() {
+            let mut continuous = txid;
+            txs.push(continuous);
+            if continuous == finality_idx {
+                while !self.affect_txs[continuous].is_empty() {
+                    let next = continuous + 1;
+                    if self.affect_txs[continuous].remove(&next) {
+                        if self.dependent_tx[next] == Some(continuous) {
+                            self.dependent_tx[next] = None;
+                            txs.push(next);
+                            continuous = next;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
             }
         }
         txs
@@ -69,13 +91,16 @@ impl TxDependency {
                 }
             }
             self.key_tx[self.dependent_tx[txid].unwrap()] = true;
-        } else if self.dependent_tx[txid].is_none() {
+        }
+        if self.dependent_tx[txid].is_none() {
             self.no_dep_txs.insert(txid);
+        } else {
+            self.no_dep_txs.remove(&txid);
         }
     }
 
     pub fn print(&self) {
-        println!("no_dep_txs: {:?}", self.no_dep_txs.to_set());
+        println!("no_dep_txs: {:?}", self.no_dep_txs);
         let dependent_tx: Vec<(TxId, Option<TxId>)> =
             self.dependent_tx.clone().into_iter().enumerate().collect();
         let affect_txs: Vec<(TxId, HashSet<TxId>)> =

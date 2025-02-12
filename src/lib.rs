@@ -107,6 +107,7 @@ struct TransactionResult<DBError> {
 enum Task {
     Execution(TxVersion),
     Validation(TxVersion),
+    ExecutionGroup(Vec<TxVersion>),
 }
 
 impl Default for Task {

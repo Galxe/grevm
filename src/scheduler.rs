@@ -1,11 +1,11 @@
 use crate::{
     async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::LockFreeQueue, AbortReason, LocationAndType, MemoryEntry,
-    ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
-    CONCURRENT_LEVEL,
+    tx_dependency::TxDependency, AbortReason, LocationAndType, MemoryEntry, ReadVersion, Task,
+    TransactionResult, TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
+use crossbeam::queue::ArrayQueue;
 use dashmap::DashMap;
 use metrics::histogram;
 use parking_lot::{Mutex, RwLock};
@@ -185,11 +185,7 @@ where
         }
     }
 
-    fn async_commit(
-        &self,
-        commiter: &Mutex<StateAsyncCommit<DB>>,
-        task_queue: &LockFreeQueue<Task>,
-    ) {
+    fn async_commit(&self, commiter: &Mutex<StateAsyncCommit<DB>>, task_queue: &ArrayQueue<Task>) {
         let mut start = Instant::now();
         let mut num_commit = 0;
         let mut commiter = commiter.lock();
@@ -245,7 +241,7 @@ where
     ) -> Result<(), EVMError<DB::Error>> {
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
-        let task_queue = LockFreeQueue::new(concurrency_level * 4);
+        let task_queue = ArrayQueue::new(concurrency_level * 4);
         let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
         commiter.lock().init().map_err(|e| EVMError::Database(e))?;
         thread::scope(|scope| {
@@ -275,6 +271,9 @@ where
                             }
                             Task::Validation(tx_version) => {
                                 self.validate(tx_version);
+                            }
+                            Task::ExecutionGroup(tx_versions) => {
+                                self.execute_group(&mut evm, tx_versions);
                             }
                         }
                     }
@@ -340,6 +339,16 @@ where
         self.abort.store(true, Ordering::Relaxed);
     }
 
+    fn execute_group(
+        &self,
+        evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
+        tx_versions: Vec<TxVersion>,
+    ) {
+        for tx_version in tx_versions {
+            self.execute(evm, tx_version);
+        }
+    }
+
     fn execute(
         &self,
         evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
@@ -402,9 +411,7 @@ where
                             .lock()
                             .add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
-                } else if write_set.len() < 8 {
-                    // When write set is large, the transaction can be more complex
-                    // Update dependency when finality
+                } else {
                     self.tx_dependency.lock().remove(txid);
                 }
                 *last_result = Some(TransactionResult {
@@ -549,7 +556,7 @@ where
         max_dep_id
     }
 
-    fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>) {
+    fn assign_tasks(&self, task_queue: &ArrayQueue<Task>) {
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
@@ -580,9 +587,13 @@ where
                             }
                         }
                         TransactionStatus::Conflict | TransactionStatus::Executed => {
-                            self.metrics.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
-                            // Subsequent transactions after conflict need to be revalidated
-                            validation_idx = finality_idx;
+                            if validation_idx != finality_idx {
+                                self.metrics
+                                    .reset_validation_idx_cnt
+                                    .fetch_add(1, Ordering::Relaxed);
+                                // Subsequent transactions after conflict need to be revalidated
+                                validation_idx = finality_idx;
+                            }
                             break;
                         }
                         _ => {
@@ -608,7 +619,8 @@ where
                 {
                     tx.status = TransactionStatus::Validating;
                     task_queue
-                        .push(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)));
+                        .push(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)))
+                        .expect("Failed to assign validation task");
                     num_tasks += 1;
                     validation_idx += 1;
                 } else {
@@ -621,28 +633,48 @@ where
             let num_execute = task_queue.capacity() - task_queue.len();
             if num_execute > 0 {
                 let mut tx_dependency = self.tx_dependency.lock();
-                for execute_id in tx_dependency.next(num_execute) {
-                    if execute_id < finality_idx {
-                        self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                        tx_dependency.commit(execute_id);
-                        continue;
+                let max_num_tasks = num_execute + num_tasks;
+                while num_tasks < max_num_tasks {
+                    let execution_group = tx_dependency.next(finality_idx);
+                    if execution_group.is_empty() {
+                        break;
                     }
-                    let mut tx = self.tx_states[execute_id].lock();
-                    if !matches!(
-                        tx.status,
-                        TransactionStatus::Initial | TransactionStatus::Conflict
-                    ) {
-                        if tx.status != TransactionStatus::Executing {
+                    let mut group = Vec::with_capacity(execution_group.len());
+                    for &execute_id in execution_group.iter() {
+                        if execute_id < finality_idx {
                             self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                            tx_dependency.remove(execute_id);
+                            tx_dependency.commit(execute_id);
+                            continue;
                         }
-                        continue;
+                        let mut tx = self.tx_states[execute_id].lock();
+                        if !matches!(
+                            tx.status,
+                            TransactionStatus::Initial | TransactionStatus::Conflict
+                        ) {
+                            if tx.status != TransactionStatus::Executing {
+                                self.metrics
+                                    .useless_dependent_update
+                                    .fetch_add(1, Ordering::Relaxed);
+                                tx_dependency.remove(execute_id);
+                            }
+                            continue;
+                        }
+                        execution_idx = max(execution_idx, execute_id + 1);
+                        tx.status = TransactionStatus::Executing;
+                        tx.incarnation += 1;
+                        group.push(TxVersion::new(execute_id, tx.incarnation));
+                        num_tasks += 1;
                     }
-                    execution_idx = max(execution_idx, execute_id + 1);
-                    tx.status = TransactionStatus::Executing;
-                    tx.incarnation += 1;
-                    task_queue.push(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
-                    num_tasks += 1;
+                    num_tasks += group.len();
+                    if group.len() == 1 {
+                        task_queue
+                            .push(Task::Execution(group[0].clone()))
+                            .expect("Failed to assign execution task");
+                    } else if group.len() > 1 {
+                        task_queue
+                            .push(Task::ExecutionGroup(group))
+                            .expect("Failed to assign execution group");
+                    }
                 }
             }
             self.execution_idx.store(execution_idx, Ordering::Release);
@@ -653,11 +685,11 @@ where
         }
     }
 
-    pub fn next(&self, task_queue: &LockFreeQueue<Task>) -> Option<Task> {
+    pub fn next(&self, task_queue: &ArrayQueue<Task>) -> Option<Task> {
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
-            if let Some(task) = task_queue.multi_pop() {
+            if let Some(task) = task_queue.pop() {
                 return Some(task);
             } else {
                 thread::yield_now();

@@ -189,6 +189,8 @@ where
                     MemoryValue::SelfDestructed,
                     estimate,
                 );
+                write_set.insert(LocationAndType::Code(address.clone()));
+                write_set.insert(LocationAndType::Basic(address.clone()));
                 self.mv_memory
                     .entry(LocationAndType::Code(address.clone()))
                     .or_default()
