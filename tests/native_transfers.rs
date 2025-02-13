@@ -31,23 +31,7 @@ fn native_gigagas() {
             }
         })
         .collect();
-    common::compare_evm_execute(
-        db,
-        txs,
-        true,
-        [
-            ("grevm.parallel_round_calls", 1),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", block_size),
-            ("grevm.conflict_tx_cnt", 0),
-            ("grevm.unconfirmed_tx_cnt", 0),
-            ("grevm.reusable_tx_cnt", 0),
-            ("grevm.skip_validation_cnt", block_size),
-            ("grevm.partition_num_tx_diff", 1),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, true, Default::default());
 }
 
 #[test]
@@ -69,23 +53,7 @@ fn native_transfers_independent() {
             }
         })
         .collect();
-    common::compare_evm_execute(
-        db,
-        txs,
-        true,
-        [
-            ("grevm.parallel_round_calls", 1),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", block_size),
-            ("grevm.conflict_tx_cnt", 0),
-            ("grevm.unconfirmed_tx_cnt", 0),
-            ("grevm.reusable_tx_cnt", 0),
-            ("grevm.skip_validation_cnt", block_size),
-            ("grevm.partition_num_tx_diff", 1),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, true, Default::default());
 }
 
 #[test]
@@ -126,27 +94,12 @@ fn native_with_same_sender() {
             }
         })
         .collect();
-    common::compare_evm_execute(
-        db,
-        txs,
-        false,
-        [
-            ("grevm.parallel_round_calls", 2),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", block_size),
-            ("grevm.conflict_tx_cnt", 24),
-            ("grevm.unconfirmed_tx_cnt", 71),
-            ("grevm.reusable_tx_cnt", 71),
-            ("grevm.partition_num_tx_diff", 22),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, false, Default::default());
 }
 
 #[test]
 fn native_with_all_related() {
-    let block_size = 100;
+    let block_size = 47620;
     let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = (0..block_size)
@@ -166,24 +119,7 @@ fn native_with_all_related() {
             }
         })
         .collect();
-    common::compare_evm_execute(
-        db,
-        txs,
-        false,
-        [
-            ("grevm.parallel_round_calls", 2),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", block_size),
-            ("grevm.conflict_tx_cnt", 96),
-            ("grevm.unconfirmed_tx_cnt", 0),
-            ("grevm.reusable_tx_cnt", 0),
-            // all transactions are related, so running in one partition
-            ("grevm.concurrent_partition_num", 1),
-            ("grevm.partition_num_tx_diff", 1),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, false, Default::default());
 }
 
 #[test]
@@ -332,21 +268,7 @@ fn native_transfer_with_beneficiary() {
         nonce: Some(3),
         ..TxEnv::default()
     });
-    common::compare_evm_execute(
-        db,
-        txs,
-        true,
-        [
-            ("grevm.parallel_round_calls", 2),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", 24),
-            ("grevm.conflict_tx_cnt", 4),
-            ("grevm.unconfirmed_tx_cnt", 0),
-            ("grevm.reusable_tx_cnt", 0),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, true, Default::default());
 }
 
 #[test]
@@ -410,20 +332,5 @@ fn native_transfer_with_beneficiary_enough() {
         nonce: Some(3),
         ..TxEnv::default()
     });
-    common::compare_evm_execute(
-        db,
-        txs,
-        true,
-        [
-            ("grevm.parallel_round_calls", 1),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", 24),
-            ("grevm.conflict_tx_cnt", 0),
-            ("grevm.unconfirmed_tx_cnt", 0),
-            ("grevm.reusable_tx_cnt", 0),
-            ("grevm.skip_validation_cnt", 24),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, true, Default::default());
 }

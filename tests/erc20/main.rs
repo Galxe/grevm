@@ -10,7 +10,6 @@ use crate::{
     },
 };
 use common::storage::InMemoryDB;
-use metrics_util::debugging::DebugValue;
 use revm::primitives::{alloy_primitives::U160, uint, Address, TransactTo, TxEnv, U256};
 use std::collections::HashMap;
 
@@ -118,26 +117,7 @@ fn erc20_hints_test() {
     txs[0].data = call_data.clone();
     txs[1].data = call_data.clone();
     let db = InMemoryDB::new(accounts, bytecodes, Default::default());
-    common::compare_evm_execute(
-        db,
-        txs,
-        true,
-        [
-            ("grevm.parallel_round_calls", 1),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", 3),
-            ("grevm.conflict_tx_cnt", 0),
-            ("grevm.unconfirmed_tx_cnt", 0),
-            ("grevm.reusable_tx_cnt", 0),
-            ("grevm.skip_validation_cnt", 3),
-            // important metrics!!! (tx0, tx1) are independent with (tx2)
-            // so there are two partitions
-            ("grevm.concurrent_partition_num", 2),
-            ("grevm.partition_num_tx_diff", 1),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, true, Default::default());
 }
 
 #[test]
@@ -156,18 +136,7 @@ fn erc20_independent() {
     let miner = common::mock_miner_account();
     state.insert(miner.0, miner.1);
     let db = InMemoryDB::new(state, bytecodes, Default::default());
-    common::compare_evm_execute(
-        db,
-        txs,
-        true,
-        [
-            ("grevm.parallel_round_calls", 1),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.conflict_tx_cnt", 0),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    common::compare_evm_execute(db, txs, true, Default::default());
 }
 
 #[test]
@@ -195,10 +164,5 @@ fn erc20_batch_transfer() {
     }
 
     let db = InMemoryDB::new(final_state, final_bytecodes, Default::default());
-    common::compare_evm_execute(
-        db,
-        final_txs,
-        true,
-        [("grevm.parallel_round_calls", 1), ("grevm.conflict_tx_cnt", 0)].into_iter().collect(),
-    );
+    common::compare_evm_execute(db, final_txs, true, Default::default());
 }

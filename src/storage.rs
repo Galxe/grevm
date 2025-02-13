@@ -1,29 +1,21 @@
 use crate::{
-    fork_join_util, scheduler::RewardsAccumulators, LocationAndType, LocationSet, TxId,
-    GREVM_RUNTIME,
+    fork_join_util, scheduler::MVMemory, AccountBasic, LocationAndType, MemoryEntry, MemoryValue,
+    ParallelState, ReadVersion, TxId, TxVersion,
 };
-use ahash::{AHashMap, AHashSet};
-use fastrace::Span;
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use parking_lot::Mutex;
 use revm::{
-    db::{
-        states::{bundle_state::BundleRetention, CacheAccount},
-        AccountRevert, BundleAccount, BundleState, PlainAccount,
-    },
-    precompile::Address,
-    primitives::{Account, AccountInfo, Bytecode, EvmState, B256, BLOCK_HASH_HISTORY, U256},
-    CacheState, Database, DatabaseCommit, DatabaseRef, TransitionAccount, TransitionState,
+    db::{states::bundle_state::BundleRetention, AccountRevert, BundleAccount, BundleState},
+    interpreter::analysis::to_analysed,
+    TransitionState,
 };
-use revm_primitives::KECCAK_EMPTY;
-use std::{
-    collections::{btree_map, hash_map, BTreeMap, HashMap},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+use revm_primitives::{
+    db::{Database, DatabaseRef},
+    AccountInfo, Address, Bytecode, EvmState, B256, U256,
 };
-use tokio::time::{timeout, Duration};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-trait ParallelBundleState {
+pub trait ParallelBundleState {
     fn parallel_apply_transitions_and_create_reverts(
         &mut self,
         transitions: TransitionState,
@@ -32,7 +24,6 @@ trait ParallelBundleState {
 }
 
 impl ParallelBundleState for BundleState {
-    #[fastrace::trace]
     fn parallel_apply_transitions_and_create_reverts(
         &mut self,
         transitions: TransitionState,
@@ -51,9 +42,8 @@ impl ParallelBundleState for BundleState {
         let reverts: Vec<Option<(Address, AccountRevert)>> = vec![None; reverts_capacity];
         let bundle_state: Vec<Option<(Address, BundleAccount)>> = vec![None; transitions.len()];
         let state_size = AtomicUsize::new(0);
-        let contracts = Mutex::new(HashMap::new());
+        let contracts = Mutex::new(std::collections::HashMap::new());
 
-        let span = Span::enter_with_local_parent("parallel create reverts");
         fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
             #[allow(invalid_reference_casting)]
             let reverts = unsafe {
@@ -74,7 +64,7 @@ impl ParallelBundleState for BundleState {
                 let transition = transitions.get(&address).cloned().unwrap();
                 // add new contract if it was created/changed.
                 if let Some((hash, new_bytecode)) = transition.has_new_contract() {
-                    contracts.lock().unwrap().insert(hash, new_bytecode.clone());
+                    contracts.lock().insert(hash, new_bytecode.clone());
                 }
                 let present_bundle = transition.present_bundle_account();
                 let revert = transition.create_revert();
@@ -88,7 +78,6 @@ impl ParallelBundleState for BundleState {
             }
         });
         self.state_size = state_size.load(Ordering::Acquire);
-        drop(span);
 
         // much faster than bundle_state.into_iter().filter_map(|r| r).collect()
         self.state.reserve(transitions.len());
@@ -104,363 +93,109 @@ impl ParallelBundleState for BundleState {
             }
         }
         self.reverts.push(final_reverts);
-        self.contracts = contracts.into_inner().unwrap();
+        self.contracts = contracts.into_inner();
     }
 }
 
-/// State of blockchain.
-///
-/// State clear flag is set inside CacheState and by default it is enabled.
-/// If you want to disable it use `set_state_clear_flag` function.
-#[derive(Debug, Clone)]
-pub struct State {
-    /// Cache the committed data of finality txns and the read-only data during execution after
-    /// each round of execution. Used as the initial state for the next round of partition
-    /// executors. When fall back to sequential execution, used as cached state contains both
-    /// changed from evm execution and cached/loaded account/storages.
-    pub cache: CacheState,
-    /// Block state, it aggregates transactions transitions into one state.
-    ///
-    /// Build reverts and state that gets applied to the state.
-    // TODO(gravity_nekomoto): Try to directly generate bundle state from cache, rather than
-    // transitions.
-    pub transition_state: Option<TransitionState>,
-    /// After block is finishes we merge those changes inside bundle.
-    /// Bundle is used to update database and create changesets.
-    /// Bundle state can be set on initialization if we want to use preloaded bundle.
-    pub bundle_state: BundleState,
-    /// If EVM asks for block hash we will first check if they are found here.
-    /// and then ask the database.
-    ///
-    /// This map can be used to give different values for block hashes if in case
-    /// The fork block is different or some blocks are not saved inside database.
-    pub block_hashes: BTreeMap<u64, B256>,
+pub trait ParallelTakeBundle {
+    fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            // TODO(gravity): Set state clear flag if the block is after the Spurious Dragon
-            // hardfork.
-            cache: CacheState::default(),
-            transition_state: Some(TransitionState::default()),
-            bundle_state: BundleState::default(),
-            block_hashes: BTreeMap::new(),
-        }
-    }
-}
-
-impl State {
-    /// Takes the current bundle state.
-    /// It is typically called after the bundle state has been finalized.
-    pub fn take_bundle(&mut self) -> BundleState {
-        std::mem::take(&mut self.bundle_state)
-    }
-
-    /// Take all transitions and merge them inside bundle state.
-    /// This action will create final post state and all reverts so that
-    /// we at any time revert state of bundle to the state before transition is applied.
-    #[fastrace::trace]
-    pub fn merge_transitions(&mut self, retention: BundleRetention) {
+impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
+    fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState {
         if let Some(transition_state) = self.transition_state.as_mut().map(TransitionState::take) {
             self.bundle_state
                 .parallel_apply_transitions_and_create_reverts(transition_state, retention);
         }
+        self.take_bundle()
     }
 }
 
-/// SchedulerDB is a database wrapper that manages state transitions and caching for the EVM.
-/// It maintains a cache of committed data, a transition state for ongoing transactions, and a
-/// bundle state for finalizing block state changes. It also tracks block hashes for quick access.
-///
-/// After each execution round, SchedulerDB caches the committed data of finalized
-/// transactions and the read-only data accessed during execution.
-/// This cached data serves as the initial state for the next round of partition executors.
-/// When reverting to sequential execution, these cached states will include both
-/// the changes from EVM execution and the cached/loaded accounts and storages.
-#[allow(missing_debug_implementations)]
-pub struct SchedulerDB<DB> {
-    /// The cached state during execution.
-    pub state: Box<State>,
-
-    /// The underlying database that stores the state.
-    pub database: DB,
-}
-
-impl<DB> SchedulerDB<DB> {
-    /// Create new SchedulerDB with database
-    pub fn new(state: Box<State>, database: DB) -> Self {
-        Self { state, database }
-    }
-
-    /// This function is used to cache the committed data of finality txns and the read-only data
-    /// during execution. These data will be used as the initial state for the next round of
-    /// partition executors. When falling back to sequential execution, these cached states will
-    /// include both the changes from EVM execution and the cached/loaded accounts/storages.
-    pub(crate) fn commit_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
-        apply_transition_to_cache(&mut self.state.cache, &transitions);
-        self.apply_transition(transitions);
-    }
-
-    /// Apply transition to transition state.
-    /// This will be used to create final post state and reverts.
-    fn apply_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
-        // add transition to transition state.
-        if let Some(s) = self.state.transition_state.as_mut() {
-            s.add_transitions(transitions)
-        }
-    }
-}
-
-impl<DB> SchedulerDB<DB>
+pub(crate) struct CacheDB<'a, DB>
 where
     DB: DatabaseRef,
 {
-    /// Load account from cache or database.
-    /// If account is not found in cache, it will be loaded from database.
-    fn load_cache_account(&mut self, address: Address) -> Result<&mut CacheAccount, DB::Error> {
-        match self.state.cache.accounts.entry(address) {
-            hash_map::Entry::Vacant(entry) => {
-                let info = self.database.basic_ref(address)?;
-                Ok(entry.insert(into_cache_account(info)))
-            }
-            hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-        }
-    }
+    coinbase: Address,
+    db: &'a DB,
+    mv_memory: &'a MVMemory,
+    num_commit: &'a AtomicUsize,
 
-    /// The miner's rewards is calculated by subtracting the previous balance from the current
-    /// balance. and should add to the miner's account after each round of execution for
-    /// finality transactions.
-    pub(crate) fn increment_balances(
-        &mut self,
-        balances: impl IntoIterator<Item = (Address, u128)>,
-    ) -> Result<(), DB::Error> {
-        // make transition and update cache state
-        let mut transitions = Vec::new();
-        for (address, balance) in balances {
-            if balance == 0 {
-                continue;
-            }
-            let original_account = self.load_cache_account(address)?;
-            transitions.push((
-                address,
-                original_account.increment_balance(balance).expect("Balance is not zero"),
-            ))
-        }
-        // append transition
-        if let Some(s) = self.state.transition_state.as_mut() {
-            s.add_transitions(transitions)
-        }
-        Ok(())
-    }
+    read_set: HashMap<LocationAndType, ReadVersion>,
+    read_accounts: HashMap<Address, AccountBasic>,
+    current_tx: TxVersion,
+    accurate_origin: bool,
+    estimate_txs: HashSet<TxId>,
 }
 
-fn into_cache_account(account: Option<AccountInfo>) -> CacheAccount {
-    match account {
-        None => CacheAccount::new_loaded_not_existing(),
-        Some(acc) if acc.is_empty() => CacheAccount::new_loaded_empty_eip161(HashMap::new()),
-        Some(acc) => CacheAccount::new_loaded(acc, HashMap::new()),
-    }
-}
-
-/// Get storage value of address at index.
-fn load_storage<DB: DatabaseRef>(
-    cache: &mut CacheState,
-    database: &DB,
-    address: Address,
-    index: U256,
-) -> Result<U256, DB::Error> {
-    // Account is guaranteed to be loaded.
-    // Note that storage from bundle is already loaded with account.
-    if let Some(account) = cache.accounts.get_mut(&address) {
-        // account will always be some, but if it is not, U256::ZERO will be returned.
-        let is_storage_known = account.status.is_storage_known();
-        Ok(account
-            .account
-            .as_mut()
-            .map(|account| match account.storage.entry(index) {
-                hash_map::Entry::Occupied(entry) => Ok(*entry.get()),
-                hash_map::Entry::Vacant(entry) => {
-                    // if account was destroyed or account is newly built
-                    // we return zero and don't ask database.
-                    let value = if is_storage_known {
-                        U256::ZERO
-                    } else {
-                        tokio::task::block_in_place(|| database.storage_ref(address, index))?
-                    };
-                    entry.insert(value);
-                    Ok(value)
-                }
-            })
-            .transpose()?
-            .unwrap_or_default())
-    } else {
-        unreachable!("For accessing any storage account is guaranteed to be loaded beforehand")
-    }
-}
-
-/// Apply transition to cache state.
-fn apply_transition_to_cache(
-    cache: &mut CacheState,
-    transitions: &Vec<(Address, TransitionAccount)>,
-) {
-    for (address, account) in transitions {
-        let new_storage = account.storage.iter().map(|(k, s)| (*k, s.present_value));
-        if let Some(entry) = cache.accounts.get_mut(address) {
-            if let Some(new_info) = &account.info {
-                assert!(!account.storage_was_destroyed);
-                if let Some(read_account) = entry.account.as_mut() {
-                    // account is loaded
-                    read_account.info = new_info.clone();
-                    read_account.storage.extend(new_storage);
-                } else {
-                    // account is loaded not existing
-                    entry.account = Some(PlainAccount {
-                        info: new_info.clone(),
-                        storage: new_storage.collect(),
-                    });
-                }
-            } else {
-                assert!(account.storage_was_destroyed);
-                entry.account = None;
-            }
-            entry.status = account.status;
-        } else {
-            cache.accounts.insert(
-                *address,
-                CacheAccount {
-                    account: account.info.as_ref().map(|info| PlainAccount {
-                        info: info.clone(),
-                        storage: new_storage.collect(),
-                    }),
-                    status: account.status,
-                },
-            );
-        }
-    }
-}
-
-/// SchedulerDB is used as a database for EVM when falling back to sequential execution.
-impl<DB> Database for SchedulerDB<DB>
+impl<'a, DB> CacheDB<'a, DB>
 where
     DB: DatabaseRef,
 {
-    type Error = DB::Error;
-
-    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        self.load_cache_account(address).map(|account| account.account_info())
-    }
-
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        let res = match self.state.cache.contracts.entry(code_hash) {
-            hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
-            hash_map::Entry::Vacant(entry) => {
-                let code = self.database.code_by_hash_ref(code_hash)?;
-                entry.insert(code.clone());
-                Ok(code)
-            }
-        };
-        res
-    }
-
-    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        load_storage(&mut self.state.cache, &self.database, address, index)
-    }
-
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        match self.state.block_hashes.entry(number) {
-            btree_map::Entry::Occupied(entry) => Ok(*entry.get()),
-            btree_map::Entry::Vacant(entry) => {
-                let ret = *entry.insert(self.database.block_hash_ref(number)?);
-
-                // prune all hashes that are older than BLOCK_HASH_HISTORY
-                let last_block = number.saturating_sub(BLOCK_HASH_HISTORY);
-                while let Some(entry) = self.state.block_hashes.first_entry() {
-                    if *entry.key() < last_block {
-                        entry.remove();
-                    } else {
-                        break;
-                    }
-                }
-
-                Ok(ret)
-            }
-        }
-    }
-}
-
-impl<DB> DatabaseCommit for SchedulerDB<DB> {
-    /// Fall back to sequential execute
-    fn commit(&mut self, changes: HashMap<Address, Account>) {
-        let transitions = self.state.cache.apply_evm_state(changes);
-        self.apply_transition(transitions);
-    }
-}
-
-/// PartitionDB is used in PartitionExecutor to build EVM and hook the read operations.
-/// It maintains the partition internal cache, scheduler_db, and block_hashes.
-/// It also records the read set of the current transaction, which will be consumed after the
-/// execution of each transaction.
-pub(crate) struct PartitionDB<DB> {
-    /// The address of the miner
-    /// Miner's account may be updated for each transaction, if we add miner's account to the
-    /// read/write set, every transaction will be conflict with each other, so we need to
-    /// handle miner's account separately.
-    pub coinbase: Address,
-
-    /// Cache the state of the partition
-    pub cache: CacheState,
-    /// The scheduler database, used to load the state of the committed data
-    pub scheduler_db: Arc<SchedulerDB<DB>>,
-    pub block_hashes: BTreeMap<u64, B256>,
-
-    /// Record the read set of current tx, will be consumed after the execution of each tx
-    tx_read_set: AHashMap<LocationAndType, Option<U256>>,
-
-    pub current_txid: TxId,
-    pub raw_transfer: bool,
-    rewards_accumulators: Arc<RewardsAccumulators>,
-    pub accumulated_rewards: u128,
-}
-
-impl<DB> PartitionDB<DB> {
-    pub(crate) fn new(
+    pub fn new(
         coinbase: Address,
-        scheduler_db: Arc<SchedulerDB<DB>>,
-        rewards_accumulators: Arc<RewardsAccumulators>,
+        db: &'a DB,
+        mv_memory: &'a MVMemory,
+        num_commit: &'a AtomicUsize,
     ) -> Self {
         Self {
             coinbase,
-            cache: CacheState::new(scheduler_db.state.cache.has_state_clear),
-            scheduler_db,
-            block_hashes: BTreeMap::new(),
-            tx_read_set: AHashMap::new(),
-            current_txid: 0,
-            raw_transfer: true,
-            rewards_accumulators,
-            accumulated_rewards: 0,
+            db,
+            mv_memory,
+            num_commit,
+            read_set: HashMap::new(),
+            read_accounts: HashMap::new(),
+            current_tx: TxVersion::new(0, 0),
+            accurate_origin: true,
+            estimate_txs: HashSet::new(),
         }
     }
 
-    /// consume the read set after evm.transact() for each tx
-    pub(crate) fn take_read_set(&mut self) -> AHashMap<LocationAndType, Option<U256>> {
-        core::mem::take(&mut self.tx_read_set)
+    pub fn reset_state(&mut self, tx_version: TxVersion) {
+        self.current_tx = tx_version;
+        self.read_set.clear();
+        self.read_accounts.clear();
+        self.accurate_origin = true;
+        self.estimate_txs.clear();
     }
 
-    /// Generate the write set after evm.transact() for each tx
-    /// The write set includes the locations of the basic account, code, and storage slots that have
-    /// been modified. Returns the write set(exclude miner) and the miner's rewards.
-    pub(crate) fn generate_write_set(&self, changes: &mut EvmState) -> LocationSet {
-        let mut write_set = AHashSet::new();
-        for (address, account) in &mut *changes {
+    pub fn read_accurate_origin(&self) -> bool {
+        self.accurate_origin
+    }
+
+    pub fn take_estimate_txs(&mut self) -> HashSet<TxId> {
+        std::mem::take(&mut self.estimate_txs)
+    }
+
+    pub fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
+        std::mem::take(&mut self.read_set)
+    }
+
+    pub(crate) fn update_mv_memory(
+        &self,
+        changes: &EvmState,
+        estimate: bool,
+    ) -> HashSet<LocationAndType> {
+        let mut write_set = HashSet::new();
+        for (address, account) in changes {
+            if *address == self.coinbase {
+                continue;
+            }
             if account.is_selfdestructed() {
-                write_set.insert(LocationAndType::Code(*address));
-                // When a contract account is destroyed, its remaining balance is sent to a
-                // designated address, and the account’s balance becomes invalid.
-                // Defensive programming should be employed to prevent subsequent transactions
-                // from attempting to read the contract account’s basic information,
-                // which could lead to errors.
-                write_set.insert(LocationAndType::Basic(*address));
+                let memory_entry = MemoryEntry::new(
+                    self.current_tx.incarnation,
+                    MemoryValue::SelfDestructed,
+                    estimate,
+                );
+                write_set.insert(LocationAndType::Code(address.clone()));
+                write_set.insert(LocationAndType::Basic(address.clone()));
+                self.mv_memory
+                    .entry(LocationAndType::Code(address.clone()))
+                    .or_default()
+                    .insert(self.current_tx.txid, memory_entry.clone());
+                self.mv_memory
+                    .entry(LocationAndType::Basic(address.clone()))
+                    .or_default()
+                    .insert(self.current_tx.txid, memory_entry);
                 continue;
             }
 
@@ -469,231 +204,228 @@ impl<DB> PartitionDB<DB> {
             // or code. We need to track these changes to ensure the correct state is committed
             // after the transaction.
             if account.is_touched() {
+                let read_account = self.read_accounts.get(address);
                 let has_code = !account.info.is_empty_code_hash();
                 // is newly created contract
-                let mut new_contract_account = false;
-
-                if match self.cache.accounts.get(address) {
-                    Some(read_account) => {
-                        read_account.account.as_ref().map_or(true, |read_account| {
-                            new_contract_account =
-                                has_code && read_account.info.is_empty_code_hash();
-                            new_contract_account ||
-                                read_account.info.nonce != account.info.nonce ||
-                                read_account.info.balance != account.info.balance
-                        })
-                    }
-                    None => {
-                        new_contract_account = has_code;
-                        true
-                    }
-                } {
-                    write_set.insert(LocationAndType::Basic(*address));
+                let new_contract = has_code &&
+                    account.info.code.is_some() &&
+                    read_account.map_or(true, |account| account.code_hash.is_none());
+                if new_contract {
+                    let location = LocationAndType::Code(address.clone());
+                    write_set.insert(location.clone());
+                    self.mv_memory.entry(location).or_default().insert(
+                        self.current_tx.txid,
+                        MemoryEntry::new(
+                            self.current_tx.incarnation,
+                            MemoryValue::Code(to_analysed(account.info.code.clone().unwrap())),
+                            estimate,
+                        ),
+                    );
                 }
-                if new_contract_account {
-                    write_set.insert(LocationAndType::Code(*address));
+
+                if new_contract ||
+                    read_account.is_none() ||
+                    read_account.is_some_and(|basic| {
+                        basic.nonce != account.info.nonce || basic.balance != account.info.balance
+                    })
+                {
+                    let location = LocationAndType::Basic(address.clone());
+                    write_set.insert(location.clone());
+                    self.mv_memory.entry(location).or_default().insert(
+                        self.current_tx.txid,
+                        MemoryEntry::new(
+                            self.current_tx.incarnation,
+                            MemoryValue::Basic(AccountInfo { code: None, ..account.info }),
+                            estimate,
+                        ),
+                    );
                 }
             }
 
-            for (slot, _) in account.changed_storage_slots() {
-                write_set.insert(LocationAndType::Storage(*address, *slot));
+            for (slot, value) in account.changed_storage_slots() {
+                let location = LocationAndType::Storage(*address, *slot);
+                write_set.insert(location.clone());
+                self.mv_memory.entry(location).or_default().insert(
+                    self.current_tx.txid,
+                    MemoryEntry::new(
+                        self.current_tx.incarnation,
+                        MemoryValue::Storage(value.present_value),
+                        estimate,
+                    ),
+                );
             }
         }
+
         write_set
     }
 
-    /// Temporary commit the state change after evm.transact() for each tx
-    /// Final commit will be called when the transaction is marked as finality in the validation of
-    /// scheduler.
-    pub(crate) fn temporary_commit(
+    fn code_by_address(
         &mut self,
-        changes: EvmState,
-    ) -> Vec<(Address, TransitionAccount)> {
-        self.cache.apply_evm_state(changes)
-    }
-
-    pub(crate) fn temporary_commit_transition(
-        &mut self,
-        transitions: &Vec<(Address, TransitionAccount)>,
-    ) {
-        apply_transition_to_cache(&mut self.cache, transitions);
-    }
-}
-
-impl<DB> PartitionDB<DB>
-where
-    DB: DatabaseRef,
-{
-    /// If the read set is consistent with the read set of the previous round of execution,
-    /// We can reuse the results of the previous round of execution, and no need to re-execute the
-    /// transaction.
-    pub(crate) fn check_read_set(
-        &mut self,
-        read_set: &AHashMap<LocationAndType, Option<U256>>,
-    ) -> bool {
-        let mut visit_account = AHashSet::new();
-        for (location, _) in read_set {
-            match location {
-                LocationAndType::Basic(address) => {
-                    if !visit_account.contains(address) {
-                        let _ = self.basic(address.clone());
-                        visit_account.insert(address.clone());
+        address: Address,
+        code_hash: B256,
+    ) -> Result<Bytecode, DB::Error> {
+        let mut result = None;
+        let mut read_version = ReadVersion::Storage;
+        let location = LocationAndType::Code(address);
+        // 1. read from multi-version memory
+        if let Some(written_transactions) = self.mv_memory.get(&location) {
+            if let Some((&txid, entry)) =
+                written_transactions.range(..self.current_tx.txid).next_back()
+            {
+                match &entry.data {
+                    MemoryValue::Code(code) => {
+                        result = Some(code.clone());
+                        if entry.estimate {
+                            self.estimate_txs.insert(txid);
+                        }
+                        read_version =
+                            ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
-                }
-                LocationAndType::Storage(address, index) => {
-                    // If the account is not loaded, we need to load it from the database.
-                    if !visit_account.contains(address) {
-                        let _ = self.basic(address.clone());
-                        visit_account.insert(address.clone());
+                    MemoryValue::SelfDestructed => {
+                        if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
+                            // make sure read after the latest self-destructed
+                            read_version =
+                                ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                        } else {
+                            self.accurate_origin = false;
+                            result = Some(Bytecode::default());
+                        }
                     }
-                    let _ = self.storage(address.clone(), index.clone());
+                    _ => {}
                 }
-                _ => {}
             }
         }
-        let new_read_set = self.take_read_set();
-        if new_read_set.len() != read_set.len() {
-            false
-        } else {
-            new_read_set
-                .iter()
-                .all(|(key, value)| read_set.get(key).map_or(false, |v| *value == *v))
+        // 2. read from database
+        if result.is_none() {
+            let byte_code = self.db.code_by_hash_ref(code_hash)?;
+            result = Some(byte_code);
         }
+
+        self.read_set.insert(location, read_version);
+        Ok(result.expect("No bytecode"))
     }
 }
 
-/// Used to build evm, and hook the read operations
-impl<DB> Database for PartitionDB<DB>
+impl<'a, DB> Database for CacheDB<'a, DB>
 where
     DB: DatabaseRef,
 {
     type Error = DB::Error;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        // 1. read from internal cache
-        let mut result = match self.cache.accounts.entry(address) {
-            hash_map::Entry::Vacant(entry) => {
-                // 2. read initial state of this round from scheduler cache
-                if let Some(account) = self.scheduler_db.state.cache.accounts.get(&address) {
-                    Ok(entry.insert(account.clone()).account_info())
-                } else {
-                    // 3. read from origin database
-                    tokio::task::block_in_place(|| self.scheduler_db.database.basic_ref(address))
-                        .map(|info| entry.insert(into_cache_account(info)).account_info())
-                }
-            }
-            hash_map::Entry::Occupied(entry) => Ok(entry.get().account_info()),
-        };
-
-        let mut inc_rewards = 0;
-        if address == self.coinbase && !self.raw_transfer {
-            if let Some(accumulator) = self.rewards_accumulators.get(&self.current_txid) {
-                let mut wait_time_ms = 0;
-                let loop_wait_time = 10; // 10ms
-                let wait_time_out = 10_1000; // 10s
-                while accumulator.accumulate_counter.load(Ordering::Acquire) <
-                    accumulator.accumulate_num
+        let mut result = None;
+        if address == self.coinbase {
+            self.accurate_origin = self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid;
+            result = self.db.basic_ref(address.clone())?;
+        } else {
+            let mut read_version = ReadVersion::Storage;
+            let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, code_hash: None };
+            let location = LocationAndType::Basic(address.clone());
+            // 1. read from multi-version memory
+            if let Some(written_transactions) = self.mv_memory.get(&location) {
+                if let Some((&txid, entry)) =
+                    written_transactions.range(..self.current_tx.txid).next_back()
                 {
-                    let notifier = accumulator.notifier.clone();
-                    tokio::task::block_in_place(move || {
-                        GREVM_RUNTIME.block_on(async move {
-                            let _ =
-                                timeout(Duration::from_millis(loop_wait_time), notifier.notified())
-                                    .await
-                                    .is_ok();
-                        })
-                    });
-                    wait_time_ms += loop_wait_time;
-                    if wait_time_ms > wait_time_out {
-                        panic!(
-                            "wait to much time for the accumulated rewards of account({:?})",
-                            address
-                        );
+                    match &entry.data {
+                        MemoryValue::Basic(info) => {
+                            result = Some(info.clone());
+                            read_account = AccountBasic {
+                                balance: info.balance,
+                                nonce: info.nonce,
+                                code_hash: if info.is_empty_code_hash() {
+                                    None
+                                } else {
+                                    Some(info.code_hash)
+                                },
+                            };
+                            if entry.estimate {
+                                self.estimate_txs.insert(txid);
+                            }
+                            read_version =
+                                ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                        }
+                        MemoryValue::SelfDestructed => {
+                            if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
+                                // make sure read after the latest self-destructed
+                                read_version =
+                                    ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                            } else {
+                                self.accurate_origin = false;
+                                result = Some(AccountInfo::default());
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                let new_rewards = accumulator.accumulate_rewards.load(Ordering::Acquire);
-                inc_rewards = new_rewards - self.accumulated_rewards;
-                self.accumulated_rewards = new_rewards;
             }
-            self.tx_read_set.entry(LocationAndType::Basic(address)).or_insert(None);
-        }
-        let mut balance = U256::ZERO;
-        if let Ok(account) = &mut result {
-            if let Some(info) = account {
-                if !info.is_empty_code_hash() {
-                    self.tx_read_set.insert(LocationAndType::Code(address), None);
+            // 2. read from database
+            if result.is_none() {
+                let info = self.db.basic_ref(address.clone())?;
+                if let Some(info) = info {
+                    read_account = AccountBasic {
+                        balance: info.balance,
+                        nonce: info.nonce,
+                        code_hash: if info.is_empty_code_hash() {
+                            None
+                        } else {
+                            Some(info.code_hash)
+                        },
+                    };
+                    result = Some(info.clone());
                 }
-                info.balance = info.balance.saturating_add(U256::from(inc_rewards));
-                balance = info.balance;
-            } else if inc_rewards != 0 {
-                result = Ok(Some(AccountInfo::new(
-                    U256::from(inc_rewards),
-                    0,
-                    KECCAK_EMPTY,
-                    Bytecode::default(),
-                )));
+            }
+            self.read_accounts.insert(address, read_account);
+            self.read_set.insert(location, read_version);
+        }
+
+        if let Some(info) = &mut result {
+            if !info.is_empty_code_hash() && info.code.is_none() {
+                info.code = Some(self.code_by_address(address.clone(), info.code_hash)?);
             }
         }
-        if address != self.coinbase || self.raw_transfer {
-            self.tx_read_set.entry(LocationAndType::Basic(address)).or_insert(Some(balance));
-        }
-        result
+        Ok(result)
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        // 1. read from internal cache
-        let res = match self.cache.contracts.entry(code_hash) {
-            hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
-            hash_map::Entry::Vacant(entry) => {
-                // 2. read initial state of this round from scheduler cache
-                if let Some(code) = self.scheduler_db.state.cache.contracts.get(&code_hash) {
-                    return Ok(entry.insert(code.clone()).clone());
-                }
-
-                // 3. read from origin database
-                let code = tokio::task::block_in_place(|| {
-                    self.scheduler_db.database.code_by_hash_ref(code_hash)
-                })?;
-                entry.insert(code.clone());
-                return Ok(code);
-            }
-        };
-        res
+        self.db.code_by_hash_ref(code_hash)
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        let result = load_storage(&mut self.cache, &self.scheduler_db.database, address, index);
-        let mut slot_value = None;
-        if let Ok(value) = &result {
-            slot_value = Some(value.clone());
+        let mut result = None;
+        let mut read_version = ReadVersion::Storage;
+        let location = LocationAndType::Storage(address.clone(), index.clone());
+        // 1. read from multi-version memory
+        if let Some(written_transactions) = self.mv_memory.get(&location) {
+            if let Some((&txid, entry)) =
+                written_transactions.range(..self.current_tx.txid).next_back()
+            {
+                if let MemoryValue::Storage(slot) = &entry.data {
+                    result = Some(slot.clone());
+                    if entry.estimate {
+                        self.estimate_txs.insert(txid);
+                    }
+                    read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                }
+            }
         }
-        self.tx_read_set.entry(LocationAndType::Storage(address, index)).or_insert(slot_value);
+        // 2. read from database
+        if result.is_none() {
+            let mut new_ca = false;
+            if let Some(ReadVersion::MvMemory(_)) =
+                self.read_set.get(&LocationAndType::Code(address.clone()))
+            {
+                new_ca = true;
+            }
+            let slot =
+                if new_ca { U256::default() } else { self.db.storage_ref(address, index)? };
+            result = Some(slot.clone());
+        }
 
-        result
+        self.read_set.insert(location, read_version);
+        Ok(result.expect("No storage slot"))
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        // FIXME(gravity_nekomoto): too lot repeated code
-        match self.block_hashes.entry(number) {
-            btree_map::Entry::Occupied(entry) => Ok(*entry.get()),
-            btree_map::Entry::Vacant(entry) => {
-                // TODO(gravity_nekomoto): read from scheduler_db?
-                let ret = *entry.insert(tokio::task::block_in_place(|| {
-                    self.scheduler_db.database.block_hash_ref(number)
-                })?);
-
-                // prune all hashes that are older then BLOCK_HASH_HISTORY
-                let last_block = number.saturating_sub(BLOCK_HASH_HISTORY);
-                while let Some(entry) = self.block_hashes.first_entry() {
-                    if *entry.key() < last_block {
-                        entry.remove();
-                    } else {
-                        break;
-                    }
-                }
-
-                Ok(ret)
-            }
-        }
+        self.db.block_hash_ref(number)
     }
 }

@@ -1,10 +1,10 @@
+use crate::{fork_join_util, tx_dependency::TxDependency, LocationAndType, TxId};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use revm::primitives::{
     alloy_primitives::U160, keccak256, ruint::UintTryFrom, Address, Bytes, TxEnv, TxKind, B256,
     U256,
 };
-use std::sync::Arc;
-
-use crate::{fork_join_util, LocationAndType, SharedTxStates, TxState};
+use std::{cmp::max, collections::BTreeSet, sync::Arc};
 
 /// This module provides functionality for parsing and handling execution hints
 /// for parallel transaction execution in the context of Ethereum-like blockchains.
@@ -57,17 +57,27 @@ enum RWType {
     ReadWrite,
 }
 
-impl TxState {
+#[derive(Clone)]
+struct RWSet {
+    pub read_set: HashSet<LocationAndType>,
+    pub write_set: HashSet<LocationAndType>,
+}
+
+impl RWSet {
+    fn new() -> Self {
+        Self { read_set: HashSet::new(), write_set: HashSet::new() }
+    }
+
     fn insert_location(&mut self, location: LocationAndType, rw_type: RWType) {
         match rw_type {
             RWType::ReadOnly => {
-                self.read_set.insert(location, None);
+                self.read_set.insert(location);
             }
             RWType::WriteOnly => {
                 self.write_set.insert(location);
             }
             RWType::ReadWrite => {
-                self.read_set.insert(location.clone(), None);
+                self.read_set.insert(location.clone());
                 self.write_set.insert(location);
             }
         }
@@ -77,33 +87,47 @@ impl TxState {
 /// Struct to hold shared transaction states and provide methods for parsing
 /// and handling execution hints for parallel transaction execution.
 pub(crate) struct ParallelExecutionHints {
-    /// Shared transaction states that will be updated with read/write sets
-    /// based on the contract interactions.
-    tx_states: SharedTxStates,
+    rw_set: Vec<RWSet>,
+    txs: Arc<Vec<TxEnv>>,
 }
 
 impl ParallelExecutionHints {
-    pub(crate) fn new(tx_states: SharedTxStates) -> Self {
-        Self { tx_states }
+    pub(crate) fn new(txs: Arc<Vec<TxEnv>>) -> Self {
+        Self { rw_set: vec![RWSet::new(); txs.len()], txs }
     }
 
-    /// Obtain a mutable reference to shared transaction states, and parse execution hints for each
-    /// transaction. Although fork_join_util executes concurrently, transactions between each
-    /// partition do not overlap. This means each partition can independently update its
-    /// assigned transactions. `self.tx_states` is immutable, and can only be converted to
-    /// mutable through unsafe code. An alternative approach is to declare `self.tx_states` as
-    /// `Arc<Vec<Mutex<TxState>>>`, allowing mutable access via
-    /// `self.tx_states[index].lock().unwrap()`. However, this would introduce locking overhead
-    /// and impact performance. The primary consideration is that developers are aware there are
-    /// no conflicts between transactions, making the `Mutex` approach unnecessarily verbose and
-    /// cumbersome.
     #[fastrace::trace]
-    pub(crate) fn parse_hints(&self, txs: Arc<Vec<TxEnv>>) {
+    fn generate_dependency(&self) -> TxDependency {
+        let num_txs = self.txs.len();
+        let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
+        let mut dependent_tx: Vec<Option<TxId>> = vec![None; num_txs];
+        let mut affect_txs = vec![HashSet::new(); num_txs];
+        let mut no_dep_txs = BTreeSet::new();
+        for (txid, rw_set) in self.rw_set.iter().enumerate() {
+            for location in rw_set.read_set.iter() {
+                if let Some(&previous) = last_write_tx.get(location) {
+                    let new_dep = dependent_tx[txid].map_or(previous, |dep| max(dep, previous));
+                    dependent_tx[txid] = Some(new_dep);
+                    affect_txs[previous].insert(txid);
+                }
+            }
+            if dependent_tx[txid].is_none() {
+                no_dep_txs.insert(txid);
+            }
+            for location in rw_set.write_set.iter() {
+                last_write_tx.insert(location.clone(), txid);
+            }
+        }
+        TxDependency::create(dependent_tx, affect_txs, no_dep_txs)
+    }
+
+    #[fastrace::trace]
+    pub(crate) fn parse_hints(&self) -> TxDependency {
+        let txs = self.txs.clone();
         // Utilize fork-join utility to process transactions in parallel
         fork_join_util(txs.len(), None, |start_tx, end_tx, _| {
             #[allow(invalid_reference_casting)]
-            let hints =
-                unsafe { &mut *(&(*self.tx_states) as *const Vec<TxState> as *mut Vec<TxState>) };
+            let hints = unsafe { &mut *(&self.rw_set as *const Vec<RWSet> as *mut Vec<RWSet>) };
             for index in start_tx..end_tx {
                 let tx_env = &txs[index];
                 let rw_set = &mut hints[index];
@@ -113,7 +137,6 @@ impl ParallelExecutionHints {
                     if !tx_env.data.is_empty() {
                         rw_set
                             .insert_location(LocationAndType::Basic(to_address), RWType::ReadOnly);
-                        rw_set.insert_location(LocationAndType::Code(to_address), RWType::ReadOnly);
                         // Update hints with contract data based on the transaction details
                         if !ParallelExecutionHints::update_hints_with_contract_data(
                             tx_env.caller,
@@ -134,6 +157,7 @@ impl ParallelExecutionHints {
                 }
             }
         });
+        self.generate_dependency()
     }
 
     /// This function computes the storage slot using the provided slot number and a vector of
@@ -194,7 +218,7 @@ impl ParallelExecutionHints {
         contract_address: Address,
         code: Option<Bytes>,
         data: &Bytes,
-        tx_rw_set: &mut TxState,
+        tx_rw_set: &mut RWSet,
     ) -> bool {
         if code.is_none() && data.is_empty() {
             return false;
@@ -204,7 +228,7 @@ impl ParallelExecutionHints {
             return false;
         }
         let (func_id, parameters) = Self::decode_contract_parameters(data);
-        match Self::get_contract_type(contract_address) {
+        match Self::get_contract_type(contract_address, data) {
             ContractType::ERC20 => match ERC20Function::from(func_id) {
                 ERC20Function::Transfer => {
                     if parameters.len() != 2 {
@@ -263,7 +287,7 @@ impl ParallelExecutionHints {
         true
     }
 
-    fn get_contract_type(_contract_address: Address) -> ContractType {
+    fn get_contract_type(_contract_address: Address, _data: &Bytes) -> ContractType {
         // TODO(gaoxin): Parse the correct contract type to determined how to handle call data
         ContractType::ERC20
     }
