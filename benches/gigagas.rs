@@ -260,7 +260,7 @@ fn benchmark_gigagas(c: &mut Criterion) {
         bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
         bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
     } else if !filter.is_empty() && filter.contains("worst") {
-        bench_worst_uniswap(c, db_latency_us, num_eoa, hot_ratio);
+        bench_half_chained_uniswap(c, db_latency_us, num_eoa, hot_ratio);
         bench_worst_raw_transfers(c, db_latency_us);
         bench_worst_erc20(c, db_latency_us);
         bench_half_chained_raw_transfers(c, db_latency_us);
@@ -276,6 +276,9 @@ fn benchmark_gigagas(c: &mut Criterion) {
         }
         if filter.is_empty() || filter.contains("dependent_erc20") {
             bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
+        }
+        if filter.is_empty() || filter.contains("half_chained_uniswap") {
+            bench_half_chained_uniswap(c, db_latency_us, num_eoa, hot_ratio);
         }
         if filter.is_empty() || filter.contains("half_chained_raw_transfers") {
             bench_half_chained_raw_transfers(c, db_latency_us);
@@ -393,7 +396,12 @@ fn bench_uniswap(c: &mut Criterion, db_latency_us: u64) {
     bench(c, "Independent Uniswap", db, final_txs);
 }
 
-fn bench_worst_uniswap(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {
+fn bench_half_chained_uniswap(
+    c: &mut Criterion,
+    db_latency_us: u64,
+    num_eoa: usize,
+    hot_ratio: f64,
+) {
     let block_size = (GIGA_GAS as f64 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let num_uniswap = (GIGA_GAS as f64 * 0.5 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
 
@@ -438,7 +446,7 @@ fn bench_worst_uniswap(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, ho
     let mut db = InMemoryDB::new(state, bytecodes, Default::default());
     db.latency_us = db_latency_us;
 
-    bench(c, "Half Worst Uniswap", db, txs);
+    bench(c, "Half Chained Worst Uniswap", db, txs);
 }
 
 fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {

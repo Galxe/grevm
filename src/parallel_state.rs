@@ -43,10 +43,10 @@ pub type BuildSuffixHasher = BuildHasherDefault<SuffixHasher>;
 #[derive(Clone, Debug)]
 pub struct ParallelCacheState {
     /// Block state account with account state.
-    pub accounts: DashMap<Address, CacheAccount, BuildSuffixHasher>,
+    pub accounts: DashMap<Address, CacheAccount>,
     /// Created contracts.
     // TODO add bytecode counter for number of bytecodes added/removed.
-    pub contracts: DashMap<B256, Bytecode, BuildSuffixHasher>,
+    pub contracts: DashMap<B256, Bytecode>,
     /// Has EIP-161 state clear enabled (Spurious Dragon hardfork).
     pub has_state_clear: bool,
 }
