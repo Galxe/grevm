@@ -2,10 +2,10 @@ use crate::common::{storage::InMemoryDB, MINER_ADDRESS};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use alloy_chains::NamedChain;
-use grevm::{ParallelTakeBundle, Scheduler};
+use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use revm::{
     db::{
-        states::{bundle_state::BundleRetention, ParallelState, StorageSlot},
+        states::{bundle_state::BundleRetention, StorageSlot},
         AccountRevert, BundleAccount, BundleState, PlainAccount,
     },
     primitives::{

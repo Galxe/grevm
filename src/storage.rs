@@ -1,14 +1,11 @@
 use crate::{
     fork_join_util, scheduler::MVMemory, AccountBasic, LocationAndType, MemoryEntry, MemoryValue,
-    ReadVersion, TxId, TxVersion,
+    ParallelState, ReadVersion, TxId, TxVersion,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use parking_lot::Mutex;
 use revm::{
-    db::{
-        states::{bundle_state::BundleRetention, ParallelState},
-        AccountRevert, BundleAccount, BundleState,
-    },
+    db::{states::bundle_state::BundleRetention, AccountRevert, BundleAccount, BundleState},
     interpreter::analysis::to_analysed,
     TransitionState,
 };

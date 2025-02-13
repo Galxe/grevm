@@ -1,9 +1,6 @@
-use crate::storage::ParallelBundleState;
+use crate::{storage::ParallelBundleState, ParallelState};
 use revm::{
-    db::{
-        states::{bundle_state::BundleRetention, ParallelState},
-        BundleState,
-    },
+    db::{states::bundle_state::BundleRetention, BundleState},
     TransitionState,
 };
 use revm_primitives::{

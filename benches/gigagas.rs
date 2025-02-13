@@ -18,17 +18,14 @@ use common::storage::InMemoryDB;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use fastrace::{collector::Config, prelude::*};
 use fastrace_jaeger::JaegerReporter;
-use grevm::Scheduler;
+use grevm::{ParallelState, Scheduler};
 use metrics::{SharedString, Unit};
 use metrics_util::{
     debugging::{DebugValue, DebuggingRecorder},
     CompositeKey, MetricKind,
 };
 use rand::Rng;
-use revm::{
-    db::states::ParallelState,
-    primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256},
-};
+use revm::primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

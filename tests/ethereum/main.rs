@@ -13,13 +13,10 @@
 
 use crate::common::storage::InMemoryDB;
 use alloy_chains::NamedChain;
-use grevm::{ParallelTakeBundle, Scheduler};
+use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use revm::{
-    db::{
-        states::{bundle_state::BundleRetention, ParallelState},
-        PlainAccount,
-    },
+    db::{states::bundle_state::BundleRetention, PlainAccount},
     primitives::{
         calc_excess_blob_gas, ruint::ParseError, AccountInfo, BlobExcessGasAndPrice, BlockEnv,
         Bytecode, CfgEnv, Env as RevmEnv, TransactTo, TxEnv, KECCAK_EMPTY,

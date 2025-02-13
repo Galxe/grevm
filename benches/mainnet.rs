@@ -7,10 +7,9 @@ use std::sync::Arc;
 
 use crate::common::execute_revm_sequential;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use grevm::Scheduler;
+use grevm::{ParallelState, Scheduler};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::Rng;
-use revm::db::states::ParallelState;
 
 fn benchmark_mainnet(c: &mut Criterion) {
     let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);

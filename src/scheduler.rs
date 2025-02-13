@@ -1,7 +1,8 @@
 use crate::{
     async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, AbortReason, LocationAndType, MemoryEntry, ReadVersion, Task,
-    TransactionResult, TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
+    tx_dependency::TxDependency, AbortReason, LocationAndType, MemoryEntry, ParallelState,
+    ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
+    CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
@@ -9,7 +10,7 @@ use crossbeam::queue::ArrayQueue;
 use dashmap::DashMap;
 use metrics::histogram;
 use parking_lot::{Mutex, RwLock};
-use revm::{db::states::ParallelState, Evm, EvmBuilder, StateBuilder};
+use revm::{Evm, EvmBuilder, StateBuilder};
 use revm_primitives::{
     db::{DatabaseCommit, DatabaseRef},
     EVMError, Env, ExecutionResult, SpecId, TxEnv, TxKind,
