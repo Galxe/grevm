@@ -391,7 +391,7 @@ Grevm 2.0 will address the limitations of version 1.0 by introducing:
 
 ## Authors
 
-[https://github.com/Richard](https://github.com/Richard19960401)
+[https://github.com/Richard](https://github.com/Richard1048576)
 
 [https://github.com/AshinGau](https://github.com/AshinGau)
 
