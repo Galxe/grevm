@@ -188,6 +188,41 @@ fn bench_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
     );
 }
 
+fn bench_dependency_distance(
+    c: &mut Criterion,
+    db_latency_us: u64,
+    dependency_ratio: f64,
+    dependency_distance: usize,
+) {
+    let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
+    let accounts = common::mock_block_accounts(common::START_ADDRESS, block_size);
+    let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
+    db.latency_us = db_latency_us;
+    bench(
+        c,
+        "Independent Raw Transfers",
+        db,
+        (0..block_size)
+            .map(|i| {
+                let address = Address::from(U160::from(common::START_ADDRESS + i));
+                let to = if rand::thread_rng().gen_range(0.0..1.0) < dependency_ratio {
+                    Address::from(U160::from(common::START_ADDRESS + i - dependency_distance))
+                } else {
+                    address
+                };
+                TxEnv {
+                    caller: address,
+                    transact_to: TransactTo::Call(to),
+                    value: U256::from(1),
+                    gas_limit: common::TRANSFER_GAS_LIMIT,
+                    gas_price: U256::from(1),
+                    ..TxEnv::default()
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+}
+
 fn pick_account_idx(num_eoa: usize, hot_ratio: f64) -> usize {
     if hot_ratio <= 0.0 {
         // Uniform workload
@@ -294,6 +329,13 @@ fn benchmark_gigagas(c: &mut Criterion) {
         }
         if filter.is_empty() || filter.contains("hybrid") {
             bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
+        }
+        if filter.contains("dependency_distance") {
+            let dependency_ratio =
+                std::env::var("DEPENDENCY_RATIO").map(|s| s.parse().unwrap()).unwrap_or(0.1);
+            let dependency_distance =
+                std::env::var("DEPENDENCY_DISTANCE").map(|s| s.parse().unwrap()).unwrap_or(8);
+            bench_dependency_distance(c, db_latency_us, dependency_ratio, dependency_distance);
         }
     }
 

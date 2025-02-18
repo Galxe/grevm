@@ -120,6 +120,7 @@ impl Default for Task {
 enum AbortReason {
     EvmError,
     SelfDestructed,
+    FallbackSequential,
 }
 
 /// Utility function for parallel execution using fork-join pattern.

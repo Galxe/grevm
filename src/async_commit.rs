@@ -4,7 +4,7 @@ use revm::{
     TransitionState,
 };
 use revm_primitives::{
-    db::{DatabaseCommit, DatabaseRef},
+    db::{Database, DatabaseCommit, DatabaseRef},
     Address, ExecutionResult, ResultAndState,
 };
 
@@ -33,7 +33,7 @@ where
     }
 
     pub fn init(&mut self) -> Result<(), DB::Error> {
-        match self.state_mut().load_cache_account(self.coinbase) {
+        match self.state_mut().basic(self.coinbase) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
