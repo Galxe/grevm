@@ -35,7 +35,7 @@ enum TransactionStatus {
 struct TxState {
     pub status: TransactionStatus,
     pub incarnation: usize,
-    pub has_dependency: bool,
+    pub dependency: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -120,6 +120,7 @@ impl Default for Task {
 enum AbortReason {
     EvmError,
     SelfDestructed,
+    FallbackSequential,
 }
 
 /// Utility function for parallel execution using fork-join pattern.
