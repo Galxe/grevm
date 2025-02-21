@@ -27,7 +27,7 @@ fn test_execute(
     let recorder = DebuggingRecorder::new();
     let with_hints = std::env::var("WITH_HINTS").map_or(false, |s| s.parse().unwrap());
     let parallel_result = metrics::with_local_recorder(&recorder, || {
-        let state = ParallelState::new(db.clone(), true);
+        let state = ParallelState::new(db.clone(), true, true);
         let mut executor = Scheduler::new(env.spec_id(), *env.env, txs, state, with_hints);
         executor.parallel_execute(None).unwrap();
 

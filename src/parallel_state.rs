@@ -1,6 +1,7 @@
 use crate::cache_account::{CacheAccount, PlainAccount, PlainStorage};
 use core::hash::{BuildHasherDefault, Hasher};
 use dashmap::{mapref::one::RefMut, DashMap, Entry};
+use metrics::histogram;
 use revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     CacheState, TransitionAccount, TransitionState,
@@ -9,7 +10,7 @@ use revm_primitives::{
     db::{Database, DatabaseCommit, DatabaseRef},
     Account, AccountInfo, Address, Bytecode, EvmState, B256, U256,
 };
-use std::{collections::HashMap, vec::Vec};
+use std::{collections::HashMap, time::Instant, vec::Vec};
 
 /// We use the last 8 bytes of an existing hash like address
 /// or code hash instead of rehashing it.
@@ -209,7 +210,6 @@ pub type BuildIdentityHasher = BuildHasherDefault<IdentityHasher>;
 ///
 /// State clear flag is set inside CacheState and by default it is enabled.
 /// If you want to disable it use `set_state_clear_flag` function.
-#[derive(Debug)]
 pub struct ParallelState<DB> {
     /// Cached state contains both changed from evm execution and cached/loaded account/storages
     /// from database. This allows us to have only one layer of cache where we can fetch data.
@@ -240,10 +240,13 @@ pub struct ParallelState<DB> {
     /// This map can be used to give different values for block hashes if in case
     /// The fork block is different or some blocks are not saved inside database.
     pub block_hashes: DashMap<u64, B256, BuildIdentityHasher>,
+
+    update_db_metrics: bool,
+    db_latency: metrics::Histogram,
 }
 
 impl<DB: DatabaseRef> ParallelState<DB> {
-    pub fn new(database: DB, with_bundle_update: bool) -> Self {
+    pub fn new(database: DB, with_bundle_update: bool, update_db_metrics: bool) -> Self {
         Self {
             cache: ParallelCacheState::default(),
             database,
@@ -251,6 +254,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             bundle_state: BundleState::default(),
             use_preloaded_bundle: false,
             block_hashes: DashMap::default(),
+            update_db_metrics,
+            db_latency: histogram!("grevm.db_latency_us"),
         }
     }
 
@@ -354,6 +359,21 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         }
     }
 
+    fn with_metrics<F, R>(&self, func: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        if self.update_db_metrics {
+            let start = Instant::now();
+            let result = func();
+            let duration = start.elapsed().as_nanos();
+            self.db_latency.record(duration as f64);
+            result
+        } else {
+            func()
+        }
+    }
+
     /// Get a mutable reference to the [`CacheAccount`] for the given address.
     /// If the account is not found in the cache, it will be loaded from the
     /// database and inserted into the cache.
@@ -372,7 +392,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
                     }
                 }
                 // if not found in bundle, load it from database
-                let info = self.database.basic_ref(address)?;
+                let info = self.with_metrics(|| self.database.basic_ref(address))?;
                 let account = match info {
                     None => CacheAccount::new_loaded_not_existing(),
                     Some(acc) if acc.is_empty() => {
@@ -424,7 +444,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
                     }
                 }
                 // if not found in bundle ask database
-                let code = self.database.code_by_hash_ref(code_hash)?;
+                let code = self.with_metrics(|| self.database.code_by_hash_ref(code_hash))?;
                 entry.insert(code.clone());
                 Ok(code)
             }
@@ -448,7 +468,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
                         let value = if is_storage_known {
                             U256::ZERO
                         } else {
-                            self.database.storage_ref(address, index)?
+                            self.with_metrics(|| self.database.storage_ref(address, index))?
                         };
                         entry.insert(value);
                         Ok(value)
@@ -468,7 +488,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         match self.block_hashes.entry(number) {
             Entry::Occupied(entry) => Ok(*entry.get()),
             Entry::Vacant(entry) => {
-                let ret = *entry.insert(self.database.block_hash_ref(number)?);
+                let ret =
+                    *entry.insert(self.with_metrics(|| self.database.block_hash_ref(number))?);
                 Ok(ret)
             }
         }

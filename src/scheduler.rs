@@ -194,6 +194,7 @@ where
         commiter: &Mutex<StateAsyncCommit<DB>>,
         task_queue: &LockFreeQueue<Task>,
     ) {
+        let dependency_distance = histogram!("grevm.dependency_distance");
         let mut start = Instant::now();
         let mut num_commit = 0;
         let mut commiter = commiter.lock();
@@ -210,6 +211,24 @@ where
                         let result = tx.as_ref().unwrap().execute_result.clone();
                         let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
                         commiter.commit(result);
+                    }
+                    let tx = self.tx_states[num_commit].lock();
+                    if tx.incarnation > 1 {
+                        self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(dep_id) = tx.dependency {
+                        dependency_distance.record((num_commit - dep_id) as f64);
+                        if tx.incarnation == 1 {
+                            self.metrics
+                                .one_attempt_with_dependency
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if tx.incarnation > 2 {
+                            self.metrics
+                                .more_attempts_with_dependency
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
                     }
                     num_commit += 1;
                     self.num_commit.fetch_add(1, Ordering::Relaxed);
@@ -524,7 +543,7 @@ where
             }
             tx_state.status =
                 if conflict { TransactionStatus::Conflict } else { TransactionStatus::Unconfirmed };
-            tx_state.has_dependency = dependency.is_some();
+            tx_state.dependency = dependency;
         }
 
         if conflict {
@@ -592,22 +611,6 @@ where
                             tx.status = TransactionStatus::Finality;
                             finality_idx += 1;
                             self.finality_idx.fetch_add(1, Ordering::Relaxed);
-                            if tx.incarnation > 1 {
-                                self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
-                            }
-                            if !tx.has_dependency {
-                                self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                if tx.incarnation == 1 {
-                                    self.metrics
-                                        .one_attempt_with_dependency
-                                        .fetch_add(1, Ordering::Relaxed);
-                                } else if tx.incarnation > 2 {
-                                    self.metrics
-                                        .more_attempts_with_dependency
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
                         }
                         TransactionStatus::Conflict | TransactionStatus::Executed => {
                             if validation_idx != finality_idx {

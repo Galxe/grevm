@@ -36,7 +36,7 @@ enum TransactionStatus {
 struct TxState {
     pub status: TransactionStatus,
     pub incarnation: usize,
-    pub has_dependency: bool,
+    pub dependency: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
