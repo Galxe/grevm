@@ -265,12 +265,16 @@ In parallel block execution, the dependencies between transactions play a crucia
 quantify this impact, we introduce two key metrics: **Dependency Distance** and **Dependent Ratio**. If a transaction
 **txⱼ** depends on a preceding transaction **txᵢ**, their dependency distance is defined as:
 
-\[ \text{dependency_distance} = j - i \]
+```math
+\text{dependency\_distance} = j - i
+```
 
 where **j** and **i** are the transaction indices. The number of transactions within a block that have dependencies is
 denoted as **with_dependent_txs**, and the dependent ratio is given by:
 
-\[ \text{dependent_ratio} = \frac{\text{with_dependent_txs}}{\text{block_txs}} \]
+```math
+\text{dependent\_ratio} = \frac{\text{with\_dependent\_txs}}{\text{block\_txs}}
+```
 
 where **block_txs** represents the total number of transactions in the block. The following table illustrates the
 relationship between conflict rate and dependency distance under **fully optimistic execution**, based on a **1Gigagas**
