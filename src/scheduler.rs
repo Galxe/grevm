@@ -661,7 +661,8 @@ where
                     if group_len == 0 {
                         break;
                     }
-                    if finality_idx < self.block_size / 2 &&
+                    if group_len > 64 &&
+                        finality_idx < self.block_size / 2 &&
                         group_len > (self.block_size - finality_idx) / 2
                     {
                         self.abort(AbortReason::FallbackSequential);
