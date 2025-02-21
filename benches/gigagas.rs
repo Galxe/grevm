@@ -94,13 +94,6 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
         })
     });
 
-    group.bench_function("Origin Sequential", |b| {
-        b.iter(|| {
-            let _ =
-                execute_revm_sequential(db.clone(), SpecId::LATEST, env.clone(), &*txs).unwrap();
-        })
-    });
-
     group.finish();
 }
 
@@ -194,33 +187,34 @@ fn bench_dependency_distance(
     dependency_ratio: f64,
     dependency_distance: usize,
 ) {
-    let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
-    let accounts = common::mock_block_accounts(common::START_ADDRESS, block_size);
-    let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
+    let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
+    let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(block_size, 1);
+    let miner = common::mock_miner_account();
+    state.insert(miner.0, miner.1);
+    let mut txs = Vec::with_capacity(block_size);
+    let sca = sca[0];
+    for i in 0..eoa.len() {
+        let addr = eoa[i].clone();
+        let recipient = if rand::thread_rng().gen_range(0.0..1.0) < dependency_ratio && i >= dependency_distance {
+            eoa[i - dependency_distance].clone()
+        } else {
+            eoa[i].clone()
+        };
+        let tx = TxEnv {
+            caller: addr,
+            transact_to: TransactTo::Call(sca),
+            value: U256::from(0),
+            gas_limit: erc20::GAS_LIMIT,
+            gas_price: U256::from(1),
+            data: ERC20Token::transfer(recipient, U256::from(900)),
+            ..TxEnv::default()
+        };
+        txs.push(tx);
+    }
+    let mut db = InMemoryDB::new(state, bytecodes, Default::default());
     db.latency_us = db_latency_us;
-    bench(
-        c,
-        "Independent Raw Transfers",
-        db,
-        (0..block_size)
-            .map(|i| {
-                let address = Address::from(U160::from(common::START_ADDRESS + i));
-                let to = if rand::thread_rng().gen_range(0.0..1.0) < dependency_ratio {
-                    Address::from(U160::from(common::START_ADDRESS + i - dependency_distance))
-                } else {
-                    address
-                };
-                TxEnv {
-                    caller: address,
-                    transact_to: TransactTo::Call(to),
-                    value: U256::from(1),
-                    gas_limit: common::TRANSFER_GAS_LIMIT,
-                    gas_price: U256::from(1),
-                    ..TxEnv::default()
-                }
-            })
-            .collect::<Vec<_>>(),
-    );
+
+    bench(c, "Worst ERC20", db, txs);
 }
 
 fn pick_account_idx(num_eoa: usize, hot_ratio: f64) -> usize {
