@@ -8,6 +8,21 @@ dependency management, and parallel state storage to significantly boost through
 
 ![Design Diagram](docs/v2/images/g2design.png)
 
+## **TL;DR – Highlights of Grevm 2.0**
+
+- **Grevm 2.0 achieves near-optimal performance in low-contention scenarios**, matching Block-STM with **16.57
+  gigagas/s** for Uniswap workloads and outperforming it with **95% less CPU usage** in inherently non-parallelizable
+  cases by **20–30%**, achieving performance close to sequential execution.
+- **Breaks Grevm 1.0’s limitations in handling highly dependent transactions**, delivering a **5.5× throughput
+  increase** to **2.96 gigagas/s** in **30%-hot-ratio hybrid workloads** by minimizing re-executions through **DAG-based
+  scheduling** and **Task Groups**.
+- **Introduces Parallel State Store**, leveraging **asynchronous execution result bundling** to **overlap and amortize
+  30-60ms of post-execution overhead within parallel execution**, effectively hiding these costs within execution time.
+  It also seamlessly handles **miner rewards and the self-destruct opcode** without the performance penalties of
+  sequential fallbacks.
+- **In-depth analysis of optimistic parallel execution** reveals the **underestimated efficiency of Block-STM** and the
+  strength of **optimistic parallelism**, providing new insights into parallel execution.
+
 ## Architecture Overview
 
 Grevm 2.0 is composed of three main modules:
@@ -22,15 +37,6 @@ Grevm 2.0 is composed of three main modules:
 - **Parallel State Storage:**  
   Provides an asynchronous commit mechanism with multi-version memory to reduce latency and manage miner rewards and
   self-destruct opcodes efficiently.
-
-## Benchmark Highlights
-
-- **Conflict-Free Workloads:**  
-  Achieves significant speedups over sequential execution (up to ~50× in some cases) especially when I/O latencies are
-  introduced.
-
-- **Contention (Hybrid) Workloads:**  
-  With a 30% hot ratio, Grevm 2.0 outperforms Grevm 1.0 by 5.55× and reaches a throughput of **2.96 gigagas/s**.
 
 ## Running the Benchmark
 
