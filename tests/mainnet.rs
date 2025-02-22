@@ -4,9 +4,9 @@ mod common;
 use std::sync::Arc;
 
 use common::storage::InMemoryDB;
-use grevm::{ParallelTakeBundle, Scheduler};
+use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-use revm::db::states::{bundle_state::BundleRetention, ParallelState};
+use revm::db::states::bundle_state::BundleRetention;
 use revm_primitives::{EnvWithHandlerCfg, TxEnv};
 
 /// Return gas used

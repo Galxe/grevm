@@ -1,5 +1,6 @@
 mod async_commit;
 mod hint;
+mod parallel_state;
 mod scheduler;
 mod storage;
 mod tx_dependency;
@@ -107,6 +108,7 @@ struct TransactionResult<DBError> {
 enum Task {
     Execution(TxVersion),
     Validation(TxVersion),
+    ExecutionGroup(Vec<TxVersion>),
 }
 
 impl Default for Task {
@@ -159,5 +161,6 @@ where
 }
 
 pub use async_commit::StateAsyncCommit;
+pub use parallel_state::{ParallelCacheState, ParallelState};
 pub use scheduler::Scheduler;
 pub use storage::{ParallelBundleState, ParallelTakeBundle};

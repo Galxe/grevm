@@ -13,13 +13,10 @@
 
 use crate::common::storage::InMemoryDB;
 use alloy_chains::NamedChain;
-use grevm::{ParallelTakeBundle, Scheduler};
+use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use revm::{
-    db::{
-        states::{bundle_state::BundleRetention, ParallelState},
-        PlainAccount,
-    },
+    db::{states::bundle_state::BundleRetention, PlainAccount},
     primitives::{
         calc_excess_blob_gas, ruint::ParseError, AccountInfo, BlobExcessGasAndPrice, BlockEnv,
         Bytecode, CfgEnv, Env as RevmEnv, TransactTo, TxEnv, KECCAK_EMPTY,
@@ -48,14 +45,24 @@ fn build_block_env(env: &Env) -> BlockEnv {
         blob_excess_gas_and_price: if let Some(current_excess_blob_gas) =
             env.current_excess_blob_gas
         {
-            Some(BlobExcessGasAndPrice::new(current_excess_blob_gas.to()))
-        } else if let (Some(parent_blob_gas_used), Some(parent_excess_blob_gas)) =
-            (env.parent_blob_gas_used, env.parent_excess_blob_gas)
-        {
-            Some(BlobExcessGasAndPrice::new(calc_excess_blob_gas(
-                parent_blob_gas_used.to(),
-                parent_excess_blob_gas.to(),
-            )))
+            Some(BlobExcessGasAndPrice::new(current_excess_blob_gas.to(), false))
+        } else if let (
+            Some(parent_blob_gas_used),
+            Some(parent_excess_blob_gas),
+            Some(parent_target_blobs_per_block),
+        ) = (
+            env.parent_blob_gas_used,
+            env.parent_excess_blob_gas,
+            env.parent_target_blobs_per_block,
+        ) {
+            Some(BlobExcessGasAndPrice::new(
+                calc_excess_blob_gas(
+                    parent_blob_gas_used.to(),
+                    parent_excess_blob_gas.to(),
+                    parent_target_blobs_per_block.to(),
+                ),
+                false,
+            ))
         } else {
             None
         },
