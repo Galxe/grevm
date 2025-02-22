@@ -1,33 +1,36 @@
 # Grevm 2.0
 
-**TLD;R**
+## Highlights
 
-**TODO**
-
-- Comparing with 1.0
-  - Grevm 2.0 resolves known performance limit with Highly dependent transactions, achieving 5.5x throughput increase to
-    2.96 gigagas/s for Hybrid workload, 30% hot ratio.
-- Comparing with Block-STM
-  - Grevm 2.0 achieves identical performance for low-conflict workloads, and outperforms Block-STM in extreme cases by
-    having identical performance of sequential execution, instead of 20-30% slower, with TODO% less CPU utilization.
+- Grevm 2.0 achieves identical performance for low-conflict workloads as Block-STM, achieving **16.57 gigagas/s** for
+  uniswap workload, and outperforms Block-STM by **30%** in extreme cases by having identical performance of sequential
+  execution, with less than **5%** CPU usage.
+- Grevm 2.0 resolves known performance Grevm 1.0's limitation of executing highly dependent transactions, achieving
+  **5.5x** throughput increase to **2.96 gigagas/s** for skewed 30%-hot-ratio hybrid workload.
+- We conducted a comprehensive analysis of the impact of **conflict v.s. re-execution** on system performance, revealing
+  hardly known powerfulness of Block-STM algorithm and optimistic parallelism.
+- Grevm 2.0 introduces a **parallel state** module, an asynchronous state storage that bundles the final execution
+  result during parallel execution, which not only amortized its ~30ms post-execution processing time, but also
+  elegantly solves the challenges of miner rewards and self-destruct opcode, while eliminating the performance penalty
+  of falling back to sequential.
 
 ## Abstract
 
-Grevm 2.0 marries a task scheduling mechanism based on a **directed acyclic graph (DAG)** of transaction dependencies,
-based on simulated transaction execution results. Compared to Block-STM's approach of scheduling tasks purely based on
-the lowest index, this design offers two advantages: first, it can significantly reduces possibility of transaction
-re-execution caused by dependency conflicts, by clustering adjacently dependent transitions into **task groups**;
-second, it allows high-index transactions without dependencies to be executed in parallel earlier, improving concurrency
-efficiency. These two advantages make Grevm 2.0 more efficient in high-conflict scenarios, significantly reducing the
-number of re-executions and reducing total execution time and CPU utilization. Our benchmark results show that:
-comparing with 1.0, for a hybrid workload of Uniswap, ERC20 and transfer, with a 30% hot ratio, Grevm 2.0 achieves 5.5x
-higher throughput than Grevm 1.0, reaching **2.96 gigagas/s**, and comparing with Block-STM, Grevm 2.0 achieves
-identical performance for low-conflict workloads, and outperforms Block-STM in extreme cases by having identical
-performance of sequential execution, instead of 20-30% slower.
+Grevm 2.0 marries Block-STM with a task scheduling mechanism based on a **directed acyclic graph (DAG)** of transaction
+dependencies, based on simulated transaction execution results. Compared to Block-STM's approach of scheduling tasks
+purely based on the lowest index, this design offers two advantages: first, it can significantly reduces possibility of
+transaction re-execution caused by dependency conflicts, by clustering adjacently dependent transitions into **task
+groups**; second, it allows high-index transactions without dependencies to be executed in parallel earlier, improving
+concurrency efficiency. These two advantages make Grevm 2.0 more efficient in high-conflict scenarios, significantly
+reducing the number of re-executions and reducing total execution time and CPU usage. Our benchmark results show that:
+comparing with 1.0, for 30%-hot-ratio hybrid workload (Uniswap, ERC20 and transfer), Grevm 2.0 achieves 5.5x higher
+throughput than Grevm 1.0, reaching **2.96 gigagas/s**, and comparing with Block-STM, Grevm 2.0 achieves identical
+performance for low-conflict workloads, and outperforms Block-STM in extreme cases by having identical performance of
+sequential execution, instead of 20-30% slower, with much lower CPU usage.
 
-Engineering-wise, Grevm 2.0 introduces **parallel state**, an asynchronous commit that bundles the final execution
-result in parallel, which also elegantly solves the challenges of miner rewards and self-destruct opcode without
-compromising correctness and performance penalty of falling back to sequential.
+Engineering-wise, Grevm 2.0 introduces **parallel state**, an asynchronous state storage that bundles the final
+execution result in parallel, which also elegantly solves the challenges of miner rewards and self-destruct opcode
+without compromising correctness and performance penalty of falling back to sequential.
 
 In this report, we will first introduce the design of Grevm 2.0, including our insights found in the process of
 experiments, including the rationale behind the design choices, and some rarely revealed data showcasing the impressive
@@ -35,32 +38,32 @@ efficiency of Block-STM's optimistic execution. Then, we will present the benchm
 
 ## Algorithm Design
 
-The core architecture of Grevm2.0 is composed of three main modules: **Dependency Manager (DAG manager)**, **Execution
+The core architecture of Grevm 2.0 is composed of three main modules: **Dependency Manager (DAG manager)**, **Execution
 Scheduler**, and **Parallel State Storage**. In a nutshell, Grevm2.0 employs a DAG-driven task scheduling mechanism to
-(1) group adjacent dependent transactions into task groups, and (2) execute transactions with the smallest index that
-has no dependencies (i.e., out-degree of 0), with a selective dependency update strategy.
+(1) group adjacent dependent transactions into task groups, and (2) execute task groups and transaction with the
+smallest index that has no dependencies (i.e., out-degree of 0), with a selective dependency update strategy.
 
 ![image.png](images/g2design.png)
 
 ### Dependency Manager And Execution Scheduler
 
-The dependency manager in Grevm 2.0 is responsible for tracking and resolving dependencies between transactions to
-enable efficient parallel execution scheduling. Similar to 1.0, Grevm 2.0 constructs a Directed Acyclic Graph (DAG)
-where:
+The dependency manager in Grevm 2.0 is responsible for tracking and resolving dependencies between transactions during
+parallel execution for efficient scheduling. Similar to 1.0, Grevm 2.0 constructs a Directed Acyclic Graph (DAG) where:
 
-- **Nodes represent transactions**, identified by unique indices. Let T_i be a transaction with index i.
-- **Edges denote dependencies**, that dependency edge T_j to T_i exists if T_j writes data that T_i reads, indicating a
-  read-after-write data dependency. Note that only transactions with higher indices may depend on those with lower
-  indices.
+- **Nodes represent transactions**, identified by unique indices. Let $T_i$ be a transaction with index $i$.
+- **Edges denote dependencies**, that a dependency edge $T_j$ to $T_i$ exists if $T_i$ writes data that $T_j$ reads,
+  indicating a read-after-write data dependency. Note that only transactions with higher indices may depend on those
+  with lower indices.
 
-Before parallel execution, dependencies are inferred using **hints** that indicate speculated read/write sets. Hints are
-obtained from static analysis or simulation (executing transactions on the last committed state).
+Before parallel execution, dependencies are inferred using **hints** representing speculated read/write sets. Hints are
+obtained from static analysis or simulation (executing transactions on the last committed state, before execution).
 
-The **Execution Scheduler** module handles both transaction execution and validation, following this workflow:
+The **Execution Scheduler** module handles both transaction **execution** and **validation**, following this workflow:
 
-1. **Parallel Execution**: The Scheduler selects and executes the transaction with the smallest identifier from the
-   Dependency DAG that has no dependencies (i.e., an out-degree of 0).
-2. **Validation**: Once execution is complete, the transaction enters a pending validation phase. The Scheduler then
+1. **Parallel Execution**: The Scheduler selects and executes the transaction with the smallest indexes from the
+   Dependency DAG that has no dependencies (i.e., an out-degree of 0). For a task group, its index is the smallest index
+   of all transactions in the group.
+2. **Validation**: Once execution is completed, the transaction enters a pending validation phase. The Scheduler then
    checks whether the read set of the transaction with the smallest identifier has changed:
    - If the read set remains unchanged, the transaction moves to the **Unconfirmed** state. Consecutive Unconfirmed
      transactions will eventually transition into the **Finality** state, from the consecutive lowest index starting
@@ -70,17 +73,17 @@ The **Execution Scheduler** module handles both transaction execution and valida
 
 During scheduling, when consecutive transactions have dependencies, they can be grouped into a **Task Group**.
 Transitions in a task group will be scheduled together and executed sequentially. For instance, in the example above,
-**tx2** depends on **tx3**. Normally, **tx2** must finish execution before **tx3** can begin. However, by bundling them
-into a Task Group, they can be executed sequentially within the same thread, ensuring that **tx3** correctly reads the
-updated data from **tx2**. Task groups effectively handle high-conflict scenarios, particularly when consecutive
-transactions are strongly interdependent, reducing frequent task switching, re-execution and scheduling overheads. We
-believe that this is a common case for highly dependent workloads like NFT minting, DeFi transactions, and especially
-when we do not have a strategy to **re-order** transactions to maximize parallelism. Especially in the worst-case
-scenario where all transitions are interdependent, forming a chain, task group execution can remain as efficient as
-serial execution. This design is simple and effective, by grouping tightly coupled transactions, the scheduling logic is
-streamlined, avoiding introducing excessive scheduling complexity.
-
-During execution, dependencies are updated dynamically based on actual transaction behavior.
+$tx_2$ depends on $tx_3$. Presumably, $tx_2$ must finish execution before $tx_3$ can begin. By bundling them into a task
+group, they can be executed sequentially within the same thread, ensuring that $tx_3$ correctly reads the updated data
+from $tx_2$. Task groups effectively handle high-conflict scenarios, particularly when consecutive transactions are
+strongly dependent, reducing frequent task switching, re-execution and scheduling overheads. We believe that this is a
+common case for highly dependent workloads like NFT minting, DeFi transactions, and especially when we do not have a
+strategy to **re-order** transactions to maximize parallelism. Especially in the worst-case scenario where all
+transitions are interdependent, forming a chain, task group execution can remain as efficient as serial execution. We
+think this design is a good trade-off that by leveraging known data dependencies, we can achieve a good balance between
+optimistic parallelism and efficient CPU utilization. This design is also good because of its simplicity. The scheduling
+logic remains largely the same as Block-STM, avoiding introducing excessive scheduling complexity, which can bring down
+the performance when transactions are simple, i.e., executed very fast.
 
 For adding dependencies, Grevm 2.0 follows a **selective dependency strategy**, adding only the most necessary edges to
 minimize DAG modifications.
@@ -90,12 +93,12 @@ There are three scenarios trigger adding dependency:
 1. When a transaction reads estimated data that later proves incorrect, instead of immediately aborts the transaction
    and marks it as dependent, Grevm 2.0 will complete execution, analyze the actual read-write set, and adds **only the
    most significant dependency** (i.e., the transaction with the largest index that it depends on).
-2. When a transaction T*j reads from a **miner account** or a **self-destructed account**, but the parallel state has
-   not been committed for T*{j-1}. Instead of linking to all prior transactions, we only add T\_{j-1} as a dependency,
-   reducing redundant edges.
+2. When a transaction $T_j$ reads from a **miner account** or a **self-destructed account**, but the parallel state has
+   not been committed for $T_{j-1}$. Instead of linking to all prior transactions, we only add $T_{j-1}$ as a
+   dependency, reducing redundant edges.
 3. When the read set of a transaction is updated during _validation_. Grevm 2.0 recalculates dependencies and adds only
-   the most recent transaction as a dependency. That is, If T_i detects a conflict with a set of transactions, find the
-   transaction with the **largest index k **. Add the dependency edge T_k to T_i.
+   the most recent transaction as a dependency. That is, If $T_i$ detects a conflict with a set of transactions, find
+   the transaction with the **largest index k **. Add the dependency edge $T_k$ to $T_i$.
 
 The rationale behind this design is to minimize the performance overhead of updating the DAG while ensuring efficient
 scheduling and correctness.
@@ -120,9 +123,9 @@ worlds.
 
 The **Storage** module implements **DatabaseRef** and offers two functionalities: **Parallel State** and **Multi-Version
 Memory**. It enhances system performance by introducing a **Parallel State** layer between EvmDB and MvMemory. The
-process works as follows: After transaction T_i completes execution, its results are first stored in MvMemory. Once it
+process works as follows: After transaction $T_i$ completes execution, its results are first stored in MvMemory. Once it
 reaches the Finality state, an asynchronous task is triggered to commit the results to Parallel State. When transaction
-T_j accesses data, it reads from Parallel State if dealing with a miner or self-destructed account; otherwise, it
+$T_j$ accesses data, it reads from Parallel State if dealing with a miner or self-destructed account; otherwise, it
 retrieves data from MvMemory. There design offers several advantages:
 
 - **Amortized Result State Building**: Committed transaction will continuously generate reth-compatible result states,
@@ -134,7 +137,7 @@ retrieves data from MvMemory. There design offers several advantages:
   self-destructed account. The self-destruct transaction updates MvMemory's write set and marks the account as
   self-destructed. If a later transaction retrieves self-destructed account data from MvMemory, it must re-fetch the
   latest state from Parallel State. In both cases, Parallel State's commit ID serves as the version number, ensuring
-  that for transaction **j**, only data with version **j-1** is deemed valid—otherwise, the transaction is marked as
+  that for transaction $j$, only data with version $j-1$ is deemed valid—otherwise, the transaction is marked as
   conflicting
 
 ## Benchmark
