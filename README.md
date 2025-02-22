@@ -1,6 +1,6 @@
 # Grevm
 
-> Grevm (both 1.0 and 2.0) is reth-ready, please see [use-with-reth.md](use-with-reth.md) for more details.
+> Grevm (both 1.0 and 2.0) is reth-ready, please see [use-with-reth.md](docs/use-with-reth.md) for more details.
 
 Grevm is a Block-STM inspired optimistic parallel EVM execution engine that leverages DAG-based task scheduling, dynamic
 dependency management, and parallel state storage to significantly boost throughput of

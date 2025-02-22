@@ -1,7 +1,5 @@
 # Grevm
 
-Grevm 1.0 is reth-ready, please see [use-with-reth.md](use-with-reth.md) for more details.
-
 ## Introducing Grevm
 
 We are excited to announce the release of [Grevm 1.0 (Gravity EVM)](https://github.com/Galxe/grevm), an open-source,
@@ -117,7 +115,7 @@ _Figure 2: Grevm 1.0 PoC Implementation_
 To validate the above framework and assess their practical impact, we developed **Grevm 1.0** as a preliminary proof of
 concept. The source code can be found on our Github: [https://github.com/Galxe/grevm](https://github.com/Galxe/grevm).
 Grevm is ready to be integrated with reth, please see
-[https://github.com/Galxe/grevm/blob/main/use-with-reth.md](https://github.com/Galxe/grevm/blob/main/use-with-reth.md).
+[https://github.com/Galxe/grevm/blob/main/docs/use-with-reth.md](https://github.com/Galxe/grevm/blob/main/docs/use-with-reth.md).
 
 This initial implementation focuses on testing our hypotheses while minimizing engineering complexity. Despite its known
 limitations, Grevm 1.0 has demonstrated significant performance improvements in parallel transaction execution.
