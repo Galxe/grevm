@@ -8,11 +8,12 @@
 - **Breaks Grevm 1.0’s limitations in handling highly dependent transactions**, delivering a **5.5× throughput
   increase** to **2.96 gigagas/s** in **30%-hot-ratio hybrid workloads** by minimizing re-executions through **DAG-based
   scheduling** and **Task Groups**.
-- **Parallel State module enhances state storage efficiency**, introducing **asynchronous execution result bundling**
-  that amortizes **~30ms post-execution overhead**, while seamlessly handling **miner rewards and self-destruct opcode**
-  without the performance penalties of sequential fallbacks.
+- **Introduces Parallel State Store**, leveraging **asynchronous execution result bundling** to **overlap and amortize
+  30-60ms of post-execution overhead within parallel execution**, effectively hiding these costs within execution time.
+  It also seamlessly handles **miner rewards and the self-destruct opcode** without the performance penalties of
+  sequential fallbacks.
 - **In-depth analysis of optimistic parallel execution** reveals the **underestimated efficiency of Block-STM** and the
-  strength of **optimistic parallelism**, providing new insights into high-performance transaction execution.
+  strength of **optimistic parallelism**, providing new insights into parallel execution.
 
 ## Abstract
 
@@ -187,7 +188,7 @@ transactions consist of independent raw transfers, ERC20 transfers, and Uniswap 
 and accounts to ensure no data dependencies. This setup provides a baseline to assess the maximum achievable performance
 improvement through parallel execution without the impact of transaction conflicts.
 
-| Test Case       | Num Txs | DB Latency | Sequential | Grevm 1.0 | Grevm 2.0 | Speedup | Gigagas/s |
+| Test            | Num Txs | DB Latency | Sequential | Grevm 1.0 | Grevm 2.0 | Speedup | Gigagas/s |
 | --------------- | ------- | ---------- | ---------- | --------- | --------- | ------- | --------- |
 | Raw Transfers   | 47620   | 0          | 185.74     | 69.172    | 123.01    | 1.5     | 8.13      |
 |                 |         | 20us       | 3703.5     | N/A       | 125.59    | 29.5    | 7.96      |
@@ -256,7 +257,7 @@ all test cases except for ERC20 transfers with zero latency, where experimental 
 improvement is in the **Hybrid test case**, where Grevm 2.0 achieves a **29× speedup over sequential execution**, which
 is **5.55× over Grevm 1.0**, reaching a throughput of **2.96 gigagas/s**.
 
-| Test Case       | Num Txs | DB Latency | Sequential | Grevm 1.0 | Grevm 2.0 | Total Speedup | ThroughPut(Gigagas/s) |
+| Test            | Num Txs | DB Latency | Sequential | Grevm 1.0 | Grevm 2.0 | Total Speedup | ThroughPut(Gigagas/s) |
 | --------------- | ------- | ---------- | ---------- | --------- | --------- | ------------- | --------------------- |
 | Raw Transfers   | 47620   | 0          | 228.03     | 171.65    | 130.17    | 1.8           | 7.68                  |
 |                 |         | 100us      | 8933.0     | 4328.08   | 199.62    | 44.8          | 5.01                  |
@@ -266,6 +267,38 @@ is **5.55× over Grevm 1.0**, reaching a throughput of **2.96 gigagas/s**.
 |                 |         | 100us      | 9799.9     | 1874.7    | 337.42    | 29.0          | 2.96                  |
 
 _Table 3: Grevm 2.0 Contention Transactions Execution Speedup (unit = milliseconds, hot ratio = 30%)_
+
+### Non-Parallelizable Transactions
+
+To compare the performance of Grevm 2.0 and Block-STM in inherently non-parallelizable cases, we conducted a test with
+transactions that are highly dependent on each other. In this scenario, transactions form a chain where each transaction
+depends on the previous one, making parallel execution impossible. All tests are running with `db_latency = 0`. Same as
+Grevm 1.0, we use pevm as the reference implementation for Block-STM.
+
+| Test                  | Num Txs | Sequential | Parallel | Speedup | Gigagas/s | CPU Usage |
+| --------------------- | ------- | ---------- | -------- | ------- | --------- | --------- |
+| Worst ERC20 Transfers | 33,628  | 350.32     | 369.96   | 0.95    | 2.70      | 128%      |
+| Worst Uniswap         | 6,414   | 550.19     | 567.32   | 0.97    | 1.76      | 115%      |
+
+_Table 4: Grevm 2.0 Non-Parallelizable Transactions Test (unit = milliseconds)_
+
+In these tests, Grevm 2.0 experiences only a **5% performance degradation** for ERC20 transfers and **3%** for Uniswap
+swaps compared to sequential execution. This result is a significant improvement over Block-STM, which suffers a **~30%
+slowdown** in similar scenarios in our benchmark (see Table 5), aligning with the worst-case benchmark results reported
+in the Block-STM paper.
+
+A more impressive result is the **CPU usage**, sampled using `pidstat`. Grevm 2.0 uses only **128% CPU for ERC20
+transfers** and **115% CPU for Uniswap swaps**, whereas Block-STM consumes **2987% and 2761% CPU**, respectively. This
+represents a **95% reduction in CPU usage** compared to Block-STM. These findings highlight Grevm 2.0's efficiency in
+handling inherently non-parallelizable transactions, enhancing the execution engine's resilience against worst-case
+transaction dependencies.
+
+| Test          | Num Txs | Sequential Total | Grevm Parallel | Speedup | Gigagas/s | CPU Usage |
+| ------------- | ------- | ---------------- | -------------- | ------- | --------- | --------- |
+| Worst ERC20   | 33,628  | 292.45           | 423.45         | 0.69    | 2.36      | 2987%     |
+| Worst Uniswap | 6,414   | 488.12           | 687.13         | 0.71    | 1.46      | 2761%     |
+
+_Table 5: Block-STM (pevm implementation) Non-Parallelizable Transactions Test (unit = milliseconds)_
 
 ## Comparison, Analysis, and Insights
 
