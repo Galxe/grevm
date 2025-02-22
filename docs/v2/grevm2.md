@@ -50,7 +50,7 @@ State Storage**. It employs a DAG-driven task scheduling mechanism to:
 2. Group adjacent dependent transactions into **task groups**.
 3. Execute task groups and the lowest-index transactions with no dependencies (i.e., out-degree of 0).
 
-![image.png](images/g2design.png)
+![Grevm 2.0 Algorithm](images/g2design.png)
 
 ### Dependency Manager and Execution Scheduler
 
@@ -122,7 +122,7 @@ throughput and re-execution probability, delivering robust performance across di
 
 ### Parallel State Storage
 
-![image.png](images/parallel_state.png)
+![Parallel State Storage](images/parallel_state.png)
 
 The **Storage** module implements **DatabaseRef** and provides two key functionalities: **Parallel State** and
 **Multi-Version Memory (MvMemory)**. It introduces a **Parallel State** layer between EvmDB and MvMemory to enhance
@@ -300,111 +300,121 @@ transaction dependencies.
 
 _Table 5: Block-STM (pevm implementation) Non-Parallelizable Transactions Test (unit = milliseconds)_
 
-## Comparison, Analysis, and Insights
+## Comparison, Analysis, and Future Work
 
 ### Optimistic Parallelism (Block-STM) Is MORE Efficient Than Expected
 
 In parallel block execution, the dependencies between transactions play a crucial role in system performance. To
 quantify this impact, we introduce two key metrics: **Dependency Distance** and **Dependent Ratio**. If a transaction
-**txⱼ** depends on a preceding transaction **txᵢ**, their dependency distance is defined as:
+$T_j$ depends on a preceding transaction $T_i$, their dependency distance is defined as:
 
 ```math
 \text{dependency\_distance} = j - i
 ```
 
-where **j** and **i** are the transaction indices. The number of transactions within a block that have dependencies is
-denoted as **with_dependent_txs**, and the dependent ratio is given by:
+where $j$ and $i$ are the transaction indices. The number of transactions within a block that have dependencies is
+denoted as `with_dependent_txs`, and the dependent ratio is given by:
 
 ```math
 \text{dependent\_ratio} = \frac{\text{with\_dependent\_txs}}{\text{block\_txs}}
 ```
 
-where **block_txs** represents the total number of transactions in the block. The following table illustrates the
-relationship between conflict rate and dependency distance under **fully optimistic execution**, based on a **1Gigagas**
-block containing **47,620** normal transfer transactions:
+where **block_txs** represents the total number of transactions in the block. The following figure illustrates the
+relationship between conflict rate and dependency distance under **fully optimistic execution**, based on a **1
+Gigagas** block containing **47,620** normal transfer transactions:
 
-![dependent_distance_plot.svg](images/dependent_distance_plot.svg)
+![Dependency Distance v.s. Conflict Ratio](images/dependent_distance_plot.svg)
 
-Analysis of 1 Gigagas transfer transactions reveals that even when **dependency_distance = 1**, later transactions still
-have a certain probability of reading the correct data from earlier ones. When **dependency_distance ≥ 4**, conflict
-rates drop significantly, showing an approximately inverse relationship with dependency distance.
+The analysis reveals that even when **dependency_distance = 1**, later transactions still have a certain probability of
+reading the correct data from earlier ones. When **dependency_distance ≥ 4**, conflict rates drop significantly, showing
+an approximately inverse relationship with dependency distance.
 
 This insight is highly practical: even in blocks with a high number of interdependent transactions, optimistic execution
 strategies (such as **Block-STM**) do not necessarily lead to excessive transaction re-execution. This is because
-transactions with greater dependency distances are less likely to conflict, reducing the performance cost of optimistic
-execution.
+transactions with greater dependency distances are less likely to conflict, minimizing performance degradation caused by
+re-executions. Moreover, when simple transactions—such as raw transfers and ERC20 transfers—are executed quickly, later
+transactions are more likely to read correct data from earlier ones. This happens because earlier transactions may have
+already completed execution, even when later transactions are running in parallel. Furthermore, if transaction
+reordering is an option, interleaving transactions with gapped dependencies can significantly improve optimistic
+parallelism by minimizing conflicts caused by short dependency distances.
 
-This principle provides a theoretical foundation for optimizing parallel execution engines, enabling maximum performance
-while ensuring correctness. For transactions with **short dependency distances (dependency_distance ≤ 3)**, a more
-conservative scheduling strategy (e.g., **Task Group**) can help reduce conflicts. Meanwhile, transactions with **larger
-dependency distances** can be processed using fully optimistic execution to maximize parallelism and throughput.
-
-In designing a parallel execution engine, dependency distance analysis can guide scheduling optimizations. For example,
-transactions with shorter dependency distances may be given higher priority or stricter conflict detection, while those
-with larger dependency distances can adopt a more relaxed optimistic execution approach. This strategy enhances system
-throughput, reduces latency, and ensures correct execution results.
+This principle provides us the theoretical foundation for optimizing parallel execution engines, enabling maximum
+performance while ensuring correctness. For transactions with **short dependency distances (dependency_distance ≤ 3)**,
+a more conservative scheduling strategy (e.g., **Task Group**) can help reduce conflicts. Meanwhile, transactions with
+**larger dependency distances** can be processed using fully optimistic execution to maximize parallelism and
+throughput.
 
 ### Implications of Dependency Distance on DAG Scheduling
 
-When **dependency_distance** is large, **hints** and **dependency DAG** become less critical since transactions can be
-optimistically executed in parallel with minimal risk of re-execution. However, when **dependency_distance** is small
-(e.g., **dependency_distance ≤ 3**), the likelihood of conflicts increases, leading to more frequent re-execution of
-affected transactions. If dependencies are not dynamically updated, conflicting transactions may require over 10
-execution attempts to reach confirmation. Implementing dynamic updates to the **dependency DAG** can significantly
-reduce the number of retries:
+When `dependency_distance` is large enough, hints and the dependency DAG play a less critical role, as transactions can
+be optimistically executed in parallel with minimal risk of re-execution. However, when it is small (e.g., $≤ 3$), the
+likelihood of conflicts increases, leading to frequent re-execution of affected transactions. Without dynamic dependency
+updates, some conflicting transactions may require over 10 execution attempts before confirmation. Introducing dynamic
+updates to the dependency DAG can significantly reduce the number of retries:
 
-- **Execution phase updates**: Reducing dependencies here lowers retries to about 5.
-- **Validation phase updates**: Further reduces retries to around 3.
-- **Finality phase updates**: Limits retries to at most 2.
+- **Execution-phase updates**: Lowers retries to about 5.
+- **Validation-phase updates**: Further reduces retries to around 3.
+- **Finality-phase updates**: Limits retries to at most 2.
 
-Since both dependency updates and transaction re-executions introduce overhead, a balance must be struck, with
-**dependency_distance** serving as the primary optimization metric.
+Both dependency updates and transaction re-executions introduce overhead, requiring a balance where
+`dependency_distance` serves as the primary optimization metric.
 
-When conflicts are frequent, **hints** accuracy becomes particularly important. If **hints** are highly accurate, even
-an execution-phase dependency removal strategy can prevent conflicts, ensuring the fastest scheduling speed. However,
-inaccurate **hints** lead to frequent **dependency DAG** updates, degrading performance.
+In high-conflict scenarios, hints accuracy becomes particularly important. When hints are reliable, even execution-phase
+dependency removals can prevent conflicts, enabling faster scheduling. Conversely, inaccurate hints lead to frequent
+dependency DAG updates, degrading performance.
 
-While the **Task Group** mechanism improves performance, to reduce reliance on **hints** accuracy, only transactions
-with **dependency_distance = 1** are grouped into **Task Groups**. This ensures that even if **hints** are inaccurate,
-sequential execution of dependent transactions remains conflict-free, minimizing performance loss.
+Task Group mechanism also mitigates reliance on hints accuracy. To ensure less-conflict execution even when hints are
+inaccurate, only transactions with `dependency_distance = 1` are grouped into task groups, preserving sequential
+execution and minimizing performance loss.
 
-Overall, compared to **Block-STM**, **grevm2.0** offers no significant advantage in low-conflict scenarios. However, in
-high-conflict environments, **grevm2.0** effectively reduces retries (lowering CPU consumption) and leverages
-**dependency_distance** for further optimizations when **hints** are reliable. By incorporating dynamic dependency
-updates and **Task Groups**, **grevm2.0** excels in high-conflict scenarios, further improving system performance.
+Overall, Grevm 2.0 offers no major advantage over Block-STM in low-conflict scenarios. However, in high-conflict
+environments, Grevm 2.0 significantly reduces retries (lowering CPU consumption) and optimizes execution based on
+`dependency_distance` when hints are reliable.
 
 ### Validation Scheduling
 
-In **grevm2.0**, **Validation** scheduling is slower than in **Block-STM** for two key reasons.
+In Grevm 2.0, validation scheduling is slower than in Block-STM for two key reasons.
 
-The first is straightforward: **grevm2.0** does not execute transactions strictly in order of their indices, but
-**Validation** must proceed in ascending order. This means **Validation** often has to wait for sequentially executed
-transactions to complete, causing scheduling delays.
+The first is straightforward: Grevm 2.0 does not execute transactions strictly in index order, whereas validation must
+proceed sequentially. As a result, validation often stalls, waiting for earlier transactions to complete before it can
+proceed, causing scheduling delays.
 
-The second reason relates to **Block-STM**'s commonly overlooked optimization for **Validation**. **Block-STM**
-introduces a **write_new_locations** flag for each transaction to indicate whether it has written to a new memory
-location. If a transaction encounters a conflict, **validation_idx** advances directly to **tx + 1**, meaning it does
-not need to wait for the conflicting transaction to be re-executed before moving forward. If, after re-execution,
-**write_new_locations = false**, only a single **Validation** task needs to be processed, and **validation_idx** remains
-unchanged. It is only advanced when **write_new_locations = true**. Since the probability of this flag being **true**
-after a retry is low, **Block-STM** accelerates validation for non-conflicting transactions while avoiding unnecessary
-re-validation.
+The second reason stems from an often-overlooked Block-STM optimization for validation. Block-STM introduces a
+`write_new_locations` flag for each transaction, indicating whether transactions have written to a new memory location.
+If a transaction encounters a conflict, `validation_idx` advances immediately to `tx + 1`, meaning validation does not
+need to wait for the conflicting transaction to be re-executed. After re-execution, if `write_new_locations = false`,
+only a single validation task is required, and `validation_idx` remains unchanged. It only advances when
+`write_new_locations = true`. Since this flag is rarely `true` after a retry, Block-STM efficiently accelerates
+validation by avoiding unnecessary re-validations for non-conflicting transactions.
 
-Since **Validation** is a prerequisite for **finality**, and features like **remove dynamic dependency**,
-**async-commit**, **miner**, and **self-destruct** all depend on **finality**, optimizing **grevm2.0**'s **Validation**
-speed is crucial.
+Since validation is a prerequisite for finality, and features like remove dynamic dependency, async-commit, miner, and
+self-destruct all depend on finality, optimizing Grevm 2.0’s validation speed is critical.
 
-A simple approach would be to validate transactions immediately after execution, following **Block-STM**'s strategy for
-checking the **write set** of earlier transactions. However, this method would also require scanning the **read set** of
-later transactions, which is computationally expensive. Checking the **write set** of earlier transactions only involves
-verifying the latest written location, whereas checking the **read set** of later transactions requires examining all
-subsequent transactions to ensure they accessed the correct data—an inefficient process.
+A simple approach would be to validate transactions immediately after execution, following Block-STM’s strategy of
+checking the `write_set` of earlier transactions. However, this method also requires scanning the `read_set` of later
+transactions, which is computationally expensive. Checking the `write_set` of earlier transactions involves verifying
+only the latest written location, whereas checking the `read_set` of later transactions requires scanning all subsequent
+transactions to confirm they accessed the correct data—an inefficient process.
 
-A more effective solution is to validate a transaction's **write set** and, if its modifications exceed the predicted
-range of **hints**, handle those out-of-range transactions using the standard validation process. However, for
-transactions within the **hints** range, their read/write sets do not require validation. Thus, optimizing
-**grevm2.0**'s **Validation** speed depends heavily on **hints** accuracy. By dynamically refining **hints** and
-improving the validation mechanism, the system can significantly boost performance while maintaining correctness.
+A more effective solution is to validate a transaction’s `write_set` and, if its modifications exceed the predicted
+range of hints, handle those out-of-range transactions using the standard validation process. However, for transactions
+within the hints range, their read/write sets do not require validation. Thus, optimizing Grevm 2.0’s validation speed
+relies heavily on hints accuracy. By dynamically refining hints and improving the validation mechanism, the system can
+significantly enhance performance while maintaining correctness.
+
+### Future Work
+
+Based on the above analysis, we propose several directions for future research:
+
+1. **More efficient dependency DAG management.** Our findings indicate that using a single lock—whether Rust’s standard
+   locks or a high-performance implementation like `parking_lot`—can reduce scheduler and overall performance by
+   **10-20% (~20ms, depending on transaction count and execution time).**, comparing with Block-STM's neat atomic index
+   counter, To address this, we plan to investigate lock-free data structures to enhance the DAG manager’s efficiency.
+2. **Optimizing validation.** Inspired by Block-STM’s `write_new_locations` flag, we aim to develop more efficient
+   validation algorithms using sophisticated, high-performance data structures to minimize unnecessary re-validations.
+3. **Empirical hints accuracy analysis.** We plan to conduct a comprehensive study on hints accuracy to determine the
+   optimal balance between hints-based scheduling and dynamic dependency updates, based on real-world data from EVM
+   blockchains like Ethereum, BNB chain, and Base.
 
 ## Authors
 
