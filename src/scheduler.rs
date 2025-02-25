@@ -1,12 +1,11 @@
 use crate::{
     async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, AbortReason, LocationAndType, MemoryEntry, ParallelState,
-    ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
-    CONCURRENT_LEVEL,
+    tx_dependency::TxDependency, utils::LockFreeQueue, AbortReason, LocationAndType, MemoryEntry,
+    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
+    TxVersion, CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
-use crossbeam::queue::ArrayQueue;
 use dashmap::DashMap;
 use metrics::histogram;
 use parking_lot::{Mutex, RwLock};
@@ -44,6 +43,7 @@ struct ExecuteMetrics {
     one_attempt_with_dependency: metrics::Histogram,
     more_attempts_with_dependency: metrics::Histogram,
     no_dependency_txs: metrics::Histogram,
+    conflict_txs: metrics::Histogram,
 }
 
 impl Default for ExecuteMetrics {
@@ -62,6 +62,7 @@ impl Default for ExecuteMetrics {
             one_attempt_with_dependency: histogram!("grevm.one_attempt_with_dependency"),
             more_attempts_with_dependency: histogram!("grevm.more_attempts_with_dependency"),
             no_dependency_txs: histogram!("grevm.no_dependency_txs"),
+            conflict_txs: histogram!("grevm.conflict_txs"),
         }
     }
 }
@@ -82,6 +83,7 @@ struct ExecuteMetricsCollector {
     one_attempt_with_dependency: AtomicUsize,
     more_attempts_with_dependency: AtomicUsize,
     no_dependency_txs: AtomicUsize,
+    conflict_txs: AtomicUsize,
 }
 
 impl ExecuteMetricsCollector {
@@ -118,6 +120,7 @@ impl ExecuteMetricsCollector {
         execute_metrics
             .no_dependency_txs
             .record(self.no_dependency_txs.load(Ordering::Relaxed) as f64);
+        execute_metrics.conflict_txs.record(self.conflict_txs.load(Ordering::Relaxed) as f64);
     }
 }
 
@@ -186,7 +189,12 @@ where
         }
     }
 
-    fn async_commit(&self, commiter: &Mutex<StateAsyncCommit<DB>>, task_queue: &ArrayQueue<Task>) {
+    fn async_commit(
+        &self,
+        commiter: &Mutex<StateAsyncCommit<DB>>,
+        task_queue: &LockFreeQueue<Task>,
+    ) {
+        let dependency_distance = histogram!("grevm.dependency_distance");
         let mut start = Instant::now();
         let mut num_commit = 0;
         let mut commiter = commiter.lock();
@@ -204,6 +212,24 @@ where
                         let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
                         commiter.commit(result);
                     }
+                    let tx = self.tx_states[num_commit].lock();
+                    if tx.incarnation > 1 {
+                        self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(dep_id) = tx.dependency {
+                        dependency_distance.record((num_commit - dep_id) as f64);
+                        if tx.incarnation == 1 {
+                            self.metrics
+                                .one_attempt_with_dependency
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else if tx.incarnation > 2 {
+                            self.metrics
+                                .more_attempts_with_dependency
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
+                    }
                     num_commit += 1;
                     self.num_commit.fetch_add(1, Ordering::Relaxed);
                 }
@@ -212,9 +238,9 @@ where
                 start = Instant::now();
                 println!(
                     "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
-                    self.finality_idx.load(Ordering::Acquire),
-                    self.validation_idx.load(Ordering::Acquire),
-                    self.execution_idx.load(Ordering::Acquire)
+                    self.finality_idx.load(Ordering::Relaxed),
+                    self.validation_idx.load(Ordering::Relaxed),
+                    self.execution_idx.load(Ordering::Relaxed)
                 );
                 let status: Vec<(TxId, TransactionStatus)> =
                     self.tx_states.iter().map(|s| s.lock().status.clone()).enumerate().collect();
@@ -242,7 +268,7 @@ where
     ) -> Result<(), EVMError<DB::Error>> {
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
-        let task_queue = ArrayQueue::new(concurrency_level * 4);
+        let task_queue = LockFreeQueue::new(concurrency_level * 4);
         let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
         commiter.lock().init().map_err(|e| EVMError::Database(e))?;
         thread::scope(|scope| {
@@ -282,7 +308,9 @@ where
             }
         });
         self.results.lock().extend(commiter.lock().take_result());
-        self.post_execute()
+        self.post_execute()?;
+        self.metrics.report();
+        Ok(())
     }
 
     fn post_execute(&self) -> Result<(), EVMError<DB::Error>> {
@@ -299,13 +327,12 @@ where
                         }
                         panic!("Wrong abort transaction")
                     }
-                    AbortReason::SelfDestructed => {
+                    AbortReason::SelfDestructed | AbortReason::FallbackSequential => {
                         return self.fallback_sequential();
                     }
                 }
             }
         }
-        self.metrics.report();
         Ok(())
     }
 
@@ -329,6 +356,7 @@ where
                 let result_and_state = evm.transact()?;
                 evm.db_mut().commit(result_and_state.state);
                 sequential_results.push(result_and_state.result);
+                self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
             }
         }
         results.extend(sequential_results);
@@ -392,6 +420,9 @@ where
                     if tx_state.incarnation != incarnation {
                         panic!("Inconsistent incarnation when execution");
                     }
+                    if tx_state.status != TransactionStatus::Executing {
+                        panic!("Wrong executing status: {:?}", tx_state.status);
+                    }
                     tx_state.status = if conflict {
                         TransactionStatus::Conflict
                     } else {
@@ -437,6 +468,9 @@ where
                     let mut tx_state = self.tx_states[txid].lock();
                     if tx_state.incarnation != incarnation {
                         panic!("Inconsistent incarnation when execution");
+                    }
+                    if tx_state.status != TransactionStatus::Executing {
+                        panic!("Wrong executing status: {:?}", tx_state.status);
                     }
                     tx_state.status = TransactionStatus::Conflict;
                 }
@@ -504,9 +538,12 @@ where
             if tx_state.incarnation != incarnation {
                 panic!("Inconsistent incarnation when validating");
             }
+            if tx_state.status != TransactionStatus::Validating {
+                panic!("Wrong validating status: {:?}", tx_state.status);
+            }
             tx_state.status =
                 if conflict { TransactionStatus::Conflict } else { TransactionStatus::Unconfirmed };
-            tx_state.has_dependency = dependency.is_some();
+            tx_state.dependency = dependency;
         }
 
         if conflict {
@@ -557,13 +594,13 @@ where
         max_dep_id
     }
 
-    fn assign_tasks(&self, task_queue: &ArrayQueue<Task>) {
+    fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>) {
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
-            let mut finality_idx = self.finality_idx.load(Ordering::Acquire);
-            let mut validation_idx = self.validation_idx.load(Ordering::Acquire);
-            let mut execution_idx = self.execution_idx.load(Ordering::Acquire);
+            let mut finality_idx = self.finality_idx.load(Ordering::Relaxed);
+            let mut validation_idx = self.validation_idx.load(Ordering::Relaxed);
+            let mut execution_idx = self.execution_idx.load(Ordering::Relaxed);
             // Confirm the finality and conflict status
             let origin_finality_idx = finality_idx;
             if finality_idx < validation_idx {
@@ -573,19 +610,7 @@ where
                         TransactionStatus::Unconfirmed => {
                             tx.status = TransactionStatus::Finality;
                             finality_idx += 1;
-                            if !tx.has_dependency {
-                                self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                if tx.incarnation == 1 {
-                                    self.metrics
-                                        .one_attempt_with_dependency
-                                        .fetch_add(1, Ordering::Relaxed);
-                                } else if tx.incarnation > 2 {
-                                    self.metrics
-                                        .more_attempts_with_dependency
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
+                            self.finality_idx.fetch_add(1, Ordering::Relaxed);
                         }
                         TransactionStatus::Conflict | TransactionStatus::Executed => {
                             if validation_idx != finality_idx {
@@ -602,12 +627,11 @@ where
                         }
                     }
                 }
-                if finality_idx > origin_finality_idx {
-                    self.finality_idx.store(finality_idx, Ordering::Release);
-                    let mut tx_dependency = self.tx_dependency.lock();
-                    for txid in origin_finality_idx..finality_idx {
-                        tx_dependency.commit(txid);
-                    }
+            }
+            if finality_idx > origin_finality_idx {
+                let mut tx_dependency = self.tx_dependency.lock();
+                for txid in origin_finality_idx..finality_idx {
+                    tx_dependency.commit(txid);
                 }
             }
 
@@ -620,15 +644,14 @@ where
                 {
                     tx.status = TransactionStatus::Validating;
                     task_queue
-                        .push(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)))
-                        .expect("Failed to assign validation task");
+                        .push(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)));
                     num_tasks += 1;
                     validation_idx += 1;
                 } else {
                     break;
                 }
             }
-            self.validation_idx.store(validation_idx, Ordering::Release);
+            self.validation_idx.store(validation_idx, Ordering::Relaxed);
 
             // Submit execution task
             let num_execute = task_queue.capacity() - task_queue.len();
@@ -637,10 +660,18 @@ where
                 let max_num_tasks = num_execute + num_tasks;
                 while num_tasks < max_num_tasks {
                     let execution_group = tx_dependency.next(finality_idx);
-                    if execution_group.is_empty() {
+                    let group_len = execution_group.len();
+                    if group_len == 0 {
                         break;
                     }
-                    let mut group = Vec::with_capacity(execution_group.len());
+                    if group_len > 64 &&
+                        finality_idx < self.block_size / 2 &&
+                        group_len > (self.block_size - finality_idx) / 2
+                    {
+                        self.abort(AbortReason::FallbackSequential);
+                        return;
+                    }
+                    let mut group = Vec::with_capacity(group_len);
                     for &execute_id in execution_group.iter() {
                         if execute_id < finality_idx {
                             self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
@@ -668,17 +699,13 @@ where
                     }
                     num_tasks += group.len();
                     if group.len() == 1 {
-                        task_queue
-                            .push(Task::Execution(group[0].clone()))
-                            .expect("Failed to assign execution task");
+                        task_queue.push(Task::Execution(group[0].clone()));
                     } else if group.len() > 1 {
-                        task_queue
-                            .push(Task::ExecutionGroup(group))
-                            .expect("Failed to assign execution group");
+                        task_queue.push(Task::ExecutionGroup(group));
                     }
                 }
             }
-            self.execution_idx.store(execution_idx, Ordering::Release);
+            self.execution_idx.store(execution_idx, Ordering::Relaxed);
 
             if num_tasks == 0 {
                 thread::yield_now();
@@ -686,11 +713,11 @@ where
         }
     }
 
-    pub fn next(&self, task_queue: &ArrayQueue<Task>) -> Option<Task> {
+    pub fn next(&self, task_queue: &LockFreeQueue<Task>) -> Option<Task> {
         while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
             !self.abort.load(Ordering::Relaxed)
         {
-            if let Some(task) = task_queue.pop() {
+            if let Some(task) = task_queue.multi_pop() {
                 return Some(task);
             } else {
                 thread::yield_now();
