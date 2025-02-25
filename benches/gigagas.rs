@@ -67,7 +67,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
-            let state = ParallelState::new(db.clone(), true);
+            let state = ParallelState::new(db.clone(), true, true);
             metrics::with_local_recorder(&recorder, || {
                 let mut executor = Scheduler::new(
                     black_box(SpecId::LATEST),
@@ -139,7 +139,7 @@ fn bench_half_chained_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
     db.latency_us = db_latency_us;
     bench(
         c,
-        "Half Chained Worst Raw Transfers",
+        "Half Chained Raw Transfers",
         db,
         (0..block_size)
             .map(|i| {
@@ -178,6 +178,41 @@ fn bench_raw_transfers(c: &mut Criterion, db_latency_us: u64) {
                 TxEnv {
                     caller: address,
                     transact_to: TransactTo::Call(address),
+                    value: U256::from(1),
+                    gas_limit: common::TRANSFER_GAS_LIMIT,
+                    gas_price: U256::from(1),
+                    ..TxEnv::default()
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn bench_dependency_distance(
+    c: &mut Criterion,
+    db_latency_us: u64,
+    dependency_ratio: f64,
+    dependency_distance: usize,
+) {
+    let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
+    let accounts = common::mock_block_accounts(common::START_ADDRESS, block_size);
+    let mut db = InMemoryDB::new(accounts, Default::default(), Default::default());
+    db.latency_us = db_latency_us;
+    bench(
+        c,
+        "Independent Raw Transfers",
+        db,
+        (0..block_size)
+            .map(|i| {
+                let address = Address::from(U160::from(common::START_ADDRESS + i));
+                let to = if rand::thread_rng().gen_range(0.0..1.0) < dependency_ratio {
+                    Address::from(U160::from(common::START_ADDRESS + i - dependency_distance))
+                } else {
+                    address
+                };
+                TxEnv {
+                    caller: address,
+                    transact_to: TransactTo::Call(to),
                     value: U256::from(1),
                     gas_limit: common::TRANSFER_GAS_LIMIT,
                     gas_price: U256::from(1),
@@ -260,10 +295,12 @@ fn benchmark_gigagas(c: &mut Criterion) {
         bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
         bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
     } else if !filter.is_empty() && filter.contains("worst") {
-        bench_worst_uniswap(c, db_latency_us, num_eoa, hot_ratio);
         bench_worst_raw_transfers(c, db_latency_us);
         bench_worst_erc20(c, db_latency_us);
+        bench_worst_uniswap(c, db_latency_us, num_eoa, hot_ratio);
         bench_half_chained_raw_transfers(c, db_latency_us);
+        bench_half_chained_erc20(c, db_latency_us);
+        bench_half_chained_uniswap(c, db_latency_us, num_eoa, hot_ratio);
     } else {
         if filter.is_empty() || filter.contains("raw_transfers") {
             bench_raw_transfers(c, db_latency_us);
@@ -276,6 +313,9 @@ fn benchmark_gigagas(c: &mut Criterion) {
         }
         if filter.is_empty() || filter.contains("dependent_erc20") {
             bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
+        }
+        if filter.is_empty() || filter.contains("half_chained_uniswap") {
+            bench_half_chained_uniswap(c, db_latency_us, num_eoa, hot_ratio);
         }
         if filter.is_empty() || filter.contains("half_chained_raw_transfers") {
             bench_half_chained_raw_transfers(c, db_latency_us);
@@ -292,9 +332,44 @@ fn benchmark_gigagas(c: &mut Criterion) {
         if filter.is_empty() || filter.contains("hybrid") {
             bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
         }
+        if filter.contains("dependency_distance") {
+            let dependency_ratio =
+                std::env::var("DEPENDENCY_RATIO").map(|s| s.parse().unwrap()).unwrap_or(0.1);
+            let dependency_distance =
+                std::env::var("DEPENDENCY_DISTANCE").map(|s| s.parse().unwrap()).unwrap_or(8);
+            bench_dependency_distance(c, db_latency_us, dependency_ratio, dependency_distance);
+        }
     }
 
     fastrace::flush();
+}
+
+fn bench_half_chained_erc20(c: &mut Criterion, db_latency_us: u64) {
+    let block_size = (GIGA_GAS as f64 / erc20::ESTIMATED_GAS_USED as f64).ceil() as usize;
+    let (mut state, bytecodes, eoa, sca) = erc20::generate_cluster(block_size, 1);
+    let miner = common::mock_miner_account();
+    state.insert(miner.0, miner.1);
+    let mut txs = Vec::with_capacity(block_size);
+    let sca = sca[0];
+    let eoa_len = eoa.len();
+    for i in 0..eoa_len {
+        let addr = eoa[i].clone();
+        let recipient = if i > eoa_len / 2 { eoa[i].clone() } else { eoa[i + 1].clone() };
+        let tx = TxEnv {
+            caller: addr,
+            transact_to: TransactTo::Call(sca),
+            value: U256::from(0),
+            gas_limit: erc20::GAS_LIMIT,
+            gas_price: U256::from(1),
+            data: ERC20Token::transfer(recipient, U256::from(900)),
+            ..TxEnv::default()
+        };
+        txs.push(tx);
+    }
+    let mut db = InMemoryDB::new(state, bytecodes, Default::default());
+    db.latency_us = db_latency_us;
+
+    bench(c, "Half Chained ERC20", db, txs);
 }
 
 fn bench_worst_erc20(c: &mut Criterion, db_latency_us: u64) {
@@ -395,6 +470,50 @@ fn bench_uniswap(c: &mut Criterion, db_latency_us: u64) {
 
 fn bench_worst_uniswap(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {
     let block_size = (GIGA_GAS as f64 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
+    let mut state = common::mock_block_accounts(common::START_ADDRESS, num_eoa);
+    let eoa_addresses = state.keys().cloned().collect::<Vec<_>>();
+    let mut txs = Vec::with_capacity(block_size);
+
+    let mut bytecodes = HashMap::default();
+    const NUM_UNISWAP_CLUSTER: usize = 1;
+    for _ in 0..NUM_UNISWAP_CLUSTER {
+        let (uniswap_contract_accounts, uniswap_bytecodes, single_swap_address) =
+            uniswap::generate_contract_accounts(&eoa_addresses);
+        state.extend(uniswap_contract_accounts);
+        bytecodes.extend(uniswap_bytecodes);
+        for _ in 0..(block_size / NUM_UNISWAP_CLUSTER) {
+            let data_bytes = if rand::random::<u64>() % 2 == 0 {
+                SingleSwap::sell_token0(U256::from(2000))
+            } else {
+                SingleSwap::sell_token1(U256::from(2000))
+            };
+
+            txs.push(TxEnv {
+                caller: Address::from(U160::from(
+                    common::START_ADDRESS + pick_account_idx(num_eoa, hot_ratio),
+                )),
+                gas_limit: uniswap::GAS_LIMIT,
+                gas_price: U256::from(0xb2d05e07u64),
+                transact_to: TransactTo::Call(single_swap_address),
+                data: data_bytes,
+                ..TxEnv::default()
+            })
+        }
+    }
+
+    let mut db = InMemoryDB::new(state, bytecodes, Default::default());
+    db.latency_us = db_latency_us;
+
+    bench(c, "Worst Uniswap", db, txs);
+}
+
+fn bench_half_chained_uniswap(
+    c: &mut Criterion,
+    db_latency_us: u64,
+    num_eoa: usize,
+    hot_ratio: f64,
+) {
+    let block_size = (GIGA_GAS as f64 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
     let num_uniswap = (GIGA_GAS as f64 * 0.5 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
 
     let mut state = common::mock_block_accounts(common::START_ADDRESS, num_eoa);
@@ -438,7 +557,7 @@ fn bench_worst_uniswap(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, ho
     let mut db = InMemoryDB::new(state, bytecodes, Default::default());
     db.latency_us = db_latency_us;
 
-    bench(c, "Half Worst Uniswap", db, txs);
+    bench(c, "Half Chained Uniswap", db, txs);
 }
 
 fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio: f64) {

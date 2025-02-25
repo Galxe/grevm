@@ -146,7 +146,7 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 tx: Default::default(),
             };
             let db = InMemoryDB::new(accounts.clone(), bytecodes, Default::default());
-            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), ParallelState::new(db, true), true);
+            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), ParallelState::new(db, true, true), true);
 
             match (
                 test.expect_exception.as_deref(),
