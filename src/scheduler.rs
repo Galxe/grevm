@@ -7,7 +7,7 @@ use crate::{
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
 use dashmap::DashMap;
-use metrics::histogram;
+use metrics::{histogram, Histogram};
 use parking_lot::{Mutex, RwLock};
 use revm::{Evm, EvmBuilder, StateBuilder};
 use revm_primitives::{
@@ -193,8 +193,8 @@ where
         &self,
         commiter: &Mutex<StateAsyncCommit<DB>>,
         task_queue: &LockFreeQueue<Task>,
+        dependency_distance: &Histogram,
     ) {
-        let dependency_distance = histogram!("grevm.dependency_distance");
         let mut start = Instant::now();
         let mut num_commit = 0;
         let mut commiter = commiter.lock();
@@ -271,9 +271,10 @@ where
         let task_queue = LockFreeQueue::new(concurrency_level * 4);
         let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
         commiter.lock().init().map_err(|e| EVMError::Database(e))?;
+        let dependency_distance = histogram!("grevm.dependency_distance");
         thread::scope(|scope| {
             scope.spawn(|| {
-                self.async_commit(&commiter, &task_queue);
+                self.async_commit(&commiter, &task_queue, &dependency_distance);
             });
             scope.spawn(|| {
                 self.assign_tasks(&task_queue);

@@ -57,6 +57,10 @@ harness = false
 name = "mainnet"
 harness = false
 
+[[bench]]
+name = "continuous_blocks"
+harness = false
+
 [profile.release]
 codegen-units = 1
 panic = "abort"
