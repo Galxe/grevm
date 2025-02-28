@@ -190,7 +190,7 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                         other => panic!("Mismatched error!\nPath: {path:?}\nExpected: {other:?}\nGot: {error:?}"),
                     });
                 }
-                // Tests that exepect execution to succeed -> match post state root
+                // Tests that expect execution to succeed -> match post state root
                 (None, Ok(_)) => {
                     let (results, mut state) = executor.take_result_and_state();
                     let state = state.parallel_take_bundle(BundleRetention::Reverts);
