@@ -1,20 +1,253 @@
+use crate::LocationAndType;
+use ahash::AHashSet;
 use core::hash::{BuildHasherDefault, Hasher};
 use dashmap::{mapref::one::RefMut, DashMap, Entry};
+use metrics::histogram;
 use revm::{
     db::{
         states::{bundle_state::BundleRetention, plain_account::PlainStorage, CacheAccount},
-        BundleState, PlainAccount,
+        AccountStatus, BundleState, PlainAccount, StorageWithOriginalValues,
     },
-    TransitionAccount, TransitionState,
+    CacheState, TransitionAccount, TransitionState,
 };
 use revm_primitives::{
     db::{Database, DatabaseCommit, DatabaseRef},
     Account, AccountInfo, Address, Bytecode, EvmState, B256, U256,
 };
-use std::{
-    collections::{hash_map, HashMap},
-    vec::Vec,
-};
+use std::{collections::HashMap, fmt::Formatter, time::Instant, vec::Vec};
+
+#[derive(Debug, Clone)]
+enum CacheValue {
+    Basic(Option<AccountInfo>, AccountStatus),
+    CodeHash(Bytecode),
+    Storage(U256),
+}
+
+impl CacheValue {
+    pub fn get_mut_basic(&mut self) -> (&mut Option<AccountInfo>, &mut AccountStatus) {
+        match self {
+            Self::Basic(account, status) => (account, status),
+            _ => panic!("Should be Basic"),
+        }
+    }
+
+    pub fn get_basic(&self) -> (&Option<AccountInfo>, &AccountStatus) {
+        match self {
+            Self::Basic(account, status) => (account, status),
+            _ => panic!("Should be Basic"),
+        }
+    }
+
+    pub fn get_slot(&self) -> &U256 {
+        match self {
+            Self::Storage(value) => value,
+            _ => panic!("Should be Storage"),
+        }
+    }
+
+    pub fn get_byte_code(&self) -> &Bytecode {
+        match self {
+            Self::CodeHash(byte_code) => byte_code,
+            _ => panic!("Should be Storage"),
+        }
+    }
+
+    /// Increment balance by `balance` amount. Assume that balance will not
+    /// overflow or be zero.
+    ///
+    /// Note: only if balance is zero we would return None as no transition would be made.
+    pub fn increment_balance(&mut self, balance: u128) -> Option<TransitionAccount> {
+        if balance == 0 {
+            return None;
+        }
+        let (_, transition) = self.account_info_change(|info| {
+            info.balance = info.balance.saturating_add(U256::from(balance));
+        });
+        Some(transition)
+    }
+
+    /// Drain balance from account and return drained amount and transition.
+    ///
+    /// Used for DAO hardfork transition.
+    pub fn drain_balance(&mut self) -> (u128, TransitionAccount) {
+        self.account_info_change(|info| {
+            let output = info.balance;
+            info.balance = U256::ZERO;
+            output.try_into().unwrap()
+        })
+    }
+
+    fn account_info_change<T, F: FnOnce(&mut AccountInfo) -> T>(
+        &mut self,
+        change: F,
+    ) -> (T, TransitionAccount) {
+        let (account, status) = self.get_mut_basic();
+        let previous_status = status.clone();
+        let previous_info = account.clone();
+        let mut info = account.take().unwrap_or_default();
+        let output = change(&mut info);
+        *account = Some(info);
+
+        let had_no_nonce_and_code =
+            previous_info.as_ref().map(AccountInfo::has_no_code_and_nonce).unwrap_or_default();
+        *status = status.on_changed(had_no_nonce_and_code);
+
+        (
+            output,
+            TransitionAccount {
+                info: account.clone(),
+                status: status.clone(),
+                previous_info,
+                previous_status,
+                storage: Default::default(),
+                storage_was_destroyed: false,
+            },
+        )
+    }
+
+    /// Consume self and make account as destroyed.
+    ///
+    /// Set account as None and set status to Destroyer or DestroyedAgain.
+    pub fn selfdestruct(&mut self) -> Option<TransitionAccount> {
+        let (account, status) = self.get_mut_basic();
+        // account should be None after selfdestruct so we can take it.
+        let previous_info = account.take();
+        let previous_status = status.clone();
+
+        *status = status.on_selfdestructed();
+
+        if previous_status == AccountStatus::LoadedNotExisting {
+            None
+        } else {
+            Some(TransitionAccount {
+                info: None,
+                status: status.clone(),
+                previous_info,
+                previous_status,
+                storage: Default::default(),
+                storage_was_destroyed: true,
+            })
+        }
+    }
+
+    /// Newly created account.
+    pub fn newly_created(
+        &mut self,
+        new_info: AccountInfo,
+        new_storage: StorageWithOriginalValues,
+    ) -> (TransitionAccount, PlainStorage) {
+        let (account, status) = self.get_mut_basic();
+        let previous_info = account.take();
+        let previous_status = status.clone();
+
+        let new_bundle_storage = new_storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
+
+        *status = status.on_created();
+        let transition_account = TransitionAccount {
+            info: Some(new_info.clone()),
+            status: status.clone(),
+            previous_status,
+            previous_info,
+            storage: new_storage,
+            storage_was_destroyed: false,
+        };
+        *account = Some(new_info);
+        (transition_account, new_bundle_storage)
+    }
+
+    /// Touch empty account, related to EIP-161 state clear.
+    ///
+    /// This account returns the Transition that is used to create the BundleState.
+    pub fn touch_empty_eip161(&mut self) -> Option<TransitionAccount> {
+        let (account, status) = self.get_mut_basic();
+        // Set account to None.
+        let previous_info = account.take();
+        let previous_status = status.clone();
+
+        // Set account state to Destroyed as we need to clear the storage if it exist.
+        *status = status.on_touched_empty_post_eip161();
+
+        if matches!(
+            previous_status,
+            AccountStatus::LoadedNotExisting |
+                AccountStatus::Destroyed |
+                AccountStatus::DestroyedAgain
+        ) {
+            None
+        } else {
+            Some(TransitionAccount {
+                info: None,
+                status: status.clone(),
+                previous_info,
+                previous_status,
+                storage: Default::default(),
+                storage_was_destroyed: true,
+            })
+        }
+    }
+
+    /// Account got touched and before EIP161 state clear this account is considered created.
+    pub fn touch_create_pre_eip161(
+        &mut self,
+        storage: StorageWithOriginalValues,
+    ) -> (Option<TransitionAccount>, PlainStorage) {
+        let (account, status) = self.get_mut_basic();
+        let previous_status = status.clone();
+
+        let had_no_info = account.as_ref().map(|info| info.is_empty()).unwrap_or_default();
+        match status.on_touched_created_pre_eip161(had_no_info) {
+            None => return (None, PlainStorage::default()),
+            Some(new_status) => {
+                *status = new_status;
+            }
+        }
+
+        let plain_storage = storage.iter().map(|(k, v)| (*k, v.present_value)).collect();
+        let previous_info = account.take();
+
+        *account = Some(AccountInfo::default());
+
+        (
+            Some(TransitionAccount {
+                info: Some(AccountInfo::default()),
+                status: status.clone(),
+                previous_info,
+                previous_status,
+                storage,
+                storage_was_destroyed: false,
+            }),
+            plain_storage,
+        )
+    }
+
+    pub fn change(
+        &mut self,
+        new: AccountInfo,
+        storage: StorageWithOriginalValues,
+    ) -> (TransitionAccount, PlainStorage) {
+        let (account, status) = self.get_mut_basic();
+        let previous_info = account.take();
+        let previous_status = status.clone();
+        let new_bundle_storage = storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
+
+        let had_no_nonce_and_code =
+            previous_info.as_ref().map(AccountInfo::has_no_code_and_nonce).unwrap_or_default();
+        *status = status.on_changed(had_no_nonce_and_code);
+        *account = Some(new);
+
+        (
+            TransitionAccount {
+                info: account.clone(),
+                status: status.clone(),
+                previous_info,
+                previous_status,
+                storage,
+                storage_was_destroyed: false,
+            },
+            new_bundle_storage,
+        )
+    }
+}
 
 /// We use the last 8 bytes of an existing hash like address
 /// or code hash instead of rehashing it.
@@ -42,11 +275,8 @@ pub type BuildSuffixHasher = BuildHasherDefault<SuffixHasher>;
 /// It generates transitions that is used to build BundleState.
 #[derive(Clone, Debug)]
 pub struct ParallelCacheState {
-    /// Block state account with account state.
-    pub accounts: DashMap<Address, CacheAccount, BuildSuffixHasher>,
-    /// Created contracts.
-    // TODO add bytecode counter for number of bytecodes added/removed.
-    pub contracts: DashMap<B256, Bytecode, BuildSuffixHasher>,
+    pub cache_data: DashMap<LocationAndType, CacheValue>,
+    storage_slots: DashMap<Address, AHashSet<U256>>,
     /// Has EIP-161 state clear enabled (Spurious Dragon hardfork).
     pub has_state_clear: bool,
 }
@@ -60,7 +290,42 @@ impl Default for ParallelCacheState {
 impl ParallelCacheState {
     /// New default state.
     pub fn new(has_state_clear: bool) -> Self {
-        Self { accounts: DashMap::default(), contracts: DashMap::default(), has_state_clear }
+        Self { cache_data: DashMap::default(), storage_slots: DashMap::default(), has_state_clear }
+    }
+
+    pub fn as_cache_state(&self) -> CacheState {
+        let mut state = CacheState::new(self.has_state_clear);
+        for kv in self.cache_data.iter() {
+            match kv.key() {
+                LocationAndType::Basic(address) => {
+                    let basic = kv.get_basic();
+                    state.accounts.insert(
+                        address.clone(),
+                        CacheAccount {
+                            account: basic
+                                .0
+                                .clone()
+                                .map(|info| PlainAccount { info, storage: PlainStorage::new() }),
+                            status: basic.1.clone(),
+                        },
+                    );
+                }
+                LocationAndType::CodeHash(code_hash) => {
+                    state.contracts.insert(code_hash.clone(), kv.get_byte_code().clone());
+                }
+                _ => {}
+            }
+        }
+        for kv in self.cache_data.iter() {
+            if let LocationAndType::Storage(address, slot) = kv.key() {
+                if let Some(account) = state.accounts.get_mut(address) {
+                    account.account.as_mut().map(|account| {
+                        account.storage.insert(slot.clone(), kv.get_slot().clone());
+                    });
+                }
+            }
+        }
+        state
     }
 
     /// Set state clear flag. EIP-161.
@@ -68,43 +333,33 @@ impl ParallelCacheState {
         self.has_state_clear = has_state_clear;
     }
 
-    /// Helper function that returns all accounts.
-    ///
-    /// Used inside tests to generate merkle tree.
-    pub fn trie_account(&self) -> impl IntoIterator<Item = (Address, PlainAccount)> + '_ {
-        self.accounts.iter().filter_map(|r| {
-            r.value().account.as_ref().map(|plain_acc| (*r.key(), plain_acc.clone()))
-        })
-    }
-
     /// Insert not existing account.
-    pub fn insert_not_existing(&mut self, address: Address) {
-        self.accounts.insert(address, CacheAccount::new_loaded_not_existing());
+    pub fn insert_not_existing(&self, address: Address) {
+        self.cache_data.insert(
+            LocationAndType::Basic(address),
+            CacheValue::Basic(None, AccountStatus::LoadedNotExisting),
+        );
     }
 
     /// Insert Loaded (Or LoadedEmptyEip161 if account is empty) account.
-    pub fn insert_account(&mut self, address: Address, info: AccountInfo) {
+    pub fn insert_account(&self, address: Address, info: AccountInfo) {
         let account = if !info.is_empty() {
-            CacheAccount::new_loaded(info, HashMap::default())
+            CacheValue::Basic(Some(info), AccountStatus::Loaded)
         } else {
-            CacheAccount::new_loaded_empty_eip161(HashMap::default())
+            CacheValue::Basic(Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161)
         };
-        self.accounts.insert(address, account);
+        self.cache_data.insert(LocationAndType::Basic(address), account);
     }
 
     /// Similar to `insert_account` but with storage.
     pub fn insert_account_with_storage(
-        &mut self,
+        &self,
         address: Address,
         info: AccountInfo,
         storage: PlainStorage,
     ) {
-        let account = if !info.is_empty() {
-            CacheAccount::new_loaded(info, storage)
-        } else {
-            CacheAccount::new_loaded_empty_eip161(storage)
-        };
-        self.accounts.insert(address, account);
+        self.update_storage_slot(address, storage);
+        self.insert_account(address, info);
     }
 
     /// Apply output of revm execution and create account transitions that are used to build
@@ -119,6 +374,12 @@ impl ParallelCacheState {
         transitions
     }
 
+    fn get_account_mut(&self, address: Address) -> RefMut<LocationAndType, CacheValue> {
+        self.cache_data
+            .get_mut(&LocationAndType::Basic(address))
+            .expect("All accounts should be present inside cache")
+    }
+
     /// Apply updated account state to the cached account.
     /// Returns account transition if applicable.
     fn apply_account_state(&self, address: Address, account: Account) -> Option<TransitionAccount> {
@@ -126,19 +387,9 @@ impl ParallelCacheState {
         if !account.is_touched() {
             return None;
         }
-
-        let mut this_account =
-            self.accounts.get_mut(&address).expect("All accounts should be present inside cache");
-
-        // If it is marked as selfdestructed inside revm
-        // we need to changed state to destroyed.
-        if account.is_selfdestructed() {
-            return this_account.selfdestruct();
-        }
-
         let is_created = account.is_created();
         let is_empty = account.is_empty();
-
+        let is_destructed = account.is_selfdestructed();
         // transform evm storage to storage with previous value.
         let changed_storage = account
             .storage
@@ -147,36 +398,73 @@ impl ParallelCacheState {
             .map(|(key, slot)| (key, slot.into()))
             .collect();
 
-        // Note: it can happen that created contract get selfdestructed in same block
-        // that is why is_created is checked after selfdestructed
-        //
-        // Note: Create2 opcode (Petersburg) was after state clear EIP (Spurious Dragon)
-        //
-        // Note: It is possibility to create KECCAK_EMPTY contract with some storage
-        // by just setting storage inside CRATE constructor. Overlap of those contracts
-        // is not possible because CREATE2 is introduced later.
-        if is_created {
-            self.contracts
-                .entry(account.info.code_hash)
-                .or_insert_with(|| account.info.code.clone().unwrap());
-            return Some(this_account.newly_created(account.info, changed_storage));
-        }
-
-        // Account is touched, but not selfdestructed or newly created.
-        // Account can be touched and not changed.
-        // And when empty account is touched it needs to be removed from database.
-        // EIP-161 state clear
-        if is_empty {
-            if self.has_state_clear {
-                // touch empty account.
-                this_account.touch_empty_eip161()
-            } else {
-                // if account is empty and state clear is not enabled we should save
-                // empty account.
-                this_account.touch_create_pre_eip161(changed_storage)
+        let (transition, changed_slots) = {
+            // If it is marked as selfdestructed inside revm
+            // we need to changed state to destroyed.
+            if is_destructed {
+                self.clean_storage_slot(address);
+                return self.get_account_mut(address).selfdestruct();
             }
-        } else {
-            Some(this_account.change(account.info, changed_storage))
+
+            // Note: it can happen that created contract get selfdestructed in same block
+            // that is why is_created is checked after selfdestructed
+            //
+            // Note: Create2 opcode (Petersburg) was after state clear EIP (Spurious Dragon)
+            //
+            // Note: It is possibility to create KECCAK_EMPTY contract with some storage
+            // by just setting storage inside CRATE constructor. Overlap of those contracts
+            // is not possible because CREATE2 is introduced later.
+            if is_created {
+                let info = account.info;
+                self.clean_storage_slot(address);
+                let (transition, changed_slots) =
+                    self.get_account_mut(address).newly_created(info.clone(), changed_storage);
+                self.cache_data
+                    .entry(LocationAndType::CodeHash(info.code_hash))
+                    .or_insert_with(|| CacheValue::CodeHash(info.code.clone().unwrap()));
+                (Some(transition), Some(changed_slots))
+            }
+            // Account is touched, but not selfdestructed or newly created.
+            // Account can be touched and not changed.
+            // And when empty account is touched it needs to be removed from database.
+            // EIP-161 state clear
+            else if is_empty {
+                self.clean_storage_slot(address);
+                if self.has_state_clear {
+                    // touch empty account.
+                    (self.get_account_mut(address).touch_empty_eip161(), None)
+                } else {
+                    // if account is empty and state clear is not enabled we should save
+                    // empty account.
+                    let (transition, changed_slots) =
+                        self.get_account_mut(address).touch_create_pre_eip161(changed_storage);
+                    (transition, Some(changed_slots))
+                }
+            } else {
+                let (transition, changed_slots) =
+                    self.get_account_mut(address).change(account.info, changed_storage);
+                (Some(transition), Some(changed_slots))
+            }
+        };
+        if let Some(changed_slots) = changed_slots {
+            self.update_storage_slot(address, changed_slots);
+        }
+        transition
+    }
+
+    fn update_storage_slot(&self, address: Address, storage: PlainStorage) {
+        for (slot, value) in storage {
+            self.cache_data
+                .insert(LocationAndType::Storage(address, slot), CacheValue::Storage(value));
+            self.storage_slots.entry(address).or_default().insert(slot);
+        }
+    }
+
+    fn clean_storage_slot(&self, address: Address) {
+        if let Some((_, slots)) = self.storage_slots.remove(&address) {
+            for slot in slots {
+                self.cache_data.remove(&LocationAndType::Storage(address, slot));
+            }
         }
     }
 }
@@ -203,7 +491,6 @@ pub type BuildIdentityHasher = BuildHasherDefault<IdentityHasher>;
 ///
 /// State clear flag is set inside CacheState and by default it is enabled.
 /// If you want to disable it use `set_state_clear_flag` function.
-#[derive(Debug)]
 pub struct ParallelState<DB> {
     /// Cached state contains both changed from evm execution and cached/loaded account/storages
     /// from database. This allows us to have only one layer of cache where we can fetch data.
@@ -222,29 +509,51 @@ pub struct ParallelState<DB> {
     /// Bundle is used to update database and create changesets.
     /// Bundle state can be set on initialization if we want to use preloaded bundle.
     pub bundle_state: BundleState,
-    /// Addition layer that is going to be used to fetched values before fetching values
-    /// from database.
-    ///
-    /// Bundle is the main output of the state execution and this allows setting previous bundle
-    /// and using its values for execution.
-    pub use_preloaded_bundle: bool,
     /// If EVM asks for block hash we will first check if they are found here.
     /// and then ask the database.
     ///
     /// This map can be used to give different values for block hashes if in case
     /// The fork block is different or some blocks are not saved inside database.
     pub block_hashes: DashMap<u64, B256, BuildIdentityHasher>,
+
+    update_db_metrics: bool,
+    db_latency: metrics::Histogram,
+}
+
+impl<DB> std::fmt::Debug for ParallelState<DB> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParallelState")
+            .field("cache", &self.cache)
+            .field("transition_state", &self.transition_state)
+            .finish()
+    }
 }
 
 impl<DB: DatabaseRef> ParallelState<DB> {
-    pub fn new(database: DB, with_bundle_update: bool) -> Self {
+    pub fn new(database: DB, with_bundle_update: bool, update_db_metrics: bool) -> Self {
         Self {
             cache: ParallelCacheState::default(),
             database,
             transition_state: with_bundle_update.then(TransitionState::default),
             bundle_state: BundleState::default(),
-            use_preloaded_bundle: false,
             block_hashes: DashMap::default(),
+            update_db_metrics,
+            db_latency: histogram!("grevm.db_latency_us"),
+        }
+    }
+
+    fn with_metrics<F, R>(&self, func: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        if self.update_db_metrics {
+            let start = Instant::now();
+            let result = func();
+            let duration = start.elapsed().as_nanos();
+            self.db_latency.record(duration as f64);
+            result
+        } else {
+            func()
         }
     }
 
@@ -272,7 +581,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             if balance == 0 {
                 continue;
             }
-            let mut original_account = self.load_cache_account(address)?;
+            let mut original_account = self.load_mut_cache_account(address)?;
             transitions.push((
                 address,
                 original_account.increment_balance(balance).expect("Balance is not zero"),
@@ -296,7 +605,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         let mut transitions = Vec::new();
         let mut balances = Vec::new();
         for address in addresses {
-            let mut original_account = self.load_cache_account(address)?;
+            let mut original_account = self.load_mut_cache_account(address)?;
             let (balance, transition) = original_account.drain_balance();
             balances.push(balance);
             transitions.push((address, transition))
@@ -313,16 +622,16 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         self.cache.set_state_clear_flag(has_state_clear);
     }
 
-    pub fn insert_not_existing(&mut self, address: Address) {
+    pub fn insert_not_existing(&self, address: Address) {
         self.cache.insert_not_existing(address)
     }
 
-    pub fn insert_account(&mut self, address: Address, info: AccountInfo) {
+    pub fn insert_account(&self, address: Address, info: AccountInfo) {
         self.cache.insert_account(address, info)
     }
 
     pub fn insert_account_with_storage(
-        &mut self,
+        &self,
         address: Address,
         info: AccountInfo,
         storage: PlainStorage,
@@ -351,31 +660,24 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     /// Get a mutable reference to the [`CacheAccount`] for the given address.
     /// If the account is not found in the cache, it will be loaded from the
     /// database and inserted into the cache.
-    pub fn load_cache_account(
+    pub fn load_mut_cache_account(
         &self,
         address: Address,
-    ) -> Result<RefMut<'_, Address, CacheAccount>, DB::Error> {
-        match self.cache.accounts.entry(address) {
-            Entry::Vacant(entry) => {
-                if self.use_preloaded_bundle {
-                    // load account from bundle state
-                    if let Some(account) =
-                        self.bundle_state.account(&address).cloned().map(Into::into)
-                    {
-                        return Ok(entry.insert(account));
-                    }
-                }
-                // if not found in bundle, load it from database
-                let info = self.database.basic_ref(address)?;
-                let account = match info {
-                    None => CacheAccount::new_loaded_not_existing(),
-                    Some(acc) if acc.is_empty() => {
-                        CacheAccount::new_loaded_empty_eip161(HashMap::default())
-                    }
-                    Some(acc) => CacheAccount::new_loaded(acc, HashMap::default()),
-                };
-                Ok(entry.insert(account))
+    ) -> Result<RefMut<'_, LocationAndType, CacheValue>, DB::Error> {
+        let location = LocationAndType::Basic(address);
+        if let Some(account) = self.cache.cache_data.get_mut(&location) {
+            return Ok(account);
+        }
+        let info = self.with_metrics(|| self.database.basic_ref(address))?;
+        let account = match info {
+            None => CacheValue::Basic(None, AccountStatus::LoadedNotExisting),
+            Some(acc) if acc.is_empty() => {
+                CacheValue::Basic(Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161)
             }
+            Some(acc) => CacheValue::Basic(Some(acc), AccountStatus::Loaded),
+        };
+        match self.cache.cache_data.entry(location) {
+            Entry::Vacant(entry) => Ok(entry.insert(account)),
             Entry::Occupied(entry) => Ok(entry.into_ref()),
         }
     }
@@ -395,57 +697,71 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     }
 
     // Database stuff
-    //
     fn db_basic(&self, address: Address) -> Result<Option<AccountInfo>, DB::Error> {
-        self.load_cache_account(address).map(|a| a.account_info())
+        let location = LocationAndType::Basic(address);
+        if let Some(account) = self.cache.cache_data.get(&location) {
+            return Ok(account.get_basic().0.clone());
+        }
+        let info = self.with_metrics(|| self.database.basic_ref(address))?;
+        let account = match info {
+            None => CacheValue::Basic(None, AccountStatus::LoadedNotExisting),
+            Some(acc) if acc.is_empty() => {
+                CacheValue::Basic(Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161)
+            }
+            Some(acc) => CacheValue::Basic(Some(acc), AccountStatus::Loaded),
+        };
+        match self.cache.cache_data.entry(location) {
+            Entry::Vacant(entry) => Ok(entry.insert(account).get_basic().0.clone()),
+            Entry::Occupied(entry) => Ok(entry.into_ref().get_basic().0.clone()),
+        }
     }
 
     fn db_code_by_hash(&self, code_hash: B256) -> Result<Bytecode, DB::Error> {
-        let res = match self.cache.contracts.entry(code_hash) {
-            Entry::Occupied(entry) => Ok(entry.get().clone()),
+        let location = LocationAndType::CodeHash(code_hash);
+        if let Some(code) = self.cache.cache_data.get(&location) {
+            return Ok(code.get_byte_code().clone());
+        }
+        let code = self.with_metrics(|| self.database.code_by_hash_ref(code_hash))?;
+        match self.cache.cache_data.entry(location) {
+            Entry::Occupied(entry) => Ok(entry.get().get_byte_code().clone()),
             Entry::Vacant(entry) => {
-                if self.use_preloaded_bundle {
-                    if let Some(code) = self.bundle_state.contracts.get(&code_hash) {
-                        entry.insert(code.clone());
-                        return Ok(code.clone());
-                    }
-                }
                 // if not found in bundle ask database
-                let code = self.database.code_by_hash_ref(code_hash)?;
-                entry.insert(code.clone());
+                entry.insert(CacheValue::CodeHash(code.clone()));
                 Ok(code)
             }
-        };
-        res
+        }
     }
 
     fn db_storage(&self, address: Address, index: U256) -> Result<U256, DB::Error> {
         // Account is guaranteed to be loaded.
         // Note that storage from bundle is already loaded with account.
-        if let Some(mut account) = self.cache.accounts.get_mut(&address) {
+        let is_storage_known = if let Some(account) =
+            self.cache.cache_data.get(&LocationAndType::Basic(address))
+        {
+            let (_, status) = account.get_basic();
             // account will always be some, but if it is not, U256::ZERO will be returned.
-            let is_storage_known = account.status.is_storage_known();
-            Ok(account
-                .account
-                .as_mut()
-                .map(|account| match account.storage.entry(index) {
-                    hash_map::Entry::Occupied(entry) => Ok(*entry.get()),
-                    hash_map::Entry::Vacant(entry) => {
-                        // if account was destroyed or account is newly built
-                        // we return zero and don't ask database.
-                        let value = if is_storage_known {
-                            U256::ZERO
-                        } else {
-                            self.database.storage_ref(address, index)?
-                        };
-                        entry.insert(value);
-                        Ok(value)
-                    }
-                })
-                .transpose()?
-                .unwrap_or_default())
+            status.is_storage_known()
         } else {
             unreachable!("For accessing any storage account is guaranteed to be loaded beforehand")
+        };
+        let location = LocationAndType::Storage(address, index);
+        if let Some(value) = self.cache.cache_data.get(&location) {
+            return Ok(value.get_slot().clone());
+        }
+        // if account was destroyed or account is newly built
+        // we return zero and don't ask database.
+        let value = if is_storage_known {
+            U256::ZERO
+        } else {
+            self.with_metrics(|| self.database.storage_ref(address, index))?
+        };
+        match self.cache.cache_data.entry(location) {
+            Entry::Occupied(entry) => Ok(*entry.get().get_slot()),
+            Entry::Vacant(entry) => {
+                entry.insert(CacheValue::Storage(value));
+                self.cache.storage_slots.entry(address).or_default().insert(index);
+                Ok(value)
+            }
         }
     }
 
@@ -453,7 +769,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         match self.block_hashes.entry(number) {
             Entry::Occupied(entry) => Ok(*entry.get()),
             Entry::Vacant(entry) => {
-                let ret = *entry.insert(self.database.block_hash_ref(number)?);
+                let ret =
+                    *entry.insert(self.with_metrics(|| self.database.block_hash_ref(number))?);
                 Ok(ret)
             }
         }

@@ -144,7 +144,7 @@ pub(crate) fn compare_evm_execute<DB>(
 
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
-        let state = ParallelState::new(db.clone(), true);
+        let state = ParallelState::new(db.clone(), true, true);
         let mut executor =
             Scheduler::new(SpecId::LATEST, env.clone(), txs.clone(), state, with_hints);
         // set determined partitions
