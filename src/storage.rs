@@ -207,9 +207,9 @@ where
                 let read_account = self.read_accounts.get(address);
                 let has_code = !account.info.is_empty_code_hash();
                 // is newly created contract
-                let new_contract = has_code
-                    && account.info.code.is_some()
-                    && read_account.map_or(true, |account| account.code_hash.is_none());
+                let new_contract = has_code &&
+                    account.info.code.is_some() &&
+                    read_account.map_or(true, |account| account.code_hash.is_none());
                 if new_contract {
                     let location = LocationAndType::Code(address.clone());
                     write_set.insert(location.clone());
@@ -223,9 +223,9 @@ where
                     );
                 }
 
-                if new_contract
-                    || read_account.is_none()
-                    || read_account.is_some_and(|basic| {
+                if new_contract ||
+                    read_account.is_none() ||
+                    read_account.is_some_and(|basic| {
                         basic.nonce != account.info.nonce || basic.balance != account.info.balance
                     })
                 {

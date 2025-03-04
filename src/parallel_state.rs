@@ -15,9 +15,9 @@ use revm_primitives::{
 use std::{fmt::Formatter, time::Instant, vec::Vec};
 
 #[derive(Clone, Debug, Default)]
-struct CacheAccountInfo {
-    account: Option<AccountInfo>,
-    status: AccountStatus,
+pub struct CacheAccountInfo {
+    pub account: Option<AccountInfo>,
+    pub status: AccountStatus,
 }
 
 impl CacheAccountInfo {
@@ -138,9 +138,9 @@ impl CacheAccountInfo {
 
         if matches!(
             previous_status,
-            AccountStatus::LoadedNotExisting
-                | AccountStatus::Destroyed
-                | AccountStatus::DestroyedAgain
+            AccountStatus::LoadedNotExisting |
+                AccountStatus::Destroyed |
+                AccountStatus::DestroyedAgain
         ) {
             None
         } else {
