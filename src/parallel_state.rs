@@ -1,5 +1,3 @@
-use crate::LocationAndType;
-use ahash::AHashSet;
 use core::hash::{BuildHasherDefault, Hasher};
 use dashmap::{mapref::one::RefMut, DashMap, Entry};
 use metrics::histogram;
@@ -12,9 +10,9 @@ use revm::{
 };
 use revm_primitives::{
     db::{Database, DatabaseCommit, DatabaseRef},
-    Account, AccountInfo, Address, Bytecode, EvmState, B256, U256,
+    Account, AccountInfo, Address, Bytecode, EvmState, HashMap, B256, U256,
 };
-use std::{collections::HashMap, fmt::Formatter, time::Instant, vec::Vec};
+use std::{fmt::Formatter, time::Instant, vec::Vec};
 
 #[derive(Clone, Debug, Default)]
 struct CacheAccountInfo {
@@ -140,9 +138,9 @@ impl CacheAccountInfo {
 
         if matches!(
             previous_status,
-            AccountStatus::LoadedNotExisting |
-                AccountStatus::Destroyed |
-                AccountStatus::DestroyedAgain
+            AccountStatus::LoadedNotExisting
+                | AccountStatus::Destroyed
+                | AccountStatus::DestroyedAgain
         ) {
             None
         } else {
@@ -218,24 +216,6 @@ impl CacheAccountInfo {
     }
 }
 
-/// We use the last 8 bytes of an existing hash like address
-/// or code hash instead of rehashing it.
-// TODO: Make sure this is acceptable for production
-#[derive(Debug, Default)]
-pub struct SuffixHasher(u64);
-impl Hasher for SuffixHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        let mut suffix = [0u8; 8];
-        suffix.copy_from_slice(&bytes[bytes.len() - 8..]);
-        self.0 = u64::from_be_bytes(suffix);
-    }
-}
-/// Build a suffix hasher
-pub type BuildSuffixHasher = BuildHasherDefault<SuffixHasher>;
-
 /// Cache state contains both modified and original values.
 ///
 /// Cache state is main state that revm uses to access state.
@@ -278,7 +258,7 @@ impl ParallelCacheState {
                     account: info
                         .account
                         .clone()
-                        .map(|info| PlainAccount { info, storage: PlainStorage::new() }),
+                        .map(|info| PlainAccount { info, storage: PlainStorage::default() }),
                     status: info.status.clone(),
                 },
             );

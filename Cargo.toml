@@ -17,6 +17,7 @@ parking_lot = "0.12"
 
 # Alloy
 alloy-chains = "0.1.18"
+alloy-primitives = { version = "0.8.20", default-features = false, features = ["map-foldhash"] }
 
 # async
 tokio = { version = "1.39", features = ["sync", "macros", "time", "rt-multi-thread"] }
