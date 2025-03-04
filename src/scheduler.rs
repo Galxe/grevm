@@ -7,7 +7,7 @@ use crate::{
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use auto_impl::auto_impl;
 use dashmap::DashMap;
-use metrics::{histogram, Histogram};
+use metrics::histogram;
 use parking_lot::{Mutex, RwLock};
 use revm::{Evm, EvmBuilder, StateBuilder};
 use revm_primitives::{
@@ -193,7 +193,7 @@ where
         &self,
         commiter: &Mutex<StateAsyncCommit<DB>>,
         task_queue: &LockFreeQueue<Task>,
-        dependency_distance: &Histogram,
+        dependency_distance: &metrics::Histogram,
     ) {
         let mut start = Instant::now();
         let mut num_commit = 0;

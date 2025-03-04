@@ -16,40 +16,15 @@ use revm_primitives::{
 };
 use std::{collections::HashMap, fmt::Formatter, time::Instant, vec::Vec};
 
-#[derive(Debug, Clone)]
-enum CacheValue {
-    Basic(Option<AccountInfo>, AccountStatus),
-    CodeHash(Bytecode),
-    Storage(U256),
+#[derive(Clone, Debug, Default)]
+struct CacheAccountInfo {
+    account: Option<AccountInfo>,
+    status: AccountStatus,
 }
 
-impl CacheValue {
-    pub fn get_mut_basic(&mut self) -> (&mut Option<AccountInfo>, &mut AccountStatus) {
-        match self {
-            Self::Basic(account, status) => (account, status),
-            _ => panic!("Should be Basic"),
-        }
-    }
-
-    pub fn get_basic(&self) -> (&Option<AccountInfo>, &AccountStatus) {
-        match self {
-            Self::Basic(account, status) => (account, status),
-            _ => panic!("Should be Basic"),
-        }
-    }
-
-    pub fn get_slot(&self) -> &U256 {
-        match self {
-            Self::Storage(value) => value,
-            _ => panic!("Should be Storage"),
-        }
-    }
-
-    pub fn get_byte_code(&self) -> &Bytecode {
-        match self {
-            Self::CodeHash(byte_code) => byte_code,
-            _ => panic!("Should be Storage"),
-        }
+impl CacheAccountInfo {
+    pub fn new(account: Option<AccountInfo>, status: AccountStatus) -> Self {
+        Self { account, status }
     }
 
     /// Increment balance by `balance` amount. Assume that balance will not
@@ -81,22 +56,21 @@ impl CacheValue {
         &mut self,
         change: F,
     ) -> (T, TransitionAccount) {
-        let (account, status) = self.get_mut_basic();
-        let previous_status = status.clone();
-        let previous_info = account.clone();
-        let mut info = account.take().unwrap_or_default();
+        let previous_status = self.status.clone();
+        let previous_info = self.account.clone();
+        let mut info = self.account.take().unwrap_or_default();
         let output = change(&mut info);
-        *account = Some(info);
+        self.account = Some(info);
 
         let had_no_nonce_and_code =
             previous_info.as_ref().map(AccountInfo::has_no_code_and_nonce).unwrap_or_default();
-        *status = status.on_changed(had_no_nonce_and_code);
+        self.status = self.status.on_changed(had_no_nonce_and_code);
 
         (
             output,
             TransitionAccount {
-                info: account.clone(),
-                status: status.clone(),
+                info: self.account.clone(),
+                status: self.status.clone(),
                 previous_info,
                 previous_status,
                 storage: Default::default(),
@@ -109,19 +83,18 @@ impl CacheValue {
     ///
     /// Set account as None and set status to Destroyer or DestroyedAgain.
     pub fn selfdestruct(&mut self) -> Option<TransitionAccount> {
-        let (account, status) = self.get_mut_basic();
         // account should be None after selfdestruct so we can take it.
-        let previous_info = account.take();
-        let previous_status = status.clone();
+        let previous_info = self.account.take();
+        let previous_status = self.status.clone();
 
-        *status = status.on_selfdestructed();
+        self.status = self.status.on_selfdestructed();
 
         if previous_status == AccountStatus::LoadedNotExisting {
             None
         } else {
             Some(TransitionAccount {
                 info: None,
-                status: status.clone(),
+                status: self.status.clone(),
                 previous_info,
                 previous_status,
                 storage: Default::default(),
@@ -136,22 +109,21 @@ impl CacheValue {
         new_info: AccountInfo,
         new_storage: StorageWithOriginalValues,
     ) -> (TransitionAccount, PlainStorage) {
-        let (account, status) = self.get_mut_basic();
-        let previous_info = account.take();
-        let previous_status = status.clone();
+        let previous_info = self.account.take();
+        let previous_status = self.status.clone();
 
         let new_bundle_storage = new_storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
 
-        *status = status.on_created();
+        self.status = self.status.on_created();
         let transition_account = TransitionAccount {
             info: Some(new_info.clone()),
-            status: status.clone(),
+            status: self.status.clone(),
             previous_status,
             previous_info,
             storage: new_storage,
             storage_was_destroyed: false,
         };
-        *account = Some(new_info);
+        self.account = Some(new_info);
         (transition_account, new_bundle_storage)
     }
 
@@ -159,13 +131,12 @@ impl CacheValue {
     ///
     /// This account returns the Transition that is used to create the BundleState.
     pub fn touch_empty_eip161(&mut self) -> Option<TransitionAccount> {
-        let (account, status) = self.get_mut_basic();
         // Set account to None.
-        let previous_info = account.take();
-        let previous_status = status.clone();
+        let previous_info = self.account.take();
+        let previous_status = self.status.clone();
 
         // Set account state to Destroyed as we need to clear the storage if it exist.
-        *status = status.on_touched_empty_post_eip161();
+        self.status = self.status.on_touched_empty_post_eip161();
 
         if matches!(
             previous_status,
@@ -177,7 +148,7 @@ impl CacheValue {
         } else {
             Some(TransitionAccount {
                 info: None,
-                status: status.clone(),
+                status: self.status.clone(),
                 previous_info,
                 previous_status,
                 storage: Default::default(),
@@ -191,26 +162,25 @@ impl CacheValue {
         &mut self,
         storage: StorageWithOriginalValues,
     ) -> (Option<TransitionAccount>, PlainStorage) {
-        let (account, status) = self.get_mut_basic();
-        let previous_status = status.clone();
+        let previous_status = self.status.clone();
 
-        let had_no_info = account.as_ref().map(|info| info.is_empty()).unwrap_or_default();
-        match status.on_touched_created_pre_eip161(had_no_info) {
+        let had_no_info = self.account.as_ref().map(|info| info.is_empty()).unwrap_or_default();
+        match self.status.on_touched_created_pre_eip161(had_no_info) {
             None => return (None, PlainStorage::default()),
             Some(new_status) => {
-                *status = new_status;
+                self.status = new_status;
             }
         }
 
         let plain_storage = storage.iter().map(|(k, v)| (*k, v.present_value)).collect();
-        let previous_info = account.take();
+        let previous_info = self.account.take();
 
-        *account = Some(AccountInfo::default());
+        self.account = Some(AccountInfo::default());
 
         (
             Some(TransitionAccount {
                 info: Some(AccountInfo::default()),
-                status: status.clone(),
+                status: self.status.clone(),
                 previous_info,
                 previous_status,
                 storage,
@@ -225,20 +195,19 @@ impl CacheValue {
         new: AccountInfo,
         storage: StorageWithOriginalValues,
     ) -> (TransitionAccount, PlainStorage) {
-        let (account, status) = self.get_mut_basic();
-        let previous_info = account.take();
-        let previous_status = status.clone();
+        let previous_info = self.account.take();
+        let previous_status = self.status.clone();
         let new_bundle_storage = storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
 
         let had_no_nonce_and_code =
             previous_info.as_ref().map(AccountInfo::has_no_code_and_nonce).unwrap_or_default();
-        *status = status.on_changed(had_no_nonce_and_code);
-        *account = Some(new);
+        self.status = self.status.on_changed(had_no_nonce_and_code);
+        self.account = Some(new);
 
         (
             TransitionAccount {
-                info: account.clone(),
-                status: status.clone(),
+                info: self.account.clone(),
+                status: self.status.clone(),
                 previous_info,
                 previous_status,
                 storage,
@@ -275,8 +244,9 @@ pub type BuildSuffixHasher = BuildHasherDefault<SuffixHasher>;
 /// It generates transitions that is used to build BundleState.
 #[derive(Clone, Debug)]
 pub struct ParallelCacheState {
-    pub cache_data: DashMap<LocationAndType, CacheValue>,
-    storage_slots: DashMap<Address, AHashSet<U256>>,
+    pub accounts: DashMap<Address, CacheAccountInfo>,
+    pub storage: DashMap<Address, DashMap<U256, U256>>,
+    pub contracts: DashMap<B256, Bytecode>,
     /// Has EIP-161 state clear enabled (Spurious Dragon hardfork).
     pub has_state_clear: bool,
 }
@@ -290,38 +260,42 @@ impl Default for ParallelCacheState {
 impl ParallelCacheState {
     /// New default state.
     pub fn new(has_state_clear: bool) -> Self {
-        Self { cache_data: DashMap::default(), storage_slots: DashMap::default(), has_state_clear }
+        Self {
+            accounts: Default::default(),
+            storage: Default::default(),
+            contracts: Default::default(),
+            has_state_clear,
+        }
     }
 
     pub fn as_cache_state(&self) -> CacheState {
         let mut state = CacheState::new(self.has_state_clear);
-        for kv in self.cache_data.iter() {
-            match kv.key() {
-                LocationAndType::Basic(address) => {
-                    let basic = kv.get_basic();
-                    state.accounts.insert(
-                        address.clone(),
-                        CacheAccount {
-                            account: basic
-                                .0
-                                .clone()
-                                .map(|info| PlainAccount { info, storage: PlainStorage::new() }),
-                            status: basic.1.clone(),
-                        },
-                    );
-                }
-                LocationAndType::CodeHash(code_hash) => {
-                    state.contracts.insert(code_hash.clone(), kv.get_byte_code().clone());
-                }
-                _ => {}
-            }
+        for kv in self.accounts.iter() {
+            let info = kv.value();
+            state.accounts.insert(
+                kv.key().clone(),
+                CacheAccount {
+                    account: info
+                        .account
+                        .clone()
+                        .map(|info| PlainAccount { info, storage: PlainStorage::new() }),
+                    status: info.status.clone(),
+                },
+            );
         }
-        for kv in self.cache_data.iter() {
-            if let LocationAndType::Storage(address, slot) = kv.key() {
-                if let Some(account) = state.accounts.get_mut(address) {
-                    account.account.as_mut().map(|account| {
-                        account.storage.insert(slot.clone(), kv.get_slot().clone());
-                    });
+        for kv in self.contracts.iter() {
+            state.contracts.insert(kv.key().clone(), kv.value().clone());
+        }
+        for kv in self.storage.iter() {
+            let address = kv.key().clone();
+            let slots = kv.value();
+            if let Some(account) = state.accounts.get_mut(&address) {
+                if let Some(plain_account) = account.account.as_mut() {
+                    for slot_value in slots.iter() {
+                        plain_account
+                            .storage
+                            .insert(slot_value.key().clone(), slot_value.value().clone());
+                    }
                 }
             }
         }
@@ -335,20 +309,18 @@ impl ParallelCacheState {
 
     /// Insert not existing account.
     pub fn insert_not_existing(&self, address: Address) {
-        self.cache_data.insert(
-            LocationAndType::Basic(address),
-            CacheValue::Basic(None, AccountStatus::LoadedNotExisting),
-        );
+        self.accounts
+            .insert(address, CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting));
     }
 
     /// Insert Loaded (Or LoadedEmptyEip161 if account is empty) account.
     pub fn insert_account(&self, address: Address, info: AccountInfo) {
         let account = if !info.is_empty() {
-            CacheValue::Basic(Some(info), AccountStatus::Loaded)
+            CacheAccountInfo::new(Some(info), AccountStatus::Loaded)
         } else {
-            CacheValue::Basic(Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161)
+            CacheAccountInfo::new(Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161)
         };
-        self.cache_data.insert(LocationAndType::Basic(address), account);
+        self.accounts.insert(address, account);
     }
 
     /// Similar to `insert_account` but with storage.
@@ -374,10 +346,8 @@ impl ParallelCacheState {
         transitions
     }
 
-    fn get_account_mut(&self, address: Address) -> RefMut<LocationAndType, CacheValue> {
-        self.cache_data
-            .get_mut(&LocationAndType::Basic(address))
-            .expect("All accounts should be present inside cache")
+    fn get_account_mut(&self, address: Address) -> RefMut<Address, CacheAccountInfo> {
+        self.accounts.get_mut(&address).expect("All accounts should be present inside cache")
     }
 
     /// Apply updated account state to the cached account.
@@ -402,7 +372,7 @@ impl ParallelCacheState {
             // If it is marked as selfdestructed inside revm
             // we need to changed state to destroyed.
             if is_destructed {
-                self.clean_storage_slot(address);
+                self.storage.remove(&address);
                 return self.get_account_mut(address).selfdestruct();
             }
 
@@ -416,12 +386,10 @@ impl ParallelCacheState {
             // is not possible because CREATE2 is introduced later.
             if is_created {
                 let info = account.info;
-                self.clean_storage_slot(address);
+                self.storage.remove(&address);
                 let (transition, changed_slots) =
                     self.get_account_mut(address).newly_created(info.clone(), changed_storage);
-                self.cache_data
-                    .entry(LocationAndType::CodeHash(info.code_hash))
-                    .or_insert_with(|| CacheValue::CodeHash(info.code.clone().unwrap()));
+                self.contracts.entry(info.code_hash).or_insert_with(|| info.code.clone().unwrap());
                 (Some(transition), Some(changed_slots))
             }
             // Account is touched, but not selfdestructed or newly created.
@@ -429,7 +397,7 @@ impl ParallelCacheState {
             // And when empty account is touched it needs to be removed from database.
             // EIP-161 state clear
             else if is_empty {
-                self.clean_storage_slot(address);
+                self.storage.remove(&address);
                 if self.has_state_clear {
                     // touch empty account.
                     (self.get_account_mut(address).touch_empty_eip161(), None)
@@ -453,18 +421,12 @@ impl ParallelCacheState {
     }
 
     fn update_storage_slot(&self, address: Address, storage: PlainStorage) {
+        let slots = match self.storage.entry(address) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => entry.insert(Default::default()),
+        };
         for (slot, value) in storage {
-            self.cache_data
-                .insert(LocationAndType::Storage(address, slot), CacheValue::Storage(value));
-            self.storage_slots.entry(address).or_default().insert(slot);
-        }
-    }
-
-    fn clean_storage_slot(&self, address: Address) {
-        if let Some((_, slots)) = self.storage_slots.remove(&address) {
-            for slot in slots {
-                self.cache_data.remove(&LocationAndType::Storage(address, slot));
-            }
+            slots.insert(slot, value);
         }
     }
 }
@@ -663,20 +625,20 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     pub fn load_mut_cache_account(
         &self,
         address: Address,
-    ) -> Result<RefMut<'_, LocationAndType, CacheValue>, DB::Error> {
-        let location = LocationAndType::Basic(address);
-        if let Some(account) = self.cache.cache_data.get_mut(&location) {
+    ) -> Result<RefMut<'_, Address, CacheAccountInfo>, DB::Error> {
+        if let Some(account) = self.cache.accounts.get_mut(&address) {
             return Ok(account);
         }
         let info = self.with_metrics(|| self.database.basic_ref(address))?;
         let account = match info {
-            None => CacheValue::Basic(None, AccountStatus::LoadedNotExisting),
-            Some(acc) if acc.is_empty() => {
-                CacheValue::Basic(Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161)
-            }
-            Some(acc) => CacheValue::Basic(Some(acc), AccountStatus::Loaded),
+            None => CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting),
+            Some(acc) if acc.is_empty() => CacheAccountInfo::new(
+                Some(AccountInfo::default()),
+                AccountStatus::LoadedEmptyEIP161,
+            ),
+            Some(acc) => CacheAccountInfo::new(Some(acc), AccountStatus::Loaded),
         };
-        match self.cache.cache_data.entry(location) {
+        match self.cache.accounts.entry(address) {
             Entry::Vacant(entry) => Ok(entry.insert(account)),
             Entry::Occupied(entry) => Ok(entry.into_ref()),
         }
@@ -698,56 +660,54 @@ impl<DB: DatabaseRef> ParallelState<DB> {
 
     // Database stuff
     fn db_basic(&self, address: Address) -> Result<Option<AccountInfo>, DB::Error> {
-        let location = LocationAndType::Basic(address);
-        if let Some(account) = self.cache.cache_data.get(&location) {
-            return Ok(account.get_basic().0.clone());
+        if let Some(account) = self.cache.accounts.get(&address) {
+            return Ok(account.account.clone());
         }
         let info = self.with_metrics(|| self.database.basic_ref(address))?;
         let account = match info {
-            None => CacheValue::Basic(None, AccountStatus::LoadedNotExisting),
-            Some(acc) if acc.is_empty() => {
-                CacheValue::Basic(Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161)
-            }
-            Some(acc) => CacheValue::Basic(Some(acc), AccountStatus::Loaded),
+            None => CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting),
+            Some(acc) if acc.is_empty() => CacheAccountInfo::new(
+                Some(AccountInfo::default()),
+                AccountStatus::LoadedEmptyEIP161,
+            ),
+            Some(acc) => CacheAccountInfo::new(Some(acc), AccountStatus::Loaded),
         };
-        match self.cache.cache_data.entry(location) {
-            Entry::Vacant(entry) => Ok(entry.insert(account).get_basic().0.clone()),
-            Entry::Occupied(entry) => Ok(entry.into_ref().get_basic().0.clone()),
+        match self.cache.accounts.entry(address) {
+            Entry::Vacant(entry) => Ok(entry.insert(account).account.clone()),
+            Entry::Occupied(entry) => Ok(entry.into_ref().account.clone()),
         }
     }
 
     fn db_code_by_hash(&self, code_hash: B256) -> Result<Bytecode, DB::Error> {
-        let location = LocationAndType::CodeHash(code_hash);
-        if let Some(code) = self.cache.cache_data.get(&location) {
-            return Ok(code.get_byte_code().clone());
+        if let Some(code) = self.cache.contracts.get(&code_hash) {
+            return Ok(code.value().clone());
         }
         let code = self.with_metrics(|| self.database.code_by_hash_ref(code_hash))?;
-        match self.cache.cache_data.entry(location) {
-            Entry::Occupied(entry) => Ok(entry.get().get_byte_code().clone()),
+        match self.cache.contracts.entry(code_hash) {
+            Entry::Occupied(entry) => Ok(entry.get().clone()),
             Entry::Vacant(entry) => {
                 // if not found in bundle ask database
-                entry.insert(CacheValue::CodeHash(code.clone()));
+                entry.insert(code.clone());
                 Ok(code)
             }
         }
     }
 
     fn db_storage(&self, address: Address, index: U256) -> Result<U256, DB::Error> {
+        if let Some(slots) = self.cache.storage.get(&address) {
+            if let Some(value) = slots.get(&index) {
+                return Ok(value.value().clone());
+            }
+        }
         // Account is guaranteed to be loaded.
         // Note that storage from bundle is already loaded with account.
-        let is_storage_known = if let Some(account) =
-            self.cache.cache_data.get(&LocationAndType::Basic(address))
-        {
-            let (_, status) = account.get_basic();
+        let is_storage_known = if let Some(account) = self.cache.accounts.get(&address) {
             // account will always be some, but if it is not, U256::ZERO will be returned.
-            status.is_storage_known()
+            account.status.is_storage_known() || account.account.is_none()
         } else {
             unreachable!("For accessing any storage account is guaranteed to be loaded beforehand")
         };
-        let location = LocationAndType::Storage(address, index);
-        if let Some(value) = self.cache.cache_data.get(&location) {
-            return Ok(value.get_slot().clone());
-        }
+
         // if account was destroyed or account is newly built
         // we return zero and don't ask database.
         let value = if is_storage_known {
@@ -755,14 +715,17 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         } else {
             self.with_metrics(|| self.database.storage_ref(address, index))?
         };
-        match self.cache.cache_data.entry(location) {
-            Entry::Occupied(entry) => Ok(*entry.get().get_slot()),
-            Entry::Vacant(entry) => {
-                entry.insert(CacheValue::Storage(value));
-                self.cache.storage_slots.entry(address).or_default().insert(index);
-                Ok(value)
+        let value = if let Some(slots) = self.cache.storage.get(&address) {
+            slots.entry(index).or_insert(value).value().clone()
+        } else {
+            match self.cache.storage.entry(address) {
+                Entry::Occupied(entry) => entry.get().entry(index).or_insert(value).value().clone(),
+                Entry::Vacant(entry) => {
+                    entry.insert(Default::default()).entry(index).or_insert(value).value().clone()
+                }
             }
-        }
+        };
+        Ok(value)
     }
 
     fn db_block_hash(&self, number: u64) -> Result<B256, DB::Error> {
