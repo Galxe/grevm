@@ -9,7 +9,7 @@ mod utils;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use lazy_static::lazy_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use revm_primitives::{AccountInfo, Address, Bytecode, EVMResult, B256, U256};
+use revm_primitives::{AccountInfo, Address, Bytecode, EVMError, EVMResult, B256, U256};
 use std::{cmp::min, thread};
 
 lazy_static! {
@@ -45,7 +45,7 @@ struct TxVersion {
 }
 
 impl TxVersion {
-    pub fn new(txid: TxId, incarnation: usize) -> Self {
+    pub(crate) fn new(txid: TxId, incarnation: usize) -> Self {
         Self { txid, incarnation }
     }
 }
@@ -121,6 +121,15 @@ enum AbortReason {
     EvmError,
     SelfDestructed,
     FallbackSequential,
+}
+
+/// Grevm error type.
+#[derive(Debug, Clone)]
+pub struct GrevmError<DBError> {
+    /// The transaction id that caused the error.
+    pub txid: TxId,
+    /// The error that occurred.
+    pub error: EVMError<DBError>,
 }
 
 /// Utility function for parallel execution using fork-join pattern.

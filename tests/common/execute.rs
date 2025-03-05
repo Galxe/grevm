@@ -18,7 +18,7 @@ use revm_primitives::{EnvWithHandlerCfg, ResultAndState};
 use std::{
     cmp::min,
     collections::{BTreeMap, HashMap},
-    fmt::Debug,
+    fmt::{Debug, Display},
     fs::{self, File},
     io::{BufReader, BufWriter},
     sync::Arc,
