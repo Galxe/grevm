@@ -211,7 +211,7 @@ where
                         let tx = self.tx_results[num_commit].lock();
                         let result = tx.as_ref().unwrap().execute_result.clone();
                         let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
-                        commiter.commit(self.txs[num_commit].clone(), result);
+                        commiter.commit(num_commit, &self.txs[num_commit], result);
                         if commiter.commit_result().is_err() {
                             self.abort(AbortReason::EvmError);
                             return;
