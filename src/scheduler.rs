@@ -210,7 +210,11 @@ where
                         let tx = self.tx_results[num_commit].lock();
                         let result = tx.as_ref().unwrap().execute_result.clone();
                         let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
-                        commiter.commit(result);
+                        commiter.commit(self.txs[num_commit].clone(), result);
+                        if commiter.commit_result().is_err() {
+                            self.abort(AbortReason::EvmError);
+                            return;
+                        }
                     }
                     let tx = self.tx_states[num_commit].lock();
                     if tx.incarnation > 1 {
@@ -308,7 +312,13 @@ where
                 });
             }
         });
-        self.results.lock().extend(commiter.lock().take_result());
+        {
+            let mut commiter = commiter.lock();
+            if let Err(e) = commiter.commit_result() {
+                return Err(e.clone());
+            }
+            self.results.lock().extend(commiter.take_result());
+        }
         self.post_execute()?;
         self.metrics.report();
         Ok(())

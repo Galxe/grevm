@@ -5,8 +5,9 @@ use revm::{
 };
 use revm_primitives::{
     db::{Database, DatabaseCommit, DatabaseRef},
-    Address, ExecutionResult, ResultAndState,
+    AccountInfo, Address, EVMError, ExecutionResult, InvalidTransaction, ResultAndState, TxEnv,
 };
+use std::cmp::Ordering;
 
 pub struct StateAsyncCommit<'a, DB>
 where
@@ -15,6 +16,7 @@ where
     coinbase: Address,
     results: Vec<ExecutionResult>,
     state: &'a ParallelState<DB>,
+    commit_result: Result<(), EVMError<DB::Error>>,
 }
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
@@ -22,7 +24,7 @@ where
     DB: DatabaseRef,
 {
     pub fn new(coinbase: Address, state: &'a ParallelState<DB>) -> Self {
-        Self { coinbase, results: vec![], state }
+        Self { coinbase, results: vec![], state, commit_result: Ok(()) }
     }
 
     fn state_mut(&self) -> &mut ParallelState<DB> {
@@ -56,7 +58,41 @@ where
         self.state_mut().take_bundle()
     }
 
-    pub fn commit(&mut self, result_and_state: ResultAndState) {
+    pub fn commit_result(&self) -> &Result<(), EVMError<DB::Error>> {
+        &self.commit_result
+    }
+
+    pub fn commit(&mut self, tx_env: TxEnv, result_and_state: ResultAndState) {
+        // check nonce
+        if let Some(tx) = tx_env.nonce {
+            match self.state.basic_ref(tx_env.caller) {
+                Ok(info) => {
+                    if let Some(info) = info {
+                        let state = info.nonce;
+                        match tx.cmp(&state) {
+                            Ordering::Greater => {
+                                self.commit_result =
+                                    Err(EVMError::Transaction(InvalidTransaction::NonceTooHigh {
+                                        tx,
+                                        state,
+                                    }));
+                            }
+                            Ordering::Less => {
+                                self.commit_result =
+                                    Err(EVMError::Transaction(InvalidTransaction::NonceTooLow {
+                                        tx,
+                                        state,
+                                    }));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.commit_result = Err(EVMError::Database(e));
+                }
+            }
+        }
         let ResultAndState { result, state, rewards } = result_and_state;
         self.results.push(result);
         self.state_mut().commit(state);
