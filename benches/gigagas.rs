@@ -16,7 +16,7 @@ use crate::{
 use alloy_chains::NamedChain;
 use common::storage::InMemoryDB;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use fastrace::{collector::Config, prelude::*};
+use fastrace::collector::Config;
 use fastrace_jaeger::JaegerReporter;
 use grevm::{ParallelState, Scheduler};
 use metrics::{SharedString, Unit};

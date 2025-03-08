@@ -42,7 +42,7 @@ impl ParallelBundleState for BundleState {
         let reverts: Vec<Option<(Address, AccountRevert)>> = vec![None; reverts_capacity];
         let bundle_state: Vec<Option<(Address, BundleAccount)>> = vec![None; transitions.len()];
         let state_size = AtomicUsize::new(0);
-        let contracts = Mutex::new(std::collections::HashMap::new());
+        let contracts = Mutex::new(revm_primitives::HashMap::default());
 
         fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
             #[allow(invalid_reference_casting)]
