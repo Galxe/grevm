@@ -1,22 +1,22 @@
 use crate::{
     async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::LockFreeQueue, AbortReason, LocationAndType, MemoryEntry,
-    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
-    TxVersion, CONCURRENT_LEVEL,
+    tx_dependency::TxDependency, utils::LockFreeQueue, AbortReason, GrevmError, LocationAndType,
+    MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
+    TxState, TxVersion, CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use auto_impl::auto_impl;
 use dashmap::DashMap;
 use metrics::histogram;
-use parking_lot::{Mutex, RwLock};
-use revm::{Evm, EvmBuilder, StateBuilder};
+use parking_lot::Mutex;
+use revm::{Evm, EvmBuilder};
 use revm_primitives::{
     db::{DatabaseCommit, DatabaseRef},
-    EVMError, Env, ExecutionResult, SpecId, TxEnv, TxKind,
+    EVMError, Env, ExecutionResult, SpecId, TxEnv,
 };
 use std::{
     cmp::max,
     collections::BTreeMap,
+    fmt::Display,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -24,6 +24,7 @@ use std::{
     thread,
     time::Instant,
 };
+use tracing::*;
 
 pub type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
@@ -210,7 +211,7 @@ where
                         let tx = self.tx_results[num_commit].lock();
                         let result = tx.as_ref().unwrap().execute_result.clone();
                         let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
-                        commiter.commit(self.txs[num_commit].clone(), result);
+                        commiter.commit(num_commit, &self.txs[num_commit], result);
                         if commiter.commit_result().is_err() {
                             self.abort(AbortReason::EvmError);
                             return;
@@ -269,12 +270,12 @@ where
     pub fn parallel_execute(
         &self,
         concurrency_level: Option<usize>,
-    ) -> Result<(), EVMError<DB::Error>> {
+    ) -> Result<(), GrevmError<DB::Error>> {
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
         let task_queue = LockFreeQueue::new(concurrency_level * 4);
         let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
-        commiter.lock().init().map_err(|e| EVMError::Database(e))?;
+        commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
         let dependency_distance = histogram!("grevm.dependency_distance");
         thread::scope(|scope| {
             scope.spawn(|| {
@@ -324,16 +325,16 @@ where
         Ok(())
     }
 
-    fn post_execute(&self) -> Result<(), EVMError<DB::Error>> {
+    fn post_execute(&self) -> Result<(), GrevmError<DB::Error>> {
         if self.abort.load(Ordering::Relaxed) {
             if let Some(abort_reason) = self.abort_reason.get() {
                 match abort_reason {
                     AbortReason::EvmError => {
-                        let result =
-                            self.tx_results[self.finality_idx.load(Ordering::Relaxed)].lock();
+                        let txid = self.finality_idx.load(Ordering::Relaxed);
+                        let result = self.tx_results[txid].lock();
                         if let Some(result) = result.as_ref() {
                             if let Err(e) = &result.execute_result {
-                                return Err(e.clone());
+                                return Err(GrevmError { txid, error: e.clone() });
                             }
                         }
                         panic!("Wrong abort transaction")
@@ -347,7 +348,7 @@ where
         Ok(())
     }
 
-    pub fn fallback_sequential(&self) -> Result<(), EVMError<DB::Error>> {
+    pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
         let mut results = self.results.lock();
         let num_commit = results.len();
         if num_commit == self.block_size {
@@ -364,7 +365,8 @@ where
                 .build();
             for txid in num_commit..self.block_size {
                 *evm.tx_mut() = self.txs[txid].clone();
-                let result_and_state = evm.transact()?;
+                let result_and_state =
+                    evm.transact().map_err(|e| GrevmError { txid, error: e.clone() })?;
                 evm.db_mut().commit(result_and_state.state);
                 sequential_results.push(result_and_state.result);
                 self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
