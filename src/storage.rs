@@ -186,12 +186,7 @@ where
                     MemoryValue::SelfDestructed,
                     estimate,
                 );
-                write_set.insert(LocationAndType::Code(address.clone()));
                 write_set.insert(LocationAndType::Basic(address.clone()));
-                self.mv_memory
-                    .entry(LocationAndType::Code(address.clone()))
-                    .or_default()
-                    .insert(self.current_tx.txid, memory_entry.clone());
                 self.mv_memory
                     .entry(LocationAndType::Basic(address.clone()))
                     .or_default()
@@ -281,16 +276,6 @@ where
                         read_version =
                             ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
-                    MemoryValue::SelfDestructed => {
-                        if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
-                            // make sure read after the latest self-destructed
-                            read_version =
-                                ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
-                        } else {
-                            self.accurate_origin = false;
-                            result = Some(Bytecode::default());
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -303,6 +288,21 @@ where
 
         self.read_set.insert(location, read_version);
         Ok(result.expect("No bytecode"))
+    }
+
+    fn clear_destructed_entry(&self, account: Address) {
+        let current_tx = self.current_tx.txid;
+        for mut entry in self.mv_memory.iter_mut() {
+            let destructed = match entry.key() {
+                LocationAndType::Basic(address) => *address == account,
+                LocationAndType::Storage(address, _) => *address == account,
+                LocationAndType::Code(address) => *address == account,
+                LocationAndType::CodeHash(_) => false,
+            };
+            if destructed {
+                *entry.value_mut() = entry.value_mut().split_off(&current_tx);
+            }
+        }
     }
 }
 
@@ -322,6 +322,7 @@ where
             let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, code_hash: None };
             let location = LocationAndType::Basic(address.clone());
             // 1. read from multi-version memory
+            let mut clear_destructed_entry = false;
             if let Some(written_transactions) = self.mv_memory.get(&location) {
                 if let Some((&txid, entry)) =
                     written_transactions.range(..self.current_tx.txid).next_back()
@@ -347,8 +348,7 @@ where
                         MemoryValue::SelfDestructed => {
                             if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
                                 // make sure read after the latest self-destructed
-                                read_version =
-                                    ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                                clear_destructed_entry = true;
                             } else {
                                 self.accurate_origin = false;
                                 result = Some(AccountInfo::default());
@@ -357,6 +357,9 @@ where
                         _ => {}
                     }
                 }
+            }
+            if clear_destructed_entry {
+                self.clear_destructed_entry(address);
             }
             // 2. read from database
             if result.is_none() {
