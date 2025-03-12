@@ -344,6 +344,23 @@ a more conservative scheduling strategy (e.g., **Task Group**) can help reduce c
 **larger dependency distances** can be processed using fully optimistic execution to maximize parallelism and
 throughput.
 
+The following figure presents the P50 real-world statistics of Ethereum mainnet blocks from 18949719 to 19126587,
+including the following key metrics:  
+`block_size`: The number of transactions included in a block;  
+`conflict_txs`: The number of transactions that conflict when the block is executed fully optimistically;  
+`no_dependency_txs`: The number of transactions in the block without any forward dependencies, with the dependent ratio
+(`dependent_ratio`) calculated as:
+```math
+\text{dependent\_ratio} = \frac{\text{block\_txs - no\_dependency\_txs}}{\text{block\_txs}}
+```
+`dependency_distance`: The dependency distance of transactions with forward dependencies.  
+According to the statistics, the average block size is 160, the `dependent_ratio` is 40%, the `dependency_distance` is 2,
+and the final transaction `conflict_ratio` is approximately 28%. These figures align closely with the simulation results of
+"1Gigagas normal transfer transactions", further validating the optimization effectiveness of grevm2.0 in high-conflict
+scenarios and the accuracy of the theoretical analysis.
+
+![Reth mainnet block statistics](images/reth_mainnet_block_sta.png)
+
 ### Implications of Dependency Distance on DAG Scheduling
 
 When `dependency_distance` is large enough, hints and the dependency DAG play a less critical role, as transactions can
