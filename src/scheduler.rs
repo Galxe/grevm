@@ -242,7 +242,8 @@ where
             if (Instant::now() - start).as_millis() > 8_000 {
                 start = Instant::now();
                 println!(
-                    "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
+                    "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}",
+                    self.env.block.number,
                     self.finality_idx.load(Ordering::Relaxed),
                     self.validation_idx.load(Ordering::Relaxed),
                     self.execution_idx.load(Ordering::Relaxed)
