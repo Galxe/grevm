@@ -67,7 +67,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
-            let state = ParallelState::new(db.clone(), true, true);
+            let state = ParallelState::new(db.clone(), true, false);
             metrics::with_local_recorder(&recorder, || {
                 let mut executor = Scheduler::new(
                     black_box(SpecId::LATEST),

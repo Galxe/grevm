@@ -36,7 +36,7 @@ fn benchmark_mainnet(c: &mut Criterion) {
         group.bench_function("Grevm Parallel", |b| {
             b.iter(|| {
                 let recorder = DebuggingRecorder::new();
-                let state = ParallelState::new(db.clone(), true, true);
+                let state = ParallelState::new(db.clone(), true, false);
                 metrics::with_local_recorder(&recorder, || {
                     let mut executor = Scheduler::new(
                         black_box(env.spec_id()),
