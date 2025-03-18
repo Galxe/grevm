@@ -118,7 +118,7 @@ where
     coinbase: Address,
     db: &'a DB,
     mv_memory: &'a MVMemory,
-    num_commit: &'a AtomicUsize,
+    commit_idx: &'a AtomicUsize,
 
     read_set: HashMap<LocationAndType, ReadVersion>,
     read_accounts: HashMap<Address, AccountBasic>,
@@ -135,13 +135,13 @@ where
         coinbase: Address,
         db: &'a DB,
         mv_memory: &'a MVMemory,
-        num_commit: &'a AtomicUsize,
+        commit_idx: &'a AtomicUsize,
     ) -> Self {
         Self {
             coinbase,
             db,
             mv_memory,
-            num_commit,
+            commit_idx,
             read_set: HashMap::new(),
             read_accounts: HashMap::new(),
             current_tx: TxVersion::new(0, 0),
@@ -315,7 +315,7 @@ where
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut result = None;
         if address == self.coinbase {
-            self.accurate_origin = self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid;
+            self.accurate_origin = self.commit_idx.load(Ordering::Relaxed) == self.current_tx.txid;
             result = self.db.basic_ref(address.clone())?;
         } else {
             let mut read_version = ReadVersion::Storage;
@@ -346,7 +346,7 @@ where
                                 ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                         }
                         MemoryValue::SelfDestructed => {
-                            if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
+                            if self.commit_idx.load(Ordering::Relaxed) == self.current_tx.txid {
                                 // make sure read after the latest self-destructed
                                 clear_destructed_entry = true;
                             } else {

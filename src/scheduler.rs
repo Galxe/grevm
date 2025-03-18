@@ -1,13 +1,16 @@
 use crate::{
-    async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::LockFreeQueue, AbortReason, GrevmError, LocationAndType,
-    MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
-    TxState, TxVersion, CONCURRENT_LEVEL,
+    async_commit::StateAsyncCommit,
+    hint::ParallelExecutionHints,
+    storage::CacheDB,
+    tx_dependency::TxDependency,
+    utils::{ContinuousDetectSet, LockFreeQueue},
+    AbortReason, GrevmError, LocationAndType, MemoryEntry, ParallelState, ReadVersion, Task,
+    TransactionResult, TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use dashmap::DashMap;
 use metrics::histogram;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use revm::{Evm, EvmBuilder};
 use revm_primitives::{
     db::{DatabaseCommit, DatabaseRef},
@@ -125,6 +128,89 @@ impl ExecuteMetricsCollector {
     }
 }
 
+struct SchedulerContext {
+    num_txs: usize,
+    validation_idx: AtomicUsize,
+    finality_idx: AtomicUsize,
+    commit_idx: AtomicUsize,
+    executed_set: ContinuousDetectSet,
+    reset_validation_idx_cnt: AtomicUsize,
+
+    logical_ts: AtomicUsize,
+    lower_ts: Vec<AtomicUsize>,
+    unconfirmed_ts: Vec<AtomicUsize>,
+}
+
+impl SchedulerContext {
+    fn new(num_txs: usize) -> Self {
+        Self {
+            num_txs,
+            validation_idx: AtomicUsize::new(0),
+            finality_idx: AtomicUsize::new(0),
+            commit_idx: AtomicUsize::new(0),
+            executed_set: ContinuousDetectSet::new(num_txs),
+            reset_validation_idx_cnt: AtomicUsize::new(0),
+            logical_ts: AtomicUsize::new(1),
+            lower_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
+            unconfirmed_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
+        }
+    }
+
+    fn reset_validation_idx(&self, index: usize) {
+        if index < self.num_txs {
+            let ts = self.logical_ts.fetch_add(1, Ordering::Relaxed);
+            self.lower_ts[index].fetch_max(ts, Ordering::Release);
+            let prev = self.validation_idx.fetch_min(index, Ordering::Relaxed);
+            if prev > index {
+                self.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn logical_timestamp(&self) -> usize {
+        self.logical_ts.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn executed(&self, index: usize) {
+        self.executed_set.add(index);
+    }
+
+    fn unconfirmed(&self, index: usize, ts: usize) {
+        self.unconfirmed_ts[index].fetch_max(ts, Ordering::Release);
+    }
+
+    fn finished(&self) -> bool {
+        self.finality_idx.load(Ordering::Relaxed) >= self.num_txs
+    }
+
+    fn finality_idx(&self) -> usize {
+        self.finality_idx.load(Ordering::Relaxed)
+    }
+
+    fn validation_idx(&self) -> usize {
+        self.validation_idx.load(Ordering::Relaxed)
+    }
+
+    fn should_shedule(&self, executing_idx: usize) -> bool {
+        let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+        let should_validation =
+            validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx();
+        let should_execution = executing_idx < self.num_txs;
+        should_validation || should_execution
+    }
+
+    fn next_validation_idx(&self, executing_idx: usize) -> Option<usize> {
+        let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+        if validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx() {
+            let validation_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);
+            if validation_idx < self.num_txs {
+                return Some(validation_idx);
+            }
+        }
+        None
+    }
+}
+
 pub struct Scheduler<DB>
 where
     DB: DatabaseRef,
@@ -137,14 +223,10 @@ where
     results: Mutex<Vec<ExecutionResult>>,
     tx_states: Vec<Mutex<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
-    tx_dependency: Mutex<TxDependency>,
+    tx_dependency: TxDependency,
 
     mv_memory: MVMemory,
-
-    finality_idx: AtomicUsize,
-    validation_idx: AtomicUsize,
-    execution_idx: AtomicUsize,
-    num_commit: AtomicUsize,
+    scheduler_ctx: SchedulerContext,
 
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason>,
@@ -178,81 +260,79 @@ where
             results: Mutex::new(vec![]),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
-            tx_dependency: Mutex::new(tx_dependency),
+            tx_dependency,
             mv_memory: MVMemory::new(),
-            finality_idx: AtomicUsize::new(0),
-            validation_idx: AtomicUsize::new(0),
-            execution_idx: AtomicUsize::new(0),
-            num_commit: AtomicUsize::new(0),
+            scheduler_ctx: SchedulerContext::new(num_txs),
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
         }
     }
 
-    fn async_commit(
-        &self,
-        commiter: &Mutex<StateAsyncCommit<DB>>,
-        task_queue: &LockFreeQueue<Task>,
-        dependency_distance: &metrics::Histogram,
-    ) {
+    fn async_commit(&self, commiter: &Mutex<StateAsyncCommit<DB>>) {
         let mut start = Instant::now();
-        let mut num_commit = 0;
+        let mut commit_idx = 0;
+        let mut lower_ts = 0;
         let mut commiter = commiter.lock();
         let async_commit_state =
             std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap());
-        while !self.abort.load(Ordering::Relaxed) && num_commit < self.block_size {
-            let finality_idx = self.finality_idx.load(Ordering::Relaxed);
-            if num_commit == finality_idx {
-                thread::yield_now();
-            } else {
-                while num_commit < finality_idx {
-                    if async_commit_state {
-                        let tx = self.tx_results[num_commit].lock();
-                        let result = tx.as_ref().unwrap().execute_result.clone();
-                        let Ok(result) = result else { panic!("Commit error tx: {}", num_commit) };
-                        commiter.commit(num_commit, &self.txs[num_commit], result);
-                        if commiter.commit_result().is_err() {
-                            self.abort(AbortReason::EvmError);
-                            return;
-                        }
-                    }
-                    let tx = self.tx_states[num_commit].lock();
-                    if tx.incarnation > 1 {
-                        self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Some(dep_id) = tx.dependency {
-                        dependency_distance.record((num_commit - dep_id) as f64);
-                        if tx.incarnation == 1 {
-                            self.metrics
-                                .one_attempt_with_dependency
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else if tx.incarnation > 2 {
-                            self.metrics
-                                .more_attempts_with_dependency
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else {
-                        self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
-                    }
-                    num_commit += 1;
-                    self.num_commit.fetch_add(1, Ordering::Relaxed);
+        let dependency_distance = histogram!("grevm.dependency_distance");
+        while !self.abort.load(Ordering::Relaxed) && commit_idx < self.block_size {
+            while commit_idx < self.block_size && commit_idx < self.scheduler_ctx.validation_idx() {
+                if self.tx_states[commit_idx].lock().status != TransactionStatus::Unconfirmed {
+                    break;
                 }
+                lower_ts =
+                    max(lower_ts, self.scheduler_ctx.lower_ts[commit_idx].load(Ordering::Acquire));
+                if self.scheduler_ctx.unconfirmed_ts[commit_idx].load(Ordering::Acquire) <= lower_ts
+                {
+                    break;
+                }
+                let mut tx_state = self.tx_states[commit_idx].lock();
+                tx_state.status = TransactionStatus::Finality;
+                self.scheduler_ctx.finality_idx.fetch_add(1, Ordering::Relaxed);
+                if async_commit_state {
+                    let tx_result = self.tx_results[commit_idx].lock();
+                    let result = tx_result.as_ref().unwrap().execute_result.clone();
+                    let Ok(result) = result else { panic!("Commit error tx: {}", commit_idx) };
+                    commiter.commit(commit_idx, &self.txs[commit_idx], result);
+                    if commiter.commit_result().is_err() {
+                        self.abort(AbortReason::EvmError);
+                        return;
+                    }
+                }
+
+                if tx_state.incarnation > 1 {
+                    self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(dep_id) = tx_state.dependency {
+                    dependency_distance.record((commit_idx - dep_id) as f64);
+                    if tx_state.incarnation == 1 {
+                        self.metrics.one_attempt_with_dependency.fetch_add(1, Ordering::Relaxed);
+                    } else if tx_state.incarnation > 2 {
+                        self.metrics.more_attempts_with_dependency.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
+                }
+                commit_idx += 1;
+                self.scheduler_ctx.commit_idx.fetch_add(1, Ordering::Relaxed);
             }
+            thread::yield_now();
+
             if (Instant::now() - start).as_millis() > 8_000 {
                 start = Instant::now();
                 println!(
                     "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}",
                     self.env.block.number,
-                    self.finality_idx.load(Ordering::Relaxed),
-                    self.validation_idx.load(Ordering::Relaxed),
-                    self.execution_idx.load(Ordering::Relaxed)
+                    self.scheduler_ctx.finality_idx(),
+                    self.scheduler_ctx.validation_idx(),
+                    self.scheduler_ctx.executed_set.continuous_idx(),
                 );
                 let status: Vec<(TxId, TransactionStatus)> =
                     self.tx_states.iter().map(|s| s.lock().status.clone()).enumerate().collect();
                 println!("transaction status: {:?}", status);
-                self.tx_dependency.lock().print();
-                println!("task queue size: {}", task_queue.len());
+                self.tx_dependency.print();
             }
         }
     }
@@ -273,17 +353,15 @@ where
         concurrency_level: Option<usize>,
     ) -> Result<(), GrevmError<DB::Error>> {
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
-        let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
-        let task_queue = LockFreeQueue::new(concurrency_level * 4);
+        let concurrency_level = concurrency_level.unwrap_or(
+            std::env::var("GREVM_CONCURRENT_LEVEL")
+                .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
+        );
         let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
         commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
-        let dependency_distance = histogram!("grevm.dependency_distance");
         thread::scope(|scope| {
             scope.spawn(|| {
-                self.async_commit(&commiter, &task_queue, &dependency_distance);
-            });
-            scope.spawn(|| {
-                self.assign_tasks(&task_queue);
+                self.async_commit(&commiter);
             });
             for _ in 0..concurrency_level {
                 scope.spawn(|| {
@@ -291,24 +369,21 @@ where
                         self.env.block.coinbase,
                         &self.state,
                         &self.mv_memory,
-                        &self.num_commit,
+                        &self.scheduler_ctx.commit_idx,
                     );
                     let mut evm = EvmBuilder::default()
                         .with_db(&mut cache_db)
                         .with_spec_id(self.spec_id.clone())
                         .with_env(Box::new(self.env.clone()))
                         .build();
-                    while let Some(task) = self.next(&task_queue) {
-                        match task {
-                            Task::Execution(tx_version) => {
-                                self.execute(&mut evm, tx_version);
-                            }
-                            Task::Validation(tx_version) => {
-                                self.validate(tx_version);
-                            }
-                            Task::ExecutionGroup(tx_versions) => {
-                                self.execute_group(&mut evm, tx_versions);
-                            }
+                    let mut task = self.next();
+                    while task.is_some() {
+                        task = match task.unwrap() {
+                            Task::Execution(tx_version) => self.execute(&mut evm, tx_version),
+                            Task::Validation(tx_version) => self.validate(tx_version),
+                        };
+                        if task.is_none() && !self.abort.load(Ordering::Relaxed) {
+                            task = self.next();
                         }
                     }
                 });
@@ -322,6 +397,10 @@ where
             self.results.lock().extend(commiter.take_result());
         }
         self.post_execute()?;
+        self.metrics.reset_validation_idx_cnt.store(
+            self.scheduler_ctx.reset_validation_idx_cnt.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.metrics.report();
         Ok(())
     }
@@ -331,7 +410,7 @@ where
             if let Some(abort_reason) = self.abort_reason.get() {
                 match abort_reason {
                     AbortReason::EvmError => {
-                        let txid = self.finality_idx.load(Ordering::Relaxed);
+                        let txid = self.scheduler_ctx.finality_idx();
                         let result = self.tx_results[txid].lock();
                         if let Some(result) = result.as_ref() {
                             if let Err(e) = &result.execute_result {
@@ -382,42 +461,49 @@ where
         self.abort.store(true, Ordering::Relaxed);
     }
 
-    fn execute_group(
-        &self,
-        evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
-        tx_versions: Vec<TxVersion>,
-    ) {
-        for tx_version in tx_versions {
-            self.execute(evm, tx_version);
-        }
-    }
-
     fn execute(
         &self,
         evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
         tx_version: TxVersion,
-    ) {
-        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-        let num_commit = self.num_commit.load(Ordering::Relaxed);
+    ) -> Option<Task> {
         let TxVersion { txid, incarnation } = tx_version;
+        let mut tx_state = self.tx_states[txid].lock();
+        if tx_state.status != TransactionStatus::Executing {
+            return None;
+        }
+        if tx_state.incarnation != incarnation {
+            panic!("Inconsistent incarnation when execution");
+        }
+        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         let mut tx_env = self.txs[txid].clone();
         tx_env.nonce = None;
         *evm.tx_mut() = tx_env;
+        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Relaxed);
         let result = evm.transact_lazy_reward();
 
+        let mut write_new_locations = false;
+        let mut conflict = false;
+        let mut next = None;
         match result {
             Ok(result_and_state) => {
                 // only the miner involved in transaction should accumulate the rewards of finality
                 // txs return true if the tx doesn't visit the miner account
                 let read_accurate_origin = evm.db().read_accurate_origin();
                 let blocking_txs = evm.db_mut().take_estimate_txs();
-                let conflict = !read_accurate_origin || !blocking_txs.is_empty();
+                conflict = !read_accurate_origin || !blocking_txs.is_empty();
                 let read_set = evm.db_mut().take_read_set();
                 let write_set = evm.db().update_mv_memory(&result_and_state.state, conflict);
 
                 let mut last_result = self.tx_results[txid].lock();
                 if let Some(last_result) = last_result.as_ref() {
+                    for location in write_set.iter() {
+                        if !last_result.write_set.contains(location) {
+                            write_new_locations = true;
+                            break;
+                        }
+                    }
                     for location in &last_result.write_set {
                         if !write_set.contains(location) {
                             if let Some(mut written_transactions) = self.mv_memory.get_mut(location)
@@ -426,22 +512,8 @@ where
                             }
                         }
                     }
-                }
-
-                // update transaction status
-                {
-                    let mut tx_state = self.tx_states[txid].lock();
-                    if tx_state.incarnation != incarnation {
-                        panic!("Inconsistent incarnation when execution");
-                    }
-                    if tx_state.status != TransactionStatus::Executing {
-                        panic!("Wrong executing status: {:?}", tx_state.status);
-                    }
-                    tx_state.status = if conflict {
-                        TransactionStatus::Conflict
-                    } else {
-                        TransactionStatus::Executed
-                    };
+                } else {
+                    write_new_locations = true;
                 }
 
                 if conflict {
@@ -450,15 +522,13 @@ where
                         self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        self.tx_dependency.lock().add(txid, Some(txid - 1));
+                        self.tx_dependency.add(txid, Some(txid - 1));
                     } else {
                         self.metrics.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
-                        self.tx_dependency
-                            .lock()
-                            .add(txid, self.generate_dependent_tx(txid, &read_set));
+                        self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
                 } else {
-                    self.tx_dependency.lock().remove(txid);
+                    next = self.tx_dependency.remove(txid, true);
                 }
                 *last_result = Some(TransactionResult {
                     read_set,
@@ -467,6 +537,7 @@ where
                 });
             }
             Err(e) => {
+                conflict = true;
                 self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
                 self.metrics.conflict_by_error.fetch_add(1, Ordering::Relaxed);
                 let mut write_set = HashSet::new();
@@ -477,36 +548,55 @@ where
                     self.mark_estimate(txid, &write_set);
                 }
 
-                // update transaction status
-                {
-                    let mut tx_state = self.tx_states[txid].lock();
-                    if tx_state.incarnation != incarnation {
-                        panic!("Inconsistent incarnation when execution");
-                    }
-                    if tx_state.status != TransactionStatus::Executing {
-                        panic!("Wrong executing status: {:?}", tx_state.status);
-                    }
-                    tx_state.status = TransactionStatus::Conflict;
-                }
-                self.tx_dependency.lock().add(txid, if txid > 0 { Some(txid - 1) } else { None });
+                self.tx_dependency.add(txid, if txid > 0 { Some(txid - 1) } else { None });
                 *last_result = Some(TransactionResult {
                     read_set: Default::default(),
                     write_set,
                     execute_result: Err(e),
                 });
-                if num_commit == txid {
+                if commit_idx == txid {
                     self.abort(AbortReason::EvmError);
                 }
             }
         }
+
+        tx_state.status =
+            if conflict { TransactionStatus::Conflict } else { TransactionStatus::Executed };
+        self.scheduler_ctx.executed(txid);
+
+        if let Some(next) = next {
+            if txid < self.scheduler_ctx.validation_idx() {
+                self.scheduler_ctx.reset_validation_idx(txid);
+            }
+            drop(tx_state);
+            return self.execution_task(next);
+        }
+        if txid < self.scheduler_ctx.validation_idx() {
+            if conflict {
+                self.scheduler_ctx.reset_validation_idx(txid + 1);
+            } else {
+                if write_new_locations {
+                    self.scheduler_ctx.reset_validation_idx(txid);
+                } else {
+                    tx_state.status = TransactionStatus::Validating;
+                    return Some(Task::Validation(TxVersion::new(txid, incarnation)));
+                }
+            }
+        }
+        None
     }
 
-    fn validate(&self, tx_version: TxVersion) {
-        self.metrics.validation_cnt.fetch_add(1, Ordering::Relaxed);
+    fn validate(&self, tx_version: TxVersion) -> Option<Task> {
         let TxVersion { txid, incarnation } = tx_version;
-        // check the read version of read set
-        let mut conflict = false;
+        let mut tx_state = self.tx_states[txid].lock();
         let tx_result = self.tx_results[txid].lock();
+        if tx_state.status != TransactionStatus::Validating {
+            return None;
+        }
+        if tx_state.incarnation != incarnation {
+            panic!("Inconsistent incarnation when validating");
+        }
+        self.metrics.validation_cnt.fetch_add(1, Ordering::Relaxed);
         let Some(result) = tx_result.as_ref() else {
             panic!("No result when validating");
         };
@@ -514,6 +604,9 @@ where
             panic!("Error transaction should take as conflict before validating");
         }
 
+        let ts = self.scheduler_ctx.logical_timestamp();
+        // check the read version of read set
+        let mut conflict = false;
         let mut dependency: Option<TxId> = None;
         for (location, version) in result.read_set.iter() {
             if let Some(written_transactions) = self.mv_memory.get(location) {
@@ -547,30 +640,29 @@ where
         }
 
         // update transaction status
-        {
-            let mut tx_state = self.tx_states[txid].lock();
-            if tx_state.incarnation != incarnation {
-                panic!("Inconsistent incarnation when validating");
+        tx_state.status = if conflict {
+            if txid < self.scheduler_ctx.validation_idx() {
+                self.scheduler_ctx.reset_validation_idx(txid + 1);
             }
-            if tx_state.status != TransactionStatus::Validating {
-                panic!("Wrong validating status: {:?}", tx_state.status);
-            }
-            tx_state.status =
-                if conflict { TransactionStatus::Conflict } else { TransactionStatus::Unconfirmed };
-            tx_state.dependency = dependency;
-        }
+            TransactionStatus::Conflict
+        } else {
+            self.scheduler_ctx.unconfirmed(txid, ts);
+            TransactionStatus::Unconfirmed
+        };
+        tx_state.dependency = dependency;
 
         if conflict {
             // update dependency
             let dep_tx = dependency.and_then(|dep| {
-                if dep >= self.finality_idx.load(Ordering::Relaxed) {
+                if dep >= self.scheduler_ctx.finality_idx() {
                     Some(dep)
                 } else {
                     None
                 }
             });
-            self.tx_dependency.lock().add(txid, dep_tx);
+            self.tx_dependency.add(txid, dep_tx);
         }
+        None
     }
 
     fn mark_estimate(&self, txid: TxId, write_set: &HashSet<LocationAndType>) {
@@ -595,7 +687,7 @@ where
                 // written_transactions
                 if let Some((&dep_id, _)) = written_transactions.range(..txid).next_back() {
                     if (max_dep_id.is_none() || dep_id > max_dep_id.unwrap()) &&
-                        dep_id >= self.finality_idx.load(Ordering::Relaxed)
+                        dep_id >= self.scheduler_ctx.finality_idx()
                     {
                         max_dep_id = Some(dep_id);
                         if dep_id == txid - 1 {
@@ -608,133 +700,45 @@ where
         max_dep_id
     }
 
-    fn assign_tasks(&self, task_queue: &LockFreeQueue<Task>) {
-        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
-            !self.abort.load(Ordering::Relaxed)
-        {
-            let mut finality_idx = self.finality_idx.load(Ordering::Relaxed);
-            let mut validation_idx = self.validation_idx.load(Ordering::Relaxed);
-            let mut execution_idx = self.execution_idx.load(Ordering::Relaxed);
-            // Confirm the finality and conflict status
-            let origin_finality_idx = finality_idx;
-            if finality_idx < validation_idx {
-                while finality_idx < validation_idx {
-                    let mut tx = self.tx_states[finality_idx].lock();
-                    match tx.status {
-                        TransactionStatus::Unconfirmed => {
-                            tx.status = TransactionStatus::Finality;
-                            finality_idx += 1;
-                            self.finality_idx.fetch_add(1, Ordering::Relaxed);
-                        }
-                        TransactionStatus::Conflict | TransactionStatus::Executed => {
-                            if validation_idx != finality_idx {
-                                self.metrics
-                                    .reset_validation_idx_cnt
-                                    .fetch_add(1, Ordering::Relaxed);
-                                // Subsequent transactions after conflict need to be revalidated
-                                validation_idx = finality_idx;
-                            }
-                            break;
-                        }
-                        _ => {
-                            break;
-                        }
-                    }
-                }
-            }
-            if finality_idx > origin_finality_idx {
-                let mut tx_dependency = self.tx_dependency.lock();
-                for txid in origin_finality_idx..finality_idx {
-                    tx_dependency.commit(txid);
-                }
-            }
-
-            // Prior to submit validation task
-            let mut num_tasks = 0;
-            let num_validation = task_queue.capacity() - task_queue.len();
-            while validation_idx < execution_idx && num_tasks < num_validation {
-                let mut tx = self.tx_states[validation_idx].lock();
-                if matches!(tx.status, TransactionStatus::Executed | TransactionStatus::Unconfirmed)
-                {
-                    tx.status = TransactionStatus::Validating;
-                    task_queue
-                        .push(Task::Validation(TxVersion::new(validation_idx, tx.incarnation)));
-                    num_tasks += 1;
-                    validation_idx += 1;
-                } else {
-                    break;
-                }
-            }
-            self.validation_idx.store(validation_idx, Ordering::Relaxed);
-
-            // Submit execution task
-            let num_execute = task_queue.capacity() - task_queue.len();
-            if num_execute > 0 {
-                let mut tx_dependency = self.tx_dependency.lock();
-                let max_num_tasks = num_execute + num_tasks;
-                while num_tasks < max_num_tasks {
-                    let execution_group = tx_dependency.next(finality_idx);
-                    let group_len = execution_group.len();
-                    if group_len == 0 {
-                        break;
-                    }
-                    if group_len > 64 &&
-                        finality_idx < self.block_size / 2 &&
-                        group_len > (self.block_size - finality_idx) / 2
-                    {
-                        self.abort(AbortReason::FallbackSequential);
-                        return;
-                    }
-                    let mut group = Vec::with_capacity(group_len);
-                    for &execute_id in execution_group.iter() {
-                        if execute_id < finality_idx {
-                            self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                            tx_dependency.commit(execute_id);
-                            continue;
-                        }
-                        let mut tx = self.tx_states[execute_id].lock();
-                        if !matches!(
-                            tx.status,
-                            TransactionStatus::Initial | TransactionStatus::Conflict
-                        ) {
-                            if tx.status != TransactionStatus::Executing {
-                                self.metrics
-                                    .useless_dependent_update
-                                    .fetch_add(1, Ordering::Relaxed);
-                                tx_dependency.remove(execute_id);
-                            }
-                            continue;
-                        }
-                        execution_idx = max(execution_idx, execute_id + 1);
-                        tx.status = TransactionStatus::Executing;
-                        tx.incarnation += 1;
-                        group.push(TxVersion::new(execute_id, tx.incarnation));
-                        num_tasks += 1;
-                    }
-                    num_tasks += group.len();
-                    if group.len() == 1 {
-                        task_queue.push(Task::Execution(group[0].clone()));
-                    } else if group.len() > 1 {
-                        task_queue.push(Task::ExecutionGroup(group));
-                    }
-                }
-            }
-            self.execution_idx.store(execution_idx, Ordering::Relaxed);
-
-            if num_tasks == 0 {
-                thread::yield_now();
-            }
+    fn execution_task(&self, execute_id: TxId) -> Option<Task> {
+        let mut tx = self.tx_states[execute_id].lock();
+        if matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
+            tx.status = TransactionStatus::Executing;
+            tx.incarnation += 1;
+            Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)))
+        } else {
+            self.tx_dependency.remove(execute_id, false);
+            self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
+            None
         }
     }
 
-    pub fn next(&self, task_queue: &LockFreeQueue<Task>) -> Option<Task> {
-        while self.finality_idx.load(Ordering::Relaxed) < self.block_size &&
-            !self.abort.load(Ordering::Relaxed)
-        {
-            if let Some(task) = task_queue.multi_pop() {
-                return Some(task);
-            } else {
+    pub fn next(&self) -> Option<Task> {
+        while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
+            if !self.scheduler_ctx.should_shedule(self.tx_dependency.index()) {
                 thread::yield_now();
+            }
+
+            if let Some(validation_idx) =
+                self.scheduler_ctx.next_validation_idx(self.tx_dependency.index())
+            {
+                let mut tx = self.tx_states[validation_idx].lock();
+                match tx.status {
+                    TransactionStatus::Executed | TransactionStatus::Unconfirmed => {
+                        tx.status = TransactionStatus::Validating;
+                        return Some(Task::Validation(TxVersion::new(
+                            validation_idx,
+                            tx.incarnation,
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(execute_id) = self.tx_dependency.next() {
+                if let Some(task) = self.execution_task(execute_id) {
+                    return Some(task);
+                }
             }
         }
         None
