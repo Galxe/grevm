@@ -67,7 +67,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
-            let state = ParallelState::new(db.clone(), true, true);
+            let state = ParallelState::new(db.clone(), true, false);
             metrics::with_local_recorder(&recorder, || {
                 let mut executor = Scheduler::new(
                     black_box(SpecId::LATEST),
@@ -295,6 +295,7 @@ fn benchmark_gigagas(c: &mut Criterion) {
         bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
         bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
     } else if !filter.is_empty() && filter.contains("worst") {
+        std::env::set_var("WITH_HINTS", "true");
         bench_worst_raw_transfers(c, db_latency_us);
         bench_worst_erc20(c, db_latency_us);
         bench_worst_uniswap(c, db_latency_us, num_eoa, hot_ratio);

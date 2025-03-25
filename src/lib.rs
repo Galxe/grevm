@@ -14,7 +14,7 @@ use std::{cmp::min, thread};
 
 lazy_static! {
     static ref CONCURRENT_LEVEL: usize =
-        thread::available_parallelism().map(|n| n.get()).unwrap_or(8) * 2;
+        thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
 }
 
 type TxId = usize;
@@ -35,7 +35,7 @@ enum TransactionStatus {
 struct TxState {
     pub status: TransactionStatus,
     pub incarnation: usize,
-    pub dependency: Option<usize>,
+    pub dependency: Option<TxId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,7 +108,6 @@ struct TransactionResult<DBError> {
 enum Task {
     Execution(TxVersion),
     Validation(TxVersion),
-    ExecutionGroup(Vec<TxVersion>),
 }
 
 impl Default for Task {
