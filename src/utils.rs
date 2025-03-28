@@ -38,17 +38,21 @@ where
         self.tail.load(Ordering::Acquire) - self.head.load(Ordering::Acquire)
     }
 
+    pub fn full(&self) -> bool {
+        self.tail.load(Ordering::Acquire) - self.head.load(Ordering::Acquire) >= self.capacity
+    }
+
     pub fn push(&self, item: T) {
         loop {
             let head = self.head.load(Ordering::Acquire);
             let tail = self.tail.load(Ordering::Relaxed);
             if tail - head < self.capacity {
                 let loc = unsafe { &mut (*self.buffer[tail % self.capacity].get()) };
-                while !loc.0.load(Ordering::Relaxed) {
+                while !loc.0.load(Ordering::Acquire) {
                     thread::yield_now();
                 }
                 loc.1 = item;
-                loc.0.store(false, Ordering::Relaxed);
+                loc.0.store(false, Ordering::Release);
                 self.tail.store(tail + 1, Ordering::Release);
                 return;
             }
@@ -67,11 +71,11 @@ where
                     .is_ok()
             {
                 let loc = unsafe { &mut (*self.buffer[tail % self.capacity].get()) };
-                while !loc.0.load(Ordering::Relaxed) {
+                while !loc.0.load(Ordering::Acquire) {
                     thread::yield_now();
                 }
                 loc.1 = item;
-                loc.0.store(false, Ordering::Relaxed);
+                loc.0.store(false, Ordering::Release);
                 return;
             }
             thread::yield_now();
@@ -86,11 +90,11 @@ where
             None
         } else {
             let loc = unsafe { &mut (*self.buffer[head % self.capacity].get()) };
-            while loc.0.load(Ordering::Relaxed) {
+            while loc.0.load(Ordering::Acquire) {
                 thread::yield_now();
             }
             let item = std::mem::take(&mut loc.1);
-            loc.0.store(true, Ordering::Relaxed);
+            loc.0.store(true, Ordering::Release);
             self.head.store(head + 1, Ordering::Release);
             Some(item)
         }
@@ -110,11 +114,11 @@ where
                 .is_ok()
             {
                 let loc = unsafe { &mut (*self.buffer[head % self.capacity].get()) };
-                while loc.0.load(Ordering::Relaxed) {
+                while loc.0.load(Ordering::Acquire) {
                     thread::yield_now();
                 }
                 let item = std::mem::take(&mut loc.1);
-                loc.0.store(true, Ordering::Relaxed);
+                loc.0.store(true, Ordering::Release);
                 return Some(item);
             }
             thread::yield_now();

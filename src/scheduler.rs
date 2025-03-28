@@ -665,55 +665,47 @@ where
             self.validation_idx.store(validation_idx, Ordering::Relaxed);
 
             // Submit execution task
-            let num_execute = task_queue.capacity() - task_queue.len();
-            if num_execute > 0 {
-                let mut tx_dependency = self.tx_dependency.lock();
-                let max_num_tasks = num_execute + num_tasks;
-                while num_tasks < max_num_tasks {
-                    let execution_group = tx_dependency.next(finality_idx);
-                    let group_len = execution_group.len();
-                    if group_len == 0 {
-                        break;
+            while !task_queue.full() {
+                let execution_group = self.tx_dependency.lock().next(finality_idx);
+                let group_len = execution_group.len();
+                if group_len == 0 {
+                    break;
+                }
+                if group_len > 64 &&
+                    finality_idx < self.block_size / 2 &&
+                    group_len > (self.block_size - finality_idx) / 2
+                {
+                    self.abort(AbortReason::FallbackSequential);
+                    return;
+                }
+                let mut group = Vec::with_capacity(group_len);
+                for &execute_id in execution_group.iter() {
+                    if execute_id < finality_idx {
+                        self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
+                        self.tx_dependency.lock().commit(execute_id);
+                        continue;
                     }
-                    if group_len > 64 &&
-                        finality_idx < self.block_size / 2 &&
-                        group_len > (self.block_size - finality_idx) / 2
-                    {
-                        self.abort(AbortReason::FallbackSequential);
-                        return;
-                    }
-                    let mut group = Vec::with_capacity(group_len);
-                    for &execute_id in execution_group.iter() {
-                        if execute_id < finality_idx {
+                    let mut tx = self.tx_states[execute_id].lock();
+                    if !matches!(
+                        tx.status,
+                        TransactionStatus::Initial | TransactionStatus::Conflict
+                    ) {
+                        if tx.status != TransactionStatus::Executing {
                             self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                            tx_dependency.commit(execute_id);
-                            continue;
+                            self.tx_dependency.lock().remove(execute_id);
                         }
-                        let mut tx = self.tx_states[execute_id].lock();
-                        if !matches!(
-                            tx.status,
-                            TransactionStatus::Initial | TransactionStatus::Conflict
-                        ) {
-                            if tx.status != TransactionStatus::Executing {
-                                self.metrics
-                                    .useless_dependent_update
-                                    .fetch_add(1, Ordering::Relaxed);
-                                tx_dependency.remove(execute_id);
-                            }
-                            continue;
-                        }
-                        execution_idx = max(execution_idx, execute_id + 1);
-                        tx.status = TransactionStatus::Executing;
-                        tx.incarnation += 1;
-                        group.push(TxVersion::new(execute_id, tx.incarnation));
-                        num_tasks += 1;
+                        continue;
                     }
-                    num_tasks += group.len();
-                    if group.len() == 1 {
-                        task_queue.push(Task::Execution(group[0].clone()));
-                    } else if group.len() > 1 {
-                        task_queue.push(Task::ExecutionGroup(group));
-                    }
+                    execution_idx = max(execution_idx, execute_id + 1);
+                    tx.status = TransactionStatus::Executing;
+                    tx.incarnation += 1;
+                    group.push(TxVersion::new(execute_id, tx.incarnation));
+                }
+                num_tasks += 1;
+                if group.len() == 1 {
+                    task_queue.push(Task::Execution(group[0].clone()));
+                } else if group.len() > 1 {
+                    task_queue.push(Task::ExecutionGroup(group));
                 }
             }
             self.execution_idx.store(execution_idx, Ordering::Relaxed);
