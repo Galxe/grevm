@@ -45,14 +45,24 @@ fn build_block_env(env: &Env) -> BlockEnv {
         blob_excess_gas_and_price: if let Some(current_excess_blob_gas) =
             env.current_excess_blob_gas
         {
-            Some(BlobExcessGasAndPrice::new(current_excess_blob_gas.to()))
-        } else if let (Some(parent_blob_gas_used), Some(parent_excess_blob_gas)) =
-            (env.parent_blob_gas_used, env.parent_excess_blob_gas)
-        {
-            Some(BlobExcessGasAndPrice::new(calc_excess_blob_gas(
-                parent_blob_gas_used.to(),
-                parent_excess_blob_gas.to(),
-            )))
+            Some(BlobExcessGasAndPrice::new(current_excess_blob_gas.to(), false))
+        } else if let (
+            Some(parent_blob_gas_used),
+            Some(parent_excess_blob_gas),
+            Some(parent_target_blobs_per_block),
+        ) = (
+            env.parent_blob_gas_used,
+            env.parent_excess_blob_gas,
+            env.parent_target_blobs_per_block,
+        ) {
+            Some(BlobExcessGasAndPrice::new(
+                calc_excess_blob_gas(
+                    parent_blob_gas_used.to(),
+                    parent_excess_blob_gas.to(),
+                    parent_target_blobs_per_block.to(),
+                ),
+                false,
+            ))
         } else {
             None
         },
@@ -158,8 +168,8 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 }
                 // Remaining tests that expect execution to fail -> match error
                 (Some(exception), Err(error)) => {
-                    println!("Error-Error: {}: {:?}", exception, error.to_string());
-                    let error = error.to_string();
+                    println!("Error-Error: {}: {:?}", exception, error);
+                    let error = error.error.to_string();
                     assert!(match exception {
                         "TransactionException.INSUFFICIENT_ACCOUNT_FUNDS|TransactionException.INTRINSIC_GAS_TOO_LOW" => error == "transaction validation error: call gas cost exceeds the gas limit",
                         "TransactionException.INSUFFICIENT_ACCOUNT_FUNDS" => error.contains("lack of funds"),

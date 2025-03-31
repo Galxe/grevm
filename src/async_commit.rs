@@ -1,11 +1,11 @@
-use crate::{storage::ParallelBundleState, ParallelState};
+use crate::{storage::ParallelBundleState, GrevmError, ParallelState, TxId};
 use revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     TransitionState,
 };
 use revm_primitives::{
     db::{Database, DatabaseCommit, DatabaseRef},
-    AccountInfo, Address, EVMError, ExecutionResult, InvalidTransaction, ResultAndState, TxEnv,
+    Address, EVMError, ExecutionResult, InvalidTransaction, ResultAndState, TxEnv,
 };
 use std::cmp::Ordering;
 
@@ -16,7 +16,7 @@ where
     coinbase: Address,
     results: Vec<ExecutionResult>,
     state: &'a ParallelState<DB>,
-    commit_result: Result<(), EVMError<DB::Error>>,
+    commit_result: Result<(), GrevmError<DB::Error>>,
 }
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
@@ -58,11 +58,11 @@ where
         self.state_mut().take_bundle()
     }
 
-    pub fn commit_result(&self) -> &Result<(), EVMError<DB::Error>> {
+    pub fn commit_result(&self) -> &Result<(), GrevmError<DB::Error>> {
         &self.commit_result
     }
 
-    pub fn commit(&mut self, tx_env: TxEnv, result_and_state: ResultAndState) {
+    pub fn commit(&mut self, txid: TxId, tx_env: &TxEnv, result_and_state: ResultAndState) {
         // check nonce
         if let Some(tx) = tx_env.nonce {
             match self.state.basic_ref(tx_env.caller) {
@@ -71,25 +71,28 @@ where
                         let state = info.nonce;
                         match tx.cmp(&state) {
                             Ordering::Greater => {
-                                self.commit_result =
-                                    Err(EVMError::Transaction(InvalidTransaction::NonceTooHigh {
-                                        tx,
-                                        state,
-                                    }));
+                                self.commit_result = Err(GrevmError {
+                                    txid,
+                                    error: EVMError::Transaction(
+                                        InvalidTransaction::NonceTooHigh { tx, state },
+                                    ),
+                                });
                             }
                             Ordering::Less => {
-                                self.commit_result =
-                                    Err(EVMError::Transaction(InvalidTransaction::NonceTooLow {
+                                self.commit_result = Err(GrevmError {
+                                    txid,
+                                    error: EVMError::Transaction(InvalidTransaction::NonceTooLow {
                                         tx,
                                         state,
-                                    }));
+                                    }),
+                                });
                             }
                             _ => {}
                         }
                     }
                 }
                 Err(e) => {
-                    self.commit_result = Err(EVMError::Database(e));
+                    self.commit_result = Err(GrevmError { txid, error: EVMError::Database(e) })
                 }
             }
         }

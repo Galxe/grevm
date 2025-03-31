@@ -6,8 +6,8 @@ description = "Create Parallel EVM"
 build = "build.rs"
 
 [dependencies]
-revm = { package = "revm", git = "https://github.com/Galxe/revm", branch = "v14.0.2-gravity" }
-revm-primitives = { package = "revm-primitives", git = "https://github.com/Galxe/revm", branch = "v14.0.2-gravity" }
+revm = { package = "revm", git = "https://github.com/Galxe/revm", branch = "v19.5.0-gravity" }
+revm-primitives = { package = "revm-primitives", git = "https://github.com/Galxe/revm", branch = "v19.5.0-gravity" }
 fastrace = "0.7"
 tracing = "0.1.40"
 ahash = { version = "0.8.11", features = ["serde"] }
@@ -17,6 +17,7 @@ parking_lot = "0.12"
 
 # Alloy
 alloy-chains = "0.1.18"
+alloy-primitives = { version = "0.8.20", default-features = false, features = ["map-foldhash"] }
 
 # async
 tokio = { version = "1.39", features = ["sync", "macros", "time", "rt-multi-thread"] }
@@ -37,7 +38,7 @@ criterion = "0.5.1"
 metrics-util = "0.17.0"
 walkdir = "2.5.0"
 rayon = "1.10.0"
-revme = { package = "revme", git = "https://github.com/Galxe/revm", branch = "v14.0.2-gravity" }
+revme = { package = "revme", git = "https://github.com/Galxe/revm", branch = "v19.5.0-gravity" }
 fastrace = { version = "0.7", features = ["enable"] }
 fastrace-jaeger = "0.7"
 tikv-jemallocator = "0.5.0"

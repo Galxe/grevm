@@ -98,7 +98,7 @@ pub(crate) fn generate_contract_accounts(
     accounts.push((swap_router_address, swap_router_account));
     accounts.push((single_swap_address, single_swap_account));
 
-    let mut bytecodes = HashMap::new();
+    let mut bytecodes = revm_primitives::HashMap::default();
     for (_, account) in accounts.iter_mut() {
         let code = account.info.code.take();
         if let Some(code) = code {

@@ -18,7 +18,7 @@ use revm_primitives::{EnvWithHandlerCfg, ResultAndState};
 use std::{
     cmp::min,
     collections::{BTreeMap, HashMap},
-    fmt::Debug,
+    fmt::{Debug, Display},
     fs::{self, File},
     io::{BufReader, BufWriter},
     sync::Arc,
@@ -366,7 +366,7 @@ pub(crate) fn dump_block_env(
                 let mut storage = if let Some(account) = account.account.as_ref() {
                     account.storage.clone()
                 } else {
-                    HashMap::new()
+                    HashMap::default()
                 };
                 storage.extend(
                     transition_account.storage.iter().map(|(k, v)| (*k, v.original_value())),

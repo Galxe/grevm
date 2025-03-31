@@ -72,7 +72,7 @@ impl DatabaseRef for InMemoryDB {
 
 #[derive(Debug, Default)]
 pub struct StorageBuilder {
-    dict: HashMap<U256, U256>,
+    dict: revm_primitives::HashMap<U256, U256>,
 }
 
 impl StorageBuilder {
@@ -112,7 +112,7 @@ impl StorageBuilder {
         *entry = buffer.into();
     }
 
-    pub fn build(self) -> HashMap<U256, U256> {
+    pub fn build(self) -> revm_primitives::HashMap<U256, U256> {
         self.dict
     }
 }
