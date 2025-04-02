@@ -1,3 +1,21 @@
+//! # Grevm
+//!
+//! Grevm is a high-performance, parallelized Ethereum Virtual Machine (EVM) inspired by BlockSTM
+//! designed to handle concurrent transaction execution and validation. It provides utilities for
+//! managing transaction states, dependencies, and memory, while leveraging multi-threading to
+//! maximize throughput.
+//!
+//! ## Concurrency
+//!
+//! Grevm automatically determines the optimal level of concurrency based on the available CPU
+//! cores, but this can be customized as needed. The `CONCURRENT_LEVEL` static variable provides the
+//! default concurrency level.
+//!
+//! ## Error Handling
+//!
+//! Errors during execution are encapsulated in the `GrevmError` type, which includes the
+//! transaction ID and the underlying EVM error. This allows for precise debugging and error
+//! reporting.
 mod async_commit;
 mod hint;
 mod parallel_state;
@@ -69,7 +87,6 @@ struct AccountBasic {
 enum MemoryValue {
     Basic(AccountInfo),
     Code(Bytecode),
-    CodeHash(Bytecode),
     Storage(U256),
     SelfDestructed,
 }
@@ -82,7 +99,7 @@ struct MemoryEntry {
 }
 
 impl MemoryEntry {
-    pub fn new(incarnation: usize, data: MemoryValue, estimate: bool) -> Self {
+    pub(crate) fn new(incarnation: usize, data: MemoryValue, estimate: bool) -> Self {
         Self { incarnation, data, estimate }
     }
 }
@@ -94,8 +111,6 @@ enum LocationAndType {
     Storage(Address, U256),
 
     Code(Address),
-
-    CodeHash(B256),
 }
 
 struct TransactionResult<DBError> {
@@ -118,7 +133,9 @@ impl Default for Task {
 
 enum AbortReason {
     EvmError,
+    #[allow(dead_code)]
     SelfDestructed,
+    #[allow(dead_code)]
     FallbackSequential,
 }
 
@@ -169,7 +186,6 @@ where
     });
 }
 
-pub use async_commit::StateAsyncCommit;
 pub use parallel_state::{ParallelCacheState, ParallelState};
 pub use scheduler::Scheduler;
 pub use storage::{ParallelBundleState, ParallelTakeBundle};
