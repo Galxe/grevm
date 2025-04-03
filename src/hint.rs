@@ -4,7 +4,7 @@ use revm::primitives::{
     alloy_primitives::U160, keccak256, ruint::UintTryFrom, Address, Bytes, TxEnv, TxKind, B256,
     U256,
 };
-use std::{cmp::max, collections::BTreeSet, sync::Arc};
+use std::{cmp::max, sync::Arc};
 
 /// This module provides functionality for parsing and handling execution hints
 /// for parallel transaction execution in the context of Ethereum-like blockchains.

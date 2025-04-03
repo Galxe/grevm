@@ -224,8 +224,11 @@ impl CacheAccountInfo {
 /// It generates transitions that is used to build BundleState.
 #[derive(Clone, Debug)]
 pub struct ParallelCacheState {
+    /// Cached accounts
     pub accounts: DashMap<Address, CacheAccountInfo>,
+    /// Cached storage slots
     pub storage: DashMap<Address, DashMap<U256, U256>>,
+    /// Cache contracts
     pub contracts: DashMap<B256, Bytecode>,
     /// Has EIP-161 state clear enabled (Spurious Dragon hardfork).
     pub has_state_clear: bool,
@@ -248,6 +251,7 @@ impl ParallelCacheState {
         }
     }
 
+    /// Copy the cached data and convert to CacheState
     pub fn as_cache_state(&self) -> CacheState {
         let mut state = CacheState::new(self.has_state_clear);
         for kv in self.accounts.iter() {
@@ -427,12 +431,22 @@ impl Hasher for IdentityHasher {
         self.0 = id as u64;
     }
 }
-pub type BuildIdentityHasher = BuildHasherDefault<IdentityHasher>;
+pub(crate) type BuildIdentityHasher = BuildHasherDefault<IdentityHasher>;
 
 /// State of blockchain.
 ///
 /// State clear flag is set inside CacheState and by default it is enabled.
 /// If you want to disable it use `set_state_clear_flag` function.
+///
+/// Represents the state of a parallelized execution environment, managing
+/// cache, database interactions, and state transitions.
+///
+/// # Type Parameters
+/// - `DB`: A type that implements the `DatabaseRef` trait, representing the database backend.
+///
+/// This struct provides methods for managing account balances, applying
+/// transitions, and interacting with the underlying database. It also supports
+/// metrics collection for database operations.
 pub struct ParallelState<DB> {
     /// Cached state contains both changed from evm execution and cached/loaded account/storages
     /// from database. This allows us to have only one layer of cache where we can fetch data.
@@ -472,6 +486,11 @@ impl<DB> std::fmt::Debug for ParallelState<DB> {
 }
 
 impl<DB: DatabaseRef> ParallelState<DB> {
+    /// Create a ParallelState
+    /// #Parameters
+    /// - `database`: the inner database to read the data not in cache
+    /// - `with_bundle_update`: whether to update the bundle states
+    /// - `update_db_metrics`: whether to report the database latency metrics
     pub fn new(database: DB, with_bundle_update: bool, update_db_metrics: bool) -> Self {
         Self {
             cache: ParallelCacheState::default(),
@@ -564,14 +583,17 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         self.cache.set_state_clear_flag(has_state_clear);
     }
 
+    /// Insert non-existent account
     pub fn insert_not_existing(&self, address: Address) {
         self.cache.insert_not_existing(address)
     }
 
+    /// Insert account with specified `AccountInfo`
     pub fn insert_account(&self, address: Address, info: AccountInfo) {
         self.cache.insert_account(address, info)
     }
 
+    /// Insert account with `AccountInfo` and `PlainStorage`
     pub fn insert_account_with_storage(
         &self,
         address: Address,

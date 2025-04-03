@@ -15,7 +15,14 @@ use revm_primitives::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// A trait that provides functionality for applying state transitions in parallel
+/// and creating reverts for a `BundleState`.
+///
+/// This trait is designed to optimize the process of applying transitions and
+/// generating reverts by leveraging parallelism, especially when dealing with
+/// large sets of transitions.
 pub trait ParallelBundleState {
+    /// apply transitions to create reverts for BundleState in parallel
     fn parallel_apply_transitions_and_create_reverts(
         &mut self,
         transitions: TransitionState,
@@ -97,7 +104,15 @@ impl ParallelBundleState for BundleState {
     }
 }
 
+/// Provides functionality for extracting a `BundleState` from a `ParallelState`
+/// while applying state transitions in parallel.
+///
+/// This trait is designed to optimize the process of taking a `BundleState` by leveraging
+/// parallelism to apply transitions and generate reverts efficiently. It ensures that the
+/// resulting `BundleState` reflects the latest state changes based on the provided retention
+/// policy.
 pub trait ParallelTakeBundle {
+    /// take bundle in parallel
     fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
 }
 
@@ -131,7 +146,7 @@ impl<'a, DB> CacheDB<'a, DB>
 where
     DB: DatabaseRef,
 {
-    pub fn new(
+    pub(crate) fn new(
         coinbase: Address,
         db: &'a DB,
         mv_memory: &'a MVMemory,
@@ -150,7 +165,7 @@ where
         }
     }
 
-    pub fn reset_state(&mut self, tx_version: TxVersion) {
+    pub(crate) fn reset_state(&mut self, tx_version: TxVersion) {
         self.current_tx = tx_version;
         self.read_set.clear();
         self.read_accounts.clear();
@@ -158,15 +173,15 @@ where
         self.estimate_txs.clear();
     }
 
-    pub fn read_accurate_origin(&self) -> bool {
+    pub(crate) fn read_accurate_origin(&self) -> bool {
         self.accurate_origin
     }
 
-    pub fn take_estimate_txs(&mut self) -> HashSet<TxId> {
+    pub(crate) fn take_estimate_txs(&mut self) -> HashSet<TxId> {
         std::mem::take(&mut self.estimate_txs)
     }
 
-    pub fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
+    pub(crate) fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
         std::mem::take(&mut self.read_set)
     }
 
@@ -297,7 +312,6 @@ where
                 LocationAndType::Basic(address) => *address == account,
                 LocationAndType::Storage(address, _) => *address == account,
                 LocationAndType::Code(address) => *address == account,
-                LocationAndType::CodeHash(_) => false,
             };
             if destructed {
                 *entry.value_mut() = entry.value_mut().split_off(&current_tx);
@@ -315,7 +329,7 @@ where
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut result = None;
         if address == self.coinbase {
-            self.accurate_origin = self.commit_idx.load(Ordering::Relaxed) == self.current_tx.txid;
+            self.accurate_origin = self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid;
             result = self.db.basic_ref(address.clone())?;
         } else {
             let mut read_version = ReadVersion::Storage;
@@ -346,7 +360,7 @@ where
                                 ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                         }
                         MemoryValue::SelfDestructed => {
-                            if self.commit_idx.load(Ordering::Relaxed) == self.current_tx.txid {
+                            if self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid {
                                 // make sure read after the latest self-destructed
                                 clear_destructed_entry = true;
                             } else {
