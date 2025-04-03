@@ -1,16 +1,13 @@
 use crate::{
-    async_commit::StateAsyncCommit,
-    hint::ParallelExecutionHints,
-    storage::CacheDB,
-    tx_dependency::TxDependency,
-    utils::{ContinuousDetectSet, LockFreeQueue},
-    AbortReason, GrevmError, LocationAndType, MemoryEntry, ParallelState, ReadVersion, Task,
-    TransactionResult, TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
+    async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
+    tx_dependency::TxDependency, utils::ContinuousDetectSet, AbortReason, GrevmError,
+    LocationAndType, MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult,
+    TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use dashmap::DashMap;
 use metrics::histogram;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use revm::{Evm, EvmBuilder};
 use revm_primitives::{
     db::{DatabaseCommit, DatabaseRef},
@@ -19,7 +16,7 @@ use revm_primitives::{
 use std::{
     cmp::max,
     collections::BTreeMap,
-    fmt::Display,
+    fmt::Debug,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -27,9 +24,8 @@ use std::{
     thread,
     time::Instant,
 };
-use tracing::*;
 
-pub type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
+pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
 struct ExecuteMetrics {
     /// Total number of transactions.
@@ -128,6 +124,14 @@ impl ExecuteMetricsCollector {
     }
 }
 
+/// The `SchedulerContext` provides the execution context for transaction scheduling. The
+/// `validation_idx` parameter serves as the validation cursor, mirroring its functionality in
+/// Block-STM. Unlike Block-STM, Grevm eliminates the execution cursor and instead employs
+/// `TxDependency` to drive transaction execution. Since transaction execution order is determined
+/// by the DAG rather than sequential numbering, Grevm utilizes the `ContinuousDetectSet` to monitor
+/// consecutively executed transactions. Compared to Block-STM where `validation_idx` can be
+/// reached when executing, this approach enables validation right aflter execution while
+/// significantly reducing the number of validation tasks through the ContinuousDetectSet mechanism.
 struct SchedulerContext {
     num_txs: usize,
     validation_idx: AtomicUsize,
@@ -136,6 +140,15 @@ struct SchedulerContext {
     executed_set: ContinuousDetectSet,
     reset_validation_idx_cnt: AtomicUsize,
 
+    // To implement asynchronous transaction commitment (`StateAsyncCommit`), Grevm must handle
+    // complex scenarios like: tx2/tx4 being unconfirmed while tx3 enters conflict state and
+    // requires re-execution (rolling back to `validation_idx`=3). Under high concurrency, if tx3
+    // re-enters unconfirmed state before tx4 begins validation, tx4 might get incorrectly
+    // committed. While locking would be the naive solution, extensive optimization attempts
+    // revealed that even minimal critical sections cause unacceptable
+    // performance degradation(reference: https://github.com/Galxe/grevm/issues/64).
+    // Grevm instead employs logical timestamps to verify transaction availability in unconfirmed
+    // states, maintaining lock-free execution while ensuring correctness.
     logical_ts: AtomicUsize,
     lower_ts: Vec<AtomicUsize>,
     unconfirmed_ts: Vec<AtomicUsize>,
@@ -159,6 +172,8 @@ impl SchedulerContext {
     fn reset_validation_idx(&self, index: usize) {
         if index < self.num_txs {
             let ts = self.logical_ts.fetch_add(1, Ordering::Relaxed);
+            // Rolling back the `validation_idx` implies that the commitment time of subsequent
+            // transactions must be logically later than the current timestamp.
             self.lower_ts[index].fetch_max(ts, Ordering::Release);
             let prev = self.validation_idx.fetch_min(index, Ordering::Relaxed);
             if prev > index {
@@ -211,6 +226,13 @@ impl SchedulerContext {
     }
 }
 
+/// The `Scheduler` struct is responsible for managing the parallel execution of transactions
+/// in a block. It coordinates the execution, validation, and finalization of transactions
+/// while handling dependencies and conflicts between them.
+///
+/// # Type Parameters
+/// - `DB`: A type that implements the `DatabaseRef` trait, representing the database used for
+///   transaction execution.
 pub struct Scheduler<DB>
 where
     DB: DatabaseRef,
@@ -233,11 +255,26 @@ where
     metrics: ExecuteMetricsCollector,
 }
 
+impl<DB> Debug for Scheduler<DB>
+where
+    DB: DatabaseRef,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scheduler")
+            .field("spec_id", &self.spec_id)
+            .field("env", &self.env)
+            .field("block_size", &self.block_size)
+            .field("txs", &self.txs)
+            .finish()
+    }
+}
+
 impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync,
 {
+    /// Create a Scheduler for parallel execution
     pub fn new(
         spec_id: SpecId,
         env: Env,
@@ -284,6 +321,8 @@ where
                 }
                 lower_ts =
                     max(lower_ts, self.scheduler_ctx.lower_ts[commit_idx].load(Ordering::Acquire));
+                // Rolling back the `validation_idx` implies that the commitment time of subsequent
+                // transactions must be logically later than the current timestamp.
                 if self.scheduler_ctx.unconfirmed_ts[commit_idx].load(Ordering::Acquire) <= lower_ts
                 {
                     break;
@@ -315,8 +354,9 @@ where
                 } else {
                     self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
                 }
+                self.scheduler_ctx.commit_idx.fetch_add(1, Ordering::Release);
+                self.tx_dependency.commit(commit_idx);
                 commit_idx += 1;
-                self.scheduler_ctx.commit_idx.fetch_add(1, Ordering::Relaxed);
             }
             thread::yield_now();
 
@@ -344,10 +384,12 @@ where
         }
     }
 
-    pub fn take_result_and_state(mut self) -> (Vec<ExecutionResult>, ParallelState<DB>) {
+    /// Take `ExecutionResult` and `ParallelState`
+    pub fn take_result_and_state(self) -> (Vec<ExecutionResult>, ParallelState<DB>) {
         (self.results.into_inner(), self.state)
     }
 
+    /// Paralle execution
     pub fn parallel_execute(
         &self,
         concurrency_level: Option<usize>,
@@ -391,11 +433,13 @@ where
         });
         {
             let mut commiter = commiter.lock();
+            // Return error if commit failed(check nonce failed)
             if let Err(e) = commiter.commit_result() {
                 return Err(e.clone());
             }
             self.results.lock().extend(commiter.take_result());
         }
+        // Return error if execution failed
         self.post_execute()?;
         self.metrics.reset_validation_idx_cnt.store(
             self.scheduler_ctx.reset_validation_idx_cnt.load(Ordering::Relaxed),
@@ -419,6 +463,16 @@ where
                         }
                         panic!("Wrong abort transaction")
                     }
+                    // Grevm maintains full compatibility with self-destruct operations while
+                    // preserving the ability to fall back to sequential execution when necessary.
+                    // Although this code path remains theoretically unreachable in normal
+                    // operation, we deliberately retain it as a safeguard. Notably, Grevm
+                    // implements an optimized rollback mechanism - when parallel execution fails,
+                    // the system can resume sequential processing from the problematic transaction
+                    // rather than restarting the entire block. This represents a significant
+                    // optimization for rare edge cases, effectively preventing severe performance
+                    // degradation that could otherwise drastically slow down parallel execution
+                    // throughput.
                     AbortReason::SelfDestructed | AbortReason::FallbackSequential => {
                         return self.fallback_sequential();
                     }
@@ -428,6 +482,7 @@ where
         Ok(())
     }
 
+    /// Fallback to sequential execution
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
         let mut results = self.results.lock();
         let num_commit = results.len();
@@ -461,6 +516,12 @@ where
         self.abort.store(true, Ordering::Relaxed);
     }
 
+    /// After execution, transactions are marked as conflict status in three scenarios:
+    /// ​- EVM Execution Failure: The transaction fails during EVM processing
+    /// - ​Read Estimate Data: The transaction accesses uncommitted state estimates
+    /// - ​Unconfirmed Miner/Self-Destruct Accounts: The transaction interacts with miner rewards or
+    ///   self-destructed accounts before their committing transaction is finalized (txid ≠
+    ///   commit_idx)
     fn execute(
         &self,
         evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
@@ -478,13 +539,22 @@ where
 
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         let mut tx_env = self.txs[txid].clone();
+        // Transaction nonces are temporarily set to `None` to bypass the EVM's strict sequential
+        // nonce verification, but the nonce will be checked when transaction commit
         tx_env.nonce = None;
         *evm.tx_mut() = tx_env;
-        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Relaxed);
+        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
         let result = evm.transact_lazy_reward();
 
+        // The `​write_new_locations` mechanism optimizes validation by intelligently reducing
+        // redundant verification tasks. Under standard validation logic, when a conflicted
+        // transaction is re-executed, all subsequent transactions must undergo revalidation.
+        // However, if the re-executed transaction hasn't written to any new storage locations (as
+        // tracked by write_new_locations), subsequent transactions can skip this revalidation
+        // process. This optimization significantly decreases the total number of required
+        // validation tasks.
         let mut write_new_locations = false;
-        let mut conflict = false;
+        let conflict;
         let mut next = None;
         match result {
             Ok(result_and_state) => {
@@ -522,12 +592,29 @@ where
                         self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        self.tx_dependency.add(txid, Some(txid - 1));
+                        self.tx_dependency.key_tx(txid, &self.scheduler_ctx.commit_idx);
                     } else {
                         self.metrics.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
                         self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
                 } else {
+                    // Grevm employs an optimized thread scheduling strategy that differs
+                    // fundamentally from Block-STM's approach while intelligently preserving its
+                    // advantages. Unlike Block-STM where conflicted transactions persistently
+                    // occupy threads through busy-waiting retries, Grevm normally yields the thread
+                    // and re-schedules via DAG - except in critical path scenarios where it
+                    // demonstrates adaptive behavior. When detecting strictly linear dependencies
+                    // (where the next transaction immediately depends on the current one), Grevm
+                    // makes a crucial optimization: it maintains thread continuity by directly
+                    // executing the dependent transaction within the same thread rather than
+                    // yielding. This hybrid approach combines the general efficiency of DAG-based
+                    // scheduling for parallelizable workloads with Block-STM's optimal performance
+                    // for sequential dependency chains, effectively minimizing both thread
+                    // contention and scheduling overhead. The system automatically applies the most
+                    // appropriate execution strategy based on real-time dependency analysis,
+                    // ensuring neither purely optimistic (Block-STM) nor purely DAG-driven
+                    // approaches impose unnecessary performance penalties in their respective
+                    // worst-case scenarios.
                     next = self.tx_dependency.remove(txid, true);
                 }
                 *last_result = Some(TransactionResult {
@@ -547,8 +634,6 @@ where
                     write_set = std::mem::take(&mut last_result.write_set);
                     self.mark_estimate(txid, &write_set);
                 }
-
-                self.tx_dependency.add(txid, if txid > 0 { Some(txid - 1) } else { None });
                 *last_result = Some(TransactionResult {
                     read_set: Default::default(),
                     write_set,
@@ -557,6 +642,7 @@ where
                 if commit_idx == txid {
                     self.abort(AbortReason::EvmError);
                 }
+                self.tx_dependency.key_tx(txid, &self.scheduler_ctx.commit_idx);
             }
         }
 
@@ -713,7 +799,7 @@ where
         }
     }
 
-    pub fn next(&self) -> Option<Task> {
+    fn next(&self) -> Option<Task> {
         while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
             if !self.scheduler_ctx.should_shedule(self.tx_dependency.index()) {
                 thread::yield_now();
