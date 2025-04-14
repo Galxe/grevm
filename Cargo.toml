@@ -28,14 +28,14 @@ lazy_static = "1.5.0"
 dashmap = "6.0"
 
 # metrics
-metrics = "0.23.0"
+metrics = "0.24"
 
 # small vector
 smallvec = "1"
 
 [dev-dependencies]
 criterion = "0.5.1"
-metrics-util = "0.17.0"
+metrics-util = "0.19.0"
 walkdir = "2.5.0"
 rayon = "1.10.0"
 revme = { package = "revme", git = "https://github.com/Galxe/revm", branch = "v19.5.0-gravity" }
