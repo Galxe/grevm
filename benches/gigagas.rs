@@ -16,8 +16,6 @@ use crate::{
 use alloy_chains::NamedChain;
 use common::storage::InMemoryDB;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use fastrace::collector::Config;
-use fastrace_jaeger::JaegerReporter;
 use grevm::{ParallelState, Scheduler};
 use metrics::{SharedString, Unit};
 use metrics_util::{
@@ -276,9 +274,6 @@ fn bench_dependent_raw_transfers(
 }
 
 fn benchmark_gigagas(c: &mut Criterion) {
-    let reporter = JaegerReporter::new("127.0.0.1:6831".parse().unwrap(), "gigagas").unwrap();
-    fastrace::set_reporter(reporter, Config::default());
-
     // TODO(gravity): Create options from toml file if there are more
     let db_latency_us = std::env::var("DB_LATENCY_US").map(|s| s.parse().unwrap()).unwrap_or(0);
     let num_eoa = std::env::var("NUM_EOA").map(|s| s.parse().unwrap()).unwrap_or(100000);
@@ -341,8 +336,6 @@ fn benchmark_gigagas(c: &mut Criterion) {
             bench_dependency_distance(c, db_latency_us, dependency_ratio, dependency_distance);
         }
     }
-
-    fastrace::flush();
 }
 
 fn bench_half_chained_erc20(c: &mut Criterion, db_latency_us: u64) {

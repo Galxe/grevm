@@ -7,12 +7,14 @@ use crate::{
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use dashmap::DashMap;
 use metrics::histogram;
+use metrics_derive::Metrics;
 use parking_lot::Mutex;
 use revm::{Evm, EvmBuilder};
 use revm_primitives::{
     db::{DatabaseCommit, DatabaseRef},
     EVMError, Env, ExecutionResult, SpecId, TxEnv,
 };
+
 use std::{
     cmp::max,
     collections::BTreeMap,
@@ -27,44 +29,38 @@ use std::{
 
 pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
+#[derive(Metrics)]
+#[metrics(scope = "grevm")]
 struct ExecuteMetrics {
-    /// Total number of transactions.
+    /// Total number of transactions
     total_tx_cnt: metrics::Histogram,
+    /// Number of conflict incarnations
     conflict_cnt: metrics::Histogram,
+    /// Number of validation incarnations
     validation_cnt: metrics::Histogram,
+    /// Number of execution incarnations
     execution_cnt: metrics::Histogram,
+    /// Number of validation reset
     reset_validation_idx_cnt: metrics::Histogram,
+    /// Number of useless dependency update
     useless_dependent_update: metrics::Histogram,
 
+    /// Number of conflict by miner&self-destruct
     conflict_by_miner: metrics::Histogram,
+    /// Number of conflict by evm error
     conflict_by_error: metrics::Histogram,
+    /// Number of conflict by estimate
     conflict_by_estimate: metrics::Histogram,
+    /// Number of conflict by version
     conflict_by_version: metrics::Histogram,
+    /// Number of transactions whose incarnation == 1
     one_attempt_with_dependency: metrics::Histogram,
+    /// Number of transactions whose incarnation > 2
     more_attempts_with_dependency: metrics::Histogram,
+    /// Number of transactions without dependency
     no_dependency_txs: metrics::Histogram,
+    /// Number of conflict transactions
     conflict_txs: metrics::Histogram,
-}
-
-impl Default for ExecuteMetrics {
-    fn default() -> Self {
-        Self {
-            total_tx_cnt: histogram!("grevm.total_tx_cnt"),
-            conflict_cnt: histogram!("grevm.conflict_cnt"),
-            validation_cnt: histogram!("grevm.validation_cnt"),
-            execution_cnt: histogram!("grevm.execution_cnt"),
-            reset_validation_idx_cnt: histogram!("grevm.reset_validation_idx_cnt"),
-            useless_dependent_update: histogram!("grevm.useless_dependent_update"),
-            conflict_by_miner: histogram!("grevm.conflict_by_miner"),
-            conflict_by_error: histogram!("grevm.conflict_by_error"),
-            conflict_by_estimate: histogram!("grevm.conflict_by_estimate"),
-            conflict_by_version: histogram!("grevm.conflict_by_version"),
-            one_attempt_with_dependency: histogram!("grevm.one_attempt_with_dependency"),
-            more_attempts_with_dependency: histogram!("grevm.more_attempts_with_dependency"),
-            no_dependency_txs: histogram!("grevm.no_dependency_txs"),
-            conflict_txs: histogram!("grevm.conflict_txs"),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -508,7 +504,7 @@ where
             }
         }
         results.extend(sequential_results);
-        return Ok(());
+        Ok(())
     }
 
     fn abort(&self, abort_reason: AbortReason) {
