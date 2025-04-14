@@ -96,7 +96,6 @@ impl ParallelExecutionHints {
         Self { rw_set: vec![RWSet::new(); txs.len()], txs }
     }
 
-    #[fastrace::trace]
     fn generate_dependency(&self) -> TxDependency {
         let num_txs = self.txs.len();
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
@@ -117,7 +116,6 @@ impl ParallelExecutionHints {
         TxDependency::create(dependent_tx, affect_txs)
     }
 
-    #[fastrace::trace]
     pub(crate) fn parse_hints(&self) -> TxDependency {
         let txs = self.txs.clone();
         // Utilize fork-join utility to process transactions in parallel
