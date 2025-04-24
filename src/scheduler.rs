@@ -61,6 +61,10 @@ struct ExecuteMetrics {
     no_dependency_txs: metrics::Histogram,
     /// Number of conflict transactions
     conflict_txs: metrics::Histogram,
+    /// Executition time(nanosecond)
+    execution_time: metrics::Histogram,
+    /// Commit time(nanosecond)
+    commit_time: metrics::Histogram,
 }
 
 #[derive(Default)]
@@ -80,6 +84,8 @@ struct ExecuteMetricsCollector {
     more_attempts_with_dependency: AtomicUsize,
     no_dependency_txs: AtomicUsize,
     conflict_txs: AtomicUsize,
+    execution_time: AtomicUsize,
+    commit_time: AtomicUsize,
 }
 
 impl ExecuteMetricsCollector {
@@ -117,6 +123,11 @@ impl ExecuteMetricsCollector {
             .no_dependency_txs
             .record(self.no_dependency_txs.load(Ordering::Relaxed) as f64);
         execute_metrics.conflict_txs.record(self.conflict_txs.load(Ordering::Relaxed) as f64);
+        let execution_time = self.execution_time.load(Ordering::Relaxed);
+        if execution_time > 0 {
+            execute_metrics.execution_time.record(execution_time as f64);
+        }
+        execute_metrics.commit_time.record(self.commit_time.load(Ordering::Relaxed) as f64);
     }
 }
 
@@ -148,6 +159,9 @@ struct SchedulerContext {
     logical_ts: AtomicUsize,
     lower_ts: Vec<AtomicUsize>,
     unconfirmed_ts: Vec<AtomicUsize>,
+
+    tasks_on_flight: AtomicUsize,
+    start_time: Instant,
 }
 
 impl SchedulerContext {
@@ -162,6 +176,8 @@ impl SchedulerContext {
             logical_ts: AtomicUsize::new(1),
             lower_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
             unconfirmed_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
+            tasks_on_flight: AtomicUsize::new(0),
+            start_time: Instant::now(),
         }
     }
 
@@ -330,7 +346,11 @@ where
                     let tx_result = self.tx_results[commit_idx].lock();
                     let result = tx_result.as_ref().unwrap().execute_result.clone();
                     let Ok(result) = result else { panic!("Commit error tx: {}", commit_idx) };
+                    let commit_start = Instant::now();
                     commiter.commit(commit_idx, &self.txs[commit_idx], result);
+                    self.metrics
+                        .commit_time
+                        .fetch_add(commit_start.elapsed().as_nanos() as usize, Ordering::Relaxed);
                     if commiter.commit_result().is_err() {
                         self.abort(AbortReason::EvmError);
                         return;
@@ -416,10 +436,12 @@ where
                         .build();
                     let mut task = self.next();
                     while task.is_some() {
+                        self.scheduler_ctx.tasks_on_flight.fetch_add(1, Ordering::Relaxed);
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => self.execute(&mut evm, tx_version),
                             Task::Validation(tx_version) => self.validate(tx_version),
                         };
+                        self.scheduler_ctx.tasks_on_flight.fetch_sub(1, Ordering::Relaxed);
                         if task.is_none() && !self.abort.load(Ordering::Relaxed) {
                             task = self.next();
                         }
@@ -798,6 +820,16 @@ where
     fn next(&self) -> Option<Task> {
         while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
             if !self.scheduler_ctx.should_shedule(self.tx_dependency.index()) {
+                if self.scheduler_ctx.tasks_on_flight.load(Ordering::Relaxed) == 0 &&
+                    self.tx_dependency.index() == self.block_size
+                {
+                    let _ = self.metrics.execution_time.compare_exchange(
+                        0,
+                        self.scheduler_ctx.start_time.elapsed().as_nanos() as usize,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+                }
                 thread::yield_now();
             }
 
