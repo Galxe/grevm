@@ -399,18 +399,33 @@ impl ParallelCacheState {
             }
         };
         if let Some(changed_slots) = changed_slots {
-            self.update_storage_slot(address, changed_slots);
+            if !changed_slots.is_empty() {
+                self.update_storage_slot(address, changed_slots);
+            }
         }
         transition
     }
 
     fn update_storage_slot(&self, address: Address, storage: PlainStorage) {
-        let slots = match self.storage.entry(address) {
-            Entry::Occupied(entry) => entry.into_ref(),
-            Entry::Vacant(entry) => entry.insert(Default::default()),
-        };
-        for (slot, value) in storage {
-            slots.insert(slot, value);
+        if let Some(slots) = self.storage.get(&address) {
+            for (slot, value) in storage {
+                slots.insert(slot, value);
+            }
+        } else {
+            match self.storage.entry(address) {
+                Entry::Occupied(entry) => {
+                    for (slot, value) in storage.into_iter() {
+                        entry.get().insert(slot, value);
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    let new_storage = DashMap::new();
+                    for (slot, value) in storage.into_iter() {
+                        new_storage.insert(slot, value);
+                    }
+                    entry.insert(new_storage);
+                }
+            };
         }
     }
 }

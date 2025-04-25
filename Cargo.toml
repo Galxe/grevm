@@ -60,6 +60,11 @@ codegen-units = 1
 panic = "abort"
 lto = "fat"
 
+[profile.bench]
+debug = 2
+opt-level = 3
+lto = "off"
+
 [features]
 update-test-submodule = ["update-submodule-test-data", "update-submodule-ethereum-tests"]
 update-submodule-test-data = []
