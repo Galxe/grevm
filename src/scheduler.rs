@@ -65,6 +65,8 @@ struct ExecuteMetrics {
     execution_time: metrics::Histogram,
     /// Commit time(nanosecond)
     commit_time: metrics::Histogram,
+    /// Total time(nanosecond)
+    total_time: metrics::Histogram,
 }
 
 #[derive(Default)]
@@ -86,6 +88,7 @@ struct ExecuteMetricsCollector {
     conflict_txs: AtomicUsize,
     execution_time: AtomicUsize,
     commit_time: AtomicUsize,
+    total_time: AtomicUsize,
 }
 
 impl ExecuteMetricsCollector {
@@ -128,6 +131,7 @@ impl ExecuteMetricsCollector {
             execute_metrics.execution_time.record(execution_time as f64);
         }
         execute_metrics.commit_time.record(self.commit_time.load(Ordering::Relaxed) as f64);
+        execute_metrics.total_time.record(self.total_time.load(Ordering::Relaxed) as f64);
     }
 }
 
@@ -463,6 +467,9 @@ where
             self.scheduler_ctx.reset_validation_idx_cnt.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.metrics
+            .total_time
+            .store(self.scheduler_ctx.start_time.elapsed().as_nanos() as usize, Ordering::Relaxed);
         self.metrics.report();
         Ok(())
     }
@@ -821,7 +828,7 @@ where
         while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
             if !self.scheduler_ctx.should_shedule(self.tx_dependency.index()) {
                 if self.scheduler_ctx.tasks_on_flight.load(Ordering::Relaxed) == 0 &&
-                    self.tx_dependency.index() == self.block_size
+                    self.tx_dependency.index() >= self.block_size
                 {
                     let _ = self.metrics.execution_time.compare_exchange(
                         0,
