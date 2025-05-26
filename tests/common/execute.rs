@@ -1,7 +1,11 @@
 use crate::common::{storage::InMemoryDB, MINER_ADDRESS};
+use alloy_primitives::address;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
 use alloy_chains::NamedChain;
+
+use alloy_sol_macro::sol;
+use alloy_sol_types::{SolCall, SolConstructor};
 use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use revm::{
     db::{
@@ -14,11 +18,11 @@ use revm::{
     },
     CacheState, DatabaseCommit, DatabaseRef, EvmBuilder, StateBuilder, TransitionState,
 };
-use revm_primitives::{EnvWithHandlerCfg, ResultAndState};
+use revm_primitives::{hex, keccak256, Bytes, EnvWithHandlerCfg, ResultAndState, TxKind};
 use std::{
     cmp::min,
     collections::{BTreeMap, HashMap},
-    fmt::{Debug, Display},
+    fmt::Debug,
     fs::{self, File},
     io::{BufReader, BufWriter},
     sync::Arc,
@@ -403,6 +407,211 @@ pub(crate) fn dump_block_env(
     serde_json::to_writer(
         BufWriter::new(File::create(format!("{path}/block_hashes.json")).unwrap()),
         block_hashes,
+    )
+    .unwrap();
+}
+
+const SYSTEM_ADDRESS: Address = address!("00000000000000000000000000000000000000ff");
+
+fn new_system_call_txn(contract: Address, input: Bytes) -> TxEnv {
+    TxEnv {
+        caller: SYSTEM_ADDRESS,
+        gas_limit: 30_000_000,
+        gas_price: U256::ZERO,
+        transact_to: TxKind::Call(contract),
+        value: U256::ZERO,
+        data: input,
+        ..Default::default()
+    }
+}
+
+fn new_system_create_txn(hex_code: &str, args: Bytes) -> TxEnv {
+    let mut data = hex::decode(hex_code).expect("Invalid hex string");
+    data.extend_from_slice(&args);
+    TxEnv {
+        caller: SYSTEM_ADDRESS,
+        gas_limit: 30_000_000,
+        gas_price: U256::ZERO,
+        transact_to: TxKind::Create,
+        value: U256::ZERO,
+        data: data.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn genesis_test() {
+    let mut env = Env::default();
+    env.cfg.chain_id = NamedChain::Mainnet.into();
+    let db = InMemoryDB::new(
+        HashMap::from([(
+            SYSTEM_ADDRESS,
+            PlainAccount {
+                info: AccountInfo {
+                    balance: uint!(1_000_000_000_000_000_000_U256),
+                    nonce: 1,
+                    code_hash: KECCAK_EMPTY,
+                    code: None,
+                },
+                storage: Default::default(),
+            },
+        )]),
+        Default::default(),
+        Default::default(),
+    );
+
+    let reconfig_sol_hex = std::io::read_to_string(
+        File::open(format!("{TEST_DATA_DIR}/gravity/reconfig.sol.hex"))
+            .expect("Failed to open reconfig.sol.hex"),
+    )
+    .unwrap();
+    let block_sol_hex = std::io::read_to_string(
+        File::open(format!("{TEST_DATA_DIR}/gravity/block.sol.hex"))
+            .expect("Failed to open block.sol.hex"),
+    )
+    .unwrap();
+    let consensus_config_sol_hex = std::io::read_to_string(
+        File::open(format!("{TEST_DATA_DIR}/gravity/consensus_config.sol.hex"))
+            .expect("Failed to open consensus.sol.hex"),
+    )
+    .unwrap();
+
+    let reconfig_address = SYSTEM_ADDRESS.create(1);
+    let block_address = SYSTEM_ADDRESS.create(2);
+    let consensus_config_address = SYSTEM_ADDRESS.create(3);
+
+    let mut txs = Vec::new();
+
+    sol! {
+        contract Reconfiguration {
+            constructor(
+                address _aptosFrameworkAddress,
+                address _authorizedBlockOrGovManager
+            );
+
+            // --- Functions equivalent to Move module functions ---
+
+            /// @notice Globally disables the reconfiguration process.
+            /// Should only be used for specific system-level operations.
+            function disableReconfigurationGlobally() external onlyAptosFramework;
+
+            /// @notice Globally enables the reconfiguration process.
+            function enableReconfigurationGlobally() external onlyAptosFramework;
+
+            /// @notice Checks if reconfiguration is currently enabled.
+            function isReconfigurationEnabled() public view returns (bool);
+
+            /// @notice Signals validators to start using new configuration.
+            /// @param currentTimeMicroseconds The current time in microseconds, expected to be provided by the caller.
+            function reconfigure(uint64 currentTimeMicroseconds) external onlyAuthorizedManager;
+
+            /// @notice Returns the time of the last reconfiguration in microseconds.
+            function getLastReconfigurationTime() external view returns (uint64);
+
+            /// @notice Returns the current epoch number.
+            function getCurrentEpoch() external view returns (uint64);
+
+            /// @notice Emits the very first reconfiguration event during genesis.
+            /// Typically called once by the system setup/genesis process.
+            function emitGenesisReconfigurationEvent() external onlyAptosFramework;
+
+            function setAuthorizedBlockOrGovManager(address _newManager) external onlyAptosFramework;
+        }
+    }
+
+    txs.push(new_system_create_txn(
+        &reconfig_sol_hex,
+        Reconfiguration::constructorCall {
+            _aptosFrameworkAddress: SYSTEM_ADDRESS,
+            _authorizedBlockOrGovManager: SYSTEM_ADDRESS,
+        }
+        .abi_encode()
+        .into(),
+    ));
+    println!("Reconfiguration contract address: {:?}", reconfig_address);
+    txs.push(new_system_call_txn(
+        reconfig_address,
+        Reconfiguration::emitGenesisReconfigurationEventCall {}.abi_encode().into(),
+    ));
+
+    sol! {
+        contract BlockModule {
+            constructor(
+                uint64 _initial_epoch_interval_microsecs,
+                address _vmAddress,
+                address _reconfigurationContractAddress
+            );
+        }
+    }
+
+    txs.push(new_system_create_txn(
+        &block_sol_hex,
+        BlockModule::constructorCall {
+            _initial_epoch_interval_microsecs: 10_000_000,
+            _vmAddress: SYSTEM_ADDRESS,
+            _reconfigurationContractAddress: address!("00000000000000000000000000000000000000f0"),
+        }
+        .abi_encode()
+        .into(),
+    ));
+
+    sol! {
+        contract ConsensusConfigContract {
+            constructor(
+                address _aptosFrameworkAddress,
+                address _reconfigurationContractAddress, // For calling reconfigure()
+                bytes memory initialConfig
+            );
+        }
+    }
+
+    txs.push(new_system_create_txn(
+        &consensus_config_sol_hex,
+        ConsensusConfigContract::constructorCall {
+            _aptosFrameworkAddress: SYSTEM_ADDRESS,
+            _reconfigurationContractAddress: address!("00000000000000000000000000000000000000f0"),
+            initialConfig: Bytes::from([
+                3, 1, 1, 10, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 10, 0, 0,
+                0, 0, 0, 0, 0, 1, 0, 0, 0,
+            ]),
+        }
+        .abi_encode()
+        .into(),
+    ));
+
+    let (result, mut bundle_state) =
+        execute_revm_sequential(db, SpecId::LATEST, env, &txs).unwrap();
+    for r in result {
+        assert!(r.is_success(), "Genesis transaction failed: {:?}", r);
+        println!("Genesis transaction result: {:?}", r);
+    }
+    //println!("Bundle state: {:?}", bundle_state.state);
+    bundle_state.state.remove(&SYSTEM_ADDRESS);
+    let genesis_state = bundle_state
+        .state
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k,
+                PlainAccount {
+                    info: v.info.unwrap(),
+                    storage: v.storage.into_iter().map(|(k, v)| (k, v.present_value())).collect(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    serde_json::to_writer_pretty(
+        BufWriter::new(
+            File::create(format!("{TEST_DATA_DIR}/gravity/genesis_accounts.json")).unwrap(),
+        ),
+        &genesis_state,
+    )
+    .unwrap();
+    serde_json::to_writer_pretty(
+        BufWriter::new(
+            File::create(format!("{TEST_DATA_DIR}/gravity/genesis_contracts.json")).unwrap(),
+        ),
+        &bundle_state.contracts.iter().map(|(k, v)| (k, v.bytecode())).collect::<HashMap<_, _>>(),
     )
     .unwrap();
 }
