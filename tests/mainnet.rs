@@ -7,8 +7,6 @@ use std::sync::Arc;
 use common::storage::InMemoryDB;
 use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-use revm::{db::states::bundle_state::BundleRetention, EvmBuilder, StateBuilder};
-use revm_primitives::{db::DatabaseCommit, EnvWithHandlerCfg, TxEnv};
 
 const GIGA_GAS: u64 = 1_000_000_000;
 

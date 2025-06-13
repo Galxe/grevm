@@ -6,7 +6,7 @@ use revm::{
     db::PlainAccount,
     interpreter::analysis::to_analysed,
     primitives::{
-        uint, AccountInfo, Address, Bytecode, Bytes, HashMap, TransactTo, TxEnv, B256, U256,
+        AccountInfo, Address, B256, Bytecode, Bytes, HashMap, TransactTo, TxEnv, U256, uint,
     },
 };
 

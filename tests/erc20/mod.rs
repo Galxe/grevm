@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use revm::{
-    db::{DbAccount, PlainAccount},
-    interpreter::analysis::to_analysed,
-    primitives::{uint, AccountInfo, Address, Bytecode, TransactTo, TxEnv, B256, U256},
-};
+use revm::primitives::{Address, B256, U256};
+use revm_context::TxEnv;
+use revm_database::{DbAccount, PlainAccount};
+use revm_primitives::{TxKind, uint};
+use revm_state::{AccountInfo, Bytecode};
 
 use crate::erc20::erc20_contract::ERC20Token;
 
@@ -105,10 +105,10 @@ pub fn generate_erc20_batch(
             let mut tx_env = TxEnv {
                 caller: sender,
                 gas_limit: GAS_LIMIT,
-                gas_price: U256::from(0xb2d05e07u64),
-                transact_to: TransactTo::Call(to_address),
+                gas_price: 0xb2d05e07u128,
+                kind: TxKind::Call(to_address),
                 value: U256::from(0),
-                nonce: Some(nonce as u64),
+                nonce: nonce as u64,
                 ..TxEnv::default()
             };
 
@@ -190,8 +190,7 @@ pub(crate) fn generate_contract_accounts(
             ERC20Token::new("Gold Token", "GLD", 18, 222_222_000_000_000_000_000_000u128)
                 .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
                 .build();
-        bytecodes
-            .insert(gld_account.info.code_hash, to_analysed(gld_account.info.code.take().unwrap()));
+        bytecodes.insert(gld_account.info.code_hash, gld_account.info.code.take().unwrap());
         accounts.push((gld_address, gld_account));
     }
     (accounts, bytecodes)

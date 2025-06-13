@@ -3,11 +3,11 @@
 #[path = "../tests/common/mod.rs"]
 pub mod common;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::Rng;
-use revm::{db::states::bundle_state::BundleRetention, EvmBuilder, StateBuilder};
+use revm::{EvmBuilder, StateBuilder, db::states::bundle_state::BundleRetention};
 use revm_primitives::db::DatabaseCommit;
 use std::{cmp::max, fs, sync::Arc, time::Instant};
 

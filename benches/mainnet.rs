@@ -6,7 +6,7 @@ pub mod common;
 use std::sync::Arc;
 
 use crate::common::execute_revm_sequential;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use grevm::{ParallelState, Scheduler};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::Rng;

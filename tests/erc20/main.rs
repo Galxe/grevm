@@ -5,12 +5,14 @@
 use crate::{
     common::START_ADDRESS,
     erc20::{
-        erc20_contract::ERC20Token, generate_cluster, generate_cluster_and_txs,
-        TransactionModeType, TxnBatchConfig, GAS_LIMIT,
+        GAS_LIMIT, TransactionModeType, TxnBatchConfig, erc20_contract::ERC20Token,
+        generate_cluster, generate_cluster_and_txs,
     },
 };
 use common::storage::InMemoryDB;
-use revm::primitives::{alloy_primitives::U160, uint, Address, TransactTo, TxEnv, U256};
+use revm::primitives::{Address, U256, alloy_primitives::U160, uint};
+use revm_context::TxEnv;
+use revm_primitives::TxKind;
 use std::collections::HashMap;
 
 #[path = "../common/mod.rs"]
@@ -33,11 +35,11 @@ fn erc20_gigagas() {
     for addr in eoa {
         let tx = TxEnv {
             caller: addr,
-            transact_to: TransactTo::Call(sca),
+            kind: TxKind::Call(sca),
             value: U256::from(0),
             gas_limit: GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: Some(0),
+            gas_price: 1,
+            nonce: 0,
             data: ERC20Token::transfer(addr, U256::from(900)),
             ..TxEnv::default()
         };
@@ -48,6 +50,7 @@ fn erc20_gigagas() {
         db,
         txs,
         true,
+        false,
         [
             ("grevm.parallel_round_calls", 1),
             ("grevm.sequential_execute_calls", 0),
@@ -87,29 +90,29 @@ fn erc20_hints_test() {
     let mut txs: Vec<TxEnv> = vec![
         TxEnv {
             caller: account1,
-            transact_to: TransactTo::Call(contract_address),
+            kind: TxKind::Call(contract_address),
             value: U256::from(0),
             gas_limit: GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: Some(1),
+            gas_price: 1,
+            nonce: 1,
             ..TxEnv::default()
         },
         TxEnv {
             caller: account2,
-            transact_to: TransactTo::Call(contract_address),
+            kind: TxKind::Call(contract_address),
             value: U256::from(0),
             gas_limit: GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: Some(1),
+            gas_price: 1,
+            nonce: 1,
             ..TxEnv::default()
         },
         TxEnv {
             caller: account3,
-            transact_to: TransactTo::Call(account4),
+            kind: TxKind::Call(account4),
             value: U256::from(100),
             gas_limit: GAS_LIMIT,
-            gas_price: U256::from(1),
-            nonce: Some(1),
+            gas_price: 1,
+            nonce: 1,
             ..TxEnv::default()
         },
     ];
@@ -117,7 +120,7 @@ fn erc20_hints_test() {
     txs[0].data = call_data.clone();
     txs[1].data = call_data.clone();
     let db = InMemoryDB::new(accounts, bytecodes, Default::default());
-    common::compare_evm_execute(db, txs, true, Default::default());
+    common::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
@@ -136,7 +139,7 @@ fn erc20_independent() {
     let miner = common::mock_miner_account();
     state.insert(miner.0, miner.1);
     let db = InMemoryDB::new(state, bytecodes, Default::default());
-    common::compare_evm_execute(db, txs, true, Default::default());
+    common::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
@@ -164,5 +167,5 @@ fn erc20_batch_transfer() {
     }
 
     let db = InMemoryDB::new(final_state, final_bytecodes, Default::default());
-    common::compare_evm_execute(db, final_txs, true, Default::default());
+    common::compare_evm_execute(db, final_txs, true, false, Default::default());
 }

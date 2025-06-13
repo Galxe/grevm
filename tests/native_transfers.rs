@@ -4,8 +4,8 @@ pub mod common;
 
 use crate::common::{MINER_ADDRESS, START_ADDRESS};
 use common::storage::InMemoryDB;
-
-use revm::primitives::{alloy_primitives::U160, Address, TransactTo, TxEnv, U256};
+use revm_context::TxEnv;
+use revm_primitives::{Address, TxKind, U256, alloy_primitives::U160};
 use std::collections::HashMap;
 
 const GIGA_GAS: u64 = 1_000_000_000;
@@ -22,16 +22,16 @@ fn native_gigagas() {
             let address = Address::from(U160::from(START_ADDRESS + i));
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(1),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, true, Default::default());
+    common::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
@@ -44,16 +44,16 @@ fn native_transfers_independent() {
             let address = Address::from(U160::from(START_ADDRESS + i));
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(1),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: Some(1),
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, true, Default::default());
+    common::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
@@ -80,21 +80,21 @@ fn native_with_same_sender() {
 
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(i),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
+                gas_price: 1,
                 // If setting nonce, then nonce validation against the account's nonce,
                 // the parallel execution will fail for the nonce validation.
                 // However, the failed evm.transact() doesn't generate write set,
                 // then there's no dependency can be detected even two txs are related.
                 // TODO(gaoxin): lazily update nonce
-                nonce: None,
+                nonce: 0,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, false, Default::default());
+    common::compare_evm_execute(db, txs, false, true, Default::default());
 }
 
 #[test]
@@ -110,16 +110,16 @@ fn native_with_all_related() {
 
             TxEnv {
                 caller: from,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(1000),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_price: 1,
+                nonce: 0,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, false, Default::default());
+    common::compare_evm_execute(db, txs, false, true, Default::default());
 }
 
 #[test]
@@ -145,16 +145,16 @@ fn native_with_unconfirmed_reuse() {
             // However, tx2 ~ tx9, tx12 ~ tx19 can reuse the result from the pre-round context.
             TxEnv {
                 caller: from,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(100),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_price: 1,
+                nonce: 0,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, false, HashMap::new());
+    common::compare_evm_execute(db, txs, false, true, HashMap::new());
 }
 
 #[test]
@@ -163,21 +163,21 @@ fn native_zero_or_one_tx() {
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = vec![];
     // empty block
-    common::compare_evm_execute(db, txs, false, HashMap::new());
+    common::compare_evm_execute(db, txs, false, false, HashMap::new());
 
     // one tx
     let txs = vec![TxEnv {
         caller: Address::from(U160::from(START_ADDRESS)),
-        transact_to: TransactTo::Call(Address::from(U160::from(START_ADDRESS))),
+        kind: TxKind::Call(Address::from(U160::from(START_ADDRESS))),
         value: U256::from(1000),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: None,
+        gas_price: 1,
+        nonce: 1,
         ..TxEnv::default()
     }];
     let accounts = common::mock_block_accounts(START_ADDRESS, 1);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    common::compare_evm_execute(db, txs, false, HashMap::new());
+    common::compare_evm_execute(db, txs, false, false, HashMap::new());
 }
 
 #[test]
@@ -195,16 +195,16 @@ fn native_loaded_not_existing_account() {
             let to = Address::from(U160::from(i + block_size));
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(999),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: Some(1),
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, true, HashMap::new());
+    common::compare_evm_execute(db, txs, true, false, HashMap::new());
 }
 
 #[test]
@@ -217,11 +217,11 @@ fn native_transfer_with_beneficiary() {
             let address = Address::from(U160::from(i));
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(100),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
@@ -231,44 +231,44 @@ fn native_transfer_with_beneficiary() {
     // miner => start
     txs.push(TxEnv {
         caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(1),
+        gas_price: 1,
+        nonce: 1,
         ..TxEnv::default()
     });
     // miner => start
     txs.push(TxEnv {
         caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // start => miner
     txs.push(TxEnv {
         caller: start_address,
-        transact_to: TransactTo::Call(miner_address),
+        kind: TxKind::Call(miner_address),
         value: U256::from(1),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // miner => miner
     txs.push(TxEnv {
         caller: miner_address,
-        transact_to: TransactTo::Call(miner_address),
+        kind: TxKind::Call(miner_address),
         value: U256::from(1),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(3),
+        gas_price: 1,
+        nonce: 3,
         ..TxEnv::default()
     });
-    common::compare_evm_execute(db, txs, true, Default::default());
+    common::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
@@ -281,11 +281,11 @@ fn native_transfer_with_beneficiary_enough() {
             let address = Address::from(U160::from(i));
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(100),
                 gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
@@ -295,42 +295,42 @@ fn native_transfer_with_beneficiary_enough() {
     // start => miner
     txs.push(TxEnv {
         caller: start_address,
-        transact_to: TransactTo::Call(miner_address),
+        kind: TxKind::Call(miner_address),
         value: U256::from(100000),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // miner => start
     txs.push(TxEnv {
         caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(1),
+        gas_price: 1,
+        nonce: 1,
         ..TxEnv::default()
     });
     // miner => start
     txs.push(TxEnv {
         caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // miner => miner
     txs.push(TxEnv {
         caller: miner_address,
-        transact_to: TransactTo::Call(miner_address),
+        kind: TxKind::Call(miner_address),
         value: U256::from(1),
         gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(3),
+        gas_price: 1,
+        nonce: 3,
         ..TxEnv::default()
     });
-    common::compare_evm_execute(db, txs, true, Default::default());
+    common::compare_evm_execute(db, txs, true, false, Default::default());
 }
