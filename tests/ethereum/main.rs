@@ -16,10 +16,10 @@ use alloy_chains::NamedChain;
 use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use revm::{
-    db::{states::bundle_state::BundleRetention, PlainAccount},
+    db::{PlainAccount, states::bundle_state::BundleRetention},
     primitives::{
-        calc_excess_blob_gas, ruint::ParseError, AccountInfo, BlobExcessGasAndPrice, BlockEnv,
-        Bytecode, CfgEnv, Env as RevmEnv, TransactTo, TxEnv, KECCAK_EMPTY,
+        AccountInfo, BlobExcessGasAndPrice, BlockEnv, Bytecode, CfgEnv, Env as RevmEnv,
+        KECCAK_EMPTY, TransactTo, TxEnv, calc_excess_blob_gas, ruint::ParseError,
     },
 };
 use revme::cmd::statetest::{

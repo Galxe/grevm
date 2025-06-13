@@ -15,15 +15,15 @@ use crate::{
 };
 use alloy_chains::NamedChain;
 use common::storage::InMemoryDB;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use grevm::{ParallelState, Scheduler};
 use metrics::{SharedString, Unit};
 use metrics_util::{
-    debugging::{DebugValue, DebuggingRecorder},
     CompositeKey, MetricKind,
+    debugging::{DebugValue, DebuggingRecorder},
 };
 use rand::Rng;
-use revm::primitives::{alloy_primitives::U160, Address, Env, SpecId, TransactTo, TxEnv, U256};
+use revm::primitives::{Address, Env, SpecId, TransactTo, TxEnv, U256, alloy_primitives::U160};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

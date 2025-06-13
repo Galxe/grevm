@@ -1,9 +1,9 @@
-use crate::{fork_join_util, tx_dependency::TxDependency, LocationAndType, TxId};
+use crate::{LocationAndType, TxId, fork_join_util, tx_dependency::TxDependency};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use revm::primitives::{
-    alloy_primitives::U160, keccak256, ruint::UintTryFrom, Address, Bytes, TxEnv, TxKind, B256,
-    U256,
+    Address, B256, Bytes, TxKind, U256, alloy_primitives::U160, keccak256, ruint::UintTryFrom,
 };
+use revm_context::TxEnv;
 use std::{cmp::max, sync::Arc};
 
 /// This module provides functionality for parsing and handling execution hints
@@ -127,7 +127,7 @@ impl ParallelExecutionHints {
                 let rw_set = &mut hints[index];
                 // Insert caller's basic location into read-write set
                 rw_set.insert_location(LocationAndType::Basic(tx_env.caller), RWType::ReadWrite);
-                if let TxKind::Call(to_address) = tx_env.transact_to {
+                if let TxKind::Call(to_address) = tx_env.kind {
                     if !tx_env.data.is_empty() {
                         rw_set
                             .insert_location(LocationAndType::Basic(to_address), RWType::ReadOnly);

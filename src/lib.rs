@@ -27,7 +27,9 @@ mod utils;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use lazy_static::lazy_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use revm_primitives::{AccountInfo, Address, Bytecode, EVMError, EVMResult, B256, U256};
+use revm_context::result::{EVMError, ResultAndState};
+use revm_primitives::{Address, B256, U256};
+use revm_state::{AccountInfo, Bytecode};
 use std::{cmp::min, thread};
 
 lazy_static! {
@@ -116,7 +118,7 @@ enum LocationAndType {
 struct TransactionResult<DBError> {
     pub read_set: HashMap<LocationAndType, ReadVersion>,
     pub write_set: HashSet<LocationAndType>,
-    pub execute_result: EVMResult<DBError>,
+    pub execute_result: Result<ResultAndState, EVMError<DBError>>,
 }
 
 #[derive(Clone, Debug)]

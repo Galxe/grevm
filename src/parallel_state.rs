@@ -1,17 +1,14 @@
 use core::hash::{BuildHasherDefault, Hasher};
-use dashmap::{mapref::one::RefMut, DashMap, Entry};
+use dashmap::{DashMap, Entry, mapref::one::RefMut};
 use metrics::histogram;
-use revm::{
-    db::{
-        states::{bundle_state::BundleRetention, plain_account::PlainStorage, CacheAccount},
-        AccountStatus, BundleState, PlainAccount, StorageWithOriginalValues,
-    },
-    CacheState, TransitionAccount, TransitionState,
+use revm::{Database, DatabaseCommit, DatabaseRef};
+use revm_database::{
+    AccountStatus, BundleState, CacheState, PlainAccount, StorageWithOriginalValues,
+    TransitionAccount, TransitionState,
+    states::{CacheAccount, bundle_state::BundleRetention, plain_account::PlainStorage},
 };
-use revm_primitives::{
-    db::{Database, DatabaseCommit, DatabaseRef},
-    Account, AccountInfo, Address, Bytecode, EvmState, HashMap, B256, U256,
-};
+use revm_primitives::{Address, B256, HashMap, U256};
+use revm_state::{Account, AccountInfo, Bytecode, EvmState};
 use std::{fmt::Formatter, time::Instant, vec::Vec};
 
 #[derive(Clone, Debug, Default)]
@@ -330,7 +327,7 @@ impl ParallelCacheState {
         transitions
     }
 
-    fn get_account_mut(&self, address: Address) -> RefMut<Address, CacheAccountInfo> {
+    fn get_account_mut(&'_ self, address: Address) -> RefMut<'_, Address, CacheAccountInfo> {
         self.accounts.get_mut(&address).expect("All accounts should be present inside cache")
     }
 
