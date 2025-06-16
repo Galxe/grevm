@@ -412,6 +412,10 @@ pub(crate) fn dump_block_env(
 }
 
 const SYSTEM_ADDRESS: Address = address!("00000000000000000000000000000000000000ff");
+const RECONF_ADDRESS: Address = address!("00000000000000000000000000000000000000f0");
+const BLOCK_ADDRESS: Address = address!("00000000000000000000000000000000000000f1");
+const CONSENSUS_CONFIG_ADDRESS: Address = address!("00000000000000000000000000000000000000f2");
+const VALIDATOR_SET_ADDRESS: Address = address!("00000000000000000000000000000000000000f3");
 
 fn new_system_call_txn(contract: Address, input: Bytes) -> TxEnv {
     TxEnv {
@@ -475,10 +479,16 @@ fn genesis_test() {
             .expect("Failed to open consensus.sol.hex"),
     )
     .unwrap();
+    let validator_set_sol_hex = std::io::read_to_string(
+        File::open(format!("{TEST_DATA_DIR}/gravity/validator_set.sol.hex"))
+            .expect("Failed to open validator_set.sol.hex"),
+    )
+    .unwrap();
 
     let reconfig_address = SYSTEM_ADDRESS.create(1);
-    let block_address = SYSTEM_ADDRESS.create(2);
-    let consensus_config_address = SYSTEM_ADDRESS.create(3);
+    let block_address = SYSTEM_ADDRESS.create(3);
+    let consensus_config_address = SYSTEM_ADDRESS.create(4);
+    let validator_set_address = SYSTEM_ADDRESS.create(5);
 
     let mut txs = Vec::new();
 
@@ -486,6 +496,8 @@ fn genesis_test() {
         contract Reconfiguration {
             constructor(
                 address _aptosFrameworkAddress,
+                address _consensusConfigContractAddress,
+                address _validatorSetContractAddress,
                 address _authorizedBlockOrGovManager
             );
 
@@ -523,6 +535,8 @@ fn genesis_test() {
         &reconfig_sol_hex,
         Reconfiguration::constructorCall {
             _aptosFrameworkAddress: SYSTEM_ADDRESS,
+            _consensusConfigContractAddress: CONSENSUS_CONFIG_ADDRESS,
+            _validatorSetContractAddress: VALIDATOR_SET_ADDRESS,
             _authorizedBlockOrGovManager: SYSTEM_ADDRESS,
         }
         .abi_encode()
@@ -544,6 +558,7 @@ fn genesis_test() {
         }
     }
 
+    println!("Block contract address: {:?}", block_address);
     txs.push(new_system_create_txn(
         &block_sol_hex,
         BlockModule::constructorCall {
@@ -559,20 +574,50 @@ fn genesis_test() {
         contract ConsensusConfigContract {
             constructor(
                 address _aptosFrameworkAddress,
-                address _reconfigurationContractAddress, // For calling reconfigure()
                 bytes memory initialConfig
             );
         }
     }
 
+    println!("Consensus config contract address: {:?}", consensus_config_address);
     txs.push(new_system_create_txn(
         &consensus_config_sol_hex,
         ConsensusConfigContract::constructorCall {
             _aptosFrameworkAddress: SYSTEM_ADDRESS,
-            _reconfigurationContractAddress: address!("00000000000000000000000000000000000000f0"),
             initialConfig: Bytes::from([
                 3, 1, 1, 10, 0, 0, 0, 0, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 10, 0, 0,
                 0, 0, 0, 0, 0, 1, 0, 0, 0,
+            ]),
+        }
+        .abi_encode()
+        .into(),
+    ));
+
+    sol! {
+        contract ValidatorSetContract {
+            constructor(
+                address _aptosFrameworkAddress,
+                bytes memory initialConfig
+            );
+        }
+    }
+
+    println!("Validator set contract address: {:?}", validator_set_address);
+    txs.push(new_system_create_txn(
+        &validator_set_sol_hex,
+        ValidatorSetContract::constructorCall {
+            _aptosFrameworkAddress: SYSTEM_ADDRESS,
+            initialConfig: Bytes::from([
+                0, 1, 202, 175, 197, 182, 88, 240, 89, 13, 126, 49, 222, 145, 237, 222, 127, 5,
+                174, 145, 150, 29, 8, 4, 236, 99, 77, 117, 53, 150, 155, 125, 23, 31, 1, 0, 0, 0,
+                0, 0, 0, 0, 48, 153, 255, 137, 244, 83, 217, 169, 191, 39, 62, 58, 232, 182, 27,
+                153, 162, 179, 54, 237, 199, 182, 235, 155, 142, 48, 130, 73, 253, 89, 243, 183,
+                98, 17, 119, 29, 126, 13, 170, 169, 127, 173, 17, 81, 140, 74, 216, 234, 189, 25,
+                1, 23, 47, 105, 112, 52, 47, 49, 50, 55, 46, 48, 46, 48, 46, 49, 47, 116, 99, 112,
+                47, 50, 48, 50, 53, 25, 1, 23, 47, 105, 112, 52, 47, 49, 50, 55, 46, 48, 46, 48,
+                46, 49, 47, 116, 99, 112, 47, 50, 48, 50, 53, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0,
             ]),
         }
         .abi_encode()
