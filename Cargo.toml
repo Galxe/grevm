@@ -23,7 +23,7 @@ alloy-evm = { package = "alloy-evm", git = "https://github.com/Galxe/alloy-evm",
 
 # async
 futures = "0.3"
-rand = "0.8.5"
+rand = "0.9"
 auto_impl = "1"
 lazy_static = "1.5.0"
 dashmap = "6.0"
