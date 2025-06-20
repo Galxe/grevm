@@ -19,7 +19,7 @@ atomic = "0.6.0"
 parking_lot = "0.12"
 
 # Alloy
-alloy-evm = { package = "alloy-evm", git = "https://github.com/Galxe/alloy-evm", rev = "85e6450", default-features = false }
+alloy-evm = { package = "alloy-evm", git = "https://github.com/Galxe/alloy-evm", rev = "2d5c29a", default-features = false }
 
 # async
 futures = "0.3"
