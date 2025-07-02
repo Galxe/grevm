@@ -103,7 +103,7 @@ where
                 }
             }
         }
-        let ResultAndState { result, state, reward } = result_and_state;
+        let ResultAndState { result, state, lazy_reward } = result_and_state;
         self.results.push(result);
         self.state_mut().commit(state);
         // In Ethereum, each transaction includes a miner reward, which would introduce write
@@ -113,6 +113,6 @@ where
         // correct concurrency - even if subsequent transactions access the miner's account, they
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
-        assert!(self.state_mut().increment_balances(vec![(self.coinbase, reward)]).is_ok());
+        assert!(self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]).is_ok());
     }
 }
