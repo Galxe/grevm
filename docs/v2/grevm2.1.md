@@ -14,8 +14,9 @@
   sequential fallbacks.
 - **In-depth analysis of optimistic parallel execution** reveals the **underestimated efficiency of Block-STM** and the
   strength of **optimistic parallelism**, providing new insights into parallel execution.
-- **Lock-free DAG** replaces global locks with fine-grained node-level synchronization. Improved scheduling performance
-  by 60% and overall performance by over 30% in low conflict situations.
+- **Lock-Free DAG** (introduced in 2.1) replaces global locking with fine-grained, node-level synchronization. This
+  change reduces DAG scheduling overhead by **60%** and improves overall performance by more than **30%**. In workloads
+  with fast-executing transactions—such as raw and ERC20 transfers—it delivers nearly **2×** higher throughput.
 
 ## Abstract
 
@@ -151,28 +152,31 @@ Parallel State.
 Parallel State's **commit ID** serves as a version number, ensuring that for transaction $j$, only data from version
 $j-1$ is valid—otherwise, the transaction is marked as conflicting.
 
-### Lock-free DAG
-Grevm 2.0 initially employed a global lock mechanism to ensure correctness in DAG dynamic updates and scheduler operations.
-However, benchmark tests (see [Issue 64](https://github.com/Galxe/grevm/issues/64)) revealed that even with the critical
-section minimized, performance degraded by over 40%.
+### Lock-Free DAG (New in Grevm 2.1)
 
-To address this, Grevm 2.1 introduces a lock-free DAG solution:
+Grevm 2.0 initially used a global lock to maintain correctness during DAG updates and scheduling. However, benchmark
+results ([Issue 64](https://github.com/Galxe/grevm/issues/64)) showed that even with a minimized critical section, this
+approach led to over 40% performance degradation.
 
-​**​Fine-grained Node Locking​**​: Instead of relying on a global `Mutex`, DAG updates now lock only the relevant nodes. For instance,
-when adding a dependency like $tx_j \rightarrow tx_i$, only $tx_j$ and $tx_i$ are locked. **​Atomic Scheduler Cursor​**​: The scheduler
-adopts an `Atomic` cursor (`execution_idx`), inspired by Block-STM, to poll for dependency-free nodes in the DAG. Upon completing
-$tx_i$, it removes $tx_j$’s dependency and updates the cursor via `execution_idx.fetch_min(j)`. Unlike Block-STM, Grevm cannot
-determine validation task scheduling by simply comparing `validation_idx` and `execution_idx`. Execution order may deviate from
-transaction sequence (e.g., concurrent execution of tx0 and tx2 while tx1 dependent on tx0, validating tx2 is useless before tx1
-is executed). To resolve this, Grevm introduces the `ContinuousDetectSet` module, which uses unsafe methods to verify contiguous
-executed transactions.
+Grevm 2.1 replaces this with a fully lock-free DAG design, featuring two key improvements:
 
-For ​​asynchronous commits​​ (`StateAsyncCommit`), Grevm handles edge cases like: tx2 and tx4 in unconfirmed state, while tx3 requires
-re-execution due to conflicts (triggering a `validation_idx=3` rollback). Under high concurrency, if tx3 re-enters unconfirmed
-before tx4 reaches validation, tx4 might commit erroneously. While locks could prevent this, tests show any locking incurs performance
-penalties. Instead, Grevm implements a ​​logical timestamp check​​: when `validation_idx` rolls back to $tx_i$, it first acquires a
-logical time (`logical_ts.fetch_add(1)`), ensuring any $tx_n$($n≥i$) in unconfirmed state during async commit observes a timestamp
-newer than the rollback time.
+- **Fine-Grained Node Locking**: Rather than locking the entire DAG, updates now lock only the involved nodes. For
+  example, when adding a dependency like $tx_j \rightarrow tx_i$, only $tx_j$ and $tx_i$ are locked.
+
+- **Atomic Scheduler Cursor**: Inspired by Block-STM, the scheduler uses an atomic `execution_idx` cursor to poll for
+  dependency-free nodes. When $tx_i$ completes, it clears $tx_j$'s dependency and updates the cursor via
+  `execution_idx.fetch_min(j)`. Unlike Block-STM, Grevm cannot rely solely on comparing `validation_idx` and
+  `execution_idx` to schedule validation, since execution order may diverge from transaction order (e.g., if $tx_0$ and
+  $tx_2$ execute before $tx_1$, validating $tx_2$ is pointless before $tx_1$ completes). To handle this, Grevm
+  introduces the `ContinuousDetectSet` module, detecting contiguous executed spans, using some unchecked code for
+  performance.
+
+For **asynchronous commits** (`StateAsyncCommit`), Grevm addresses edge cases such as: $tx_2$ and $tx_4$ remain
+unconfirmed while $tx_3$—dependent on $tx_2$—triggers a rollback to `validation_idx = 3`. Under concurrency, if $tx_3$
+re-enters the unconfirmed state before $tx_4$ validates, $tx_4$ may commit incorrectly. Locks could prevent this but
+would reintroduce performance bottlenecks. Instead, Grevm uses a **Logical Timestamp Check**: when rolling back to
+$tx_i$, it increments `logical_ts` via `fetch_add(1)`. This ensures that any $tx_n$ ($n \geq i$) still in the
+unconfirmed state will observe a timestamp newer than the rollback, preventing stale commits.
 
 ## Benchmark
 
@@ -214,7 +218,7 @@ and accounts to ensure no data dependencies. This setup provides a baseline to a
 improvement through parallel execution without the impact of transaction conflicts.
 
 | Test            | Num Txs | DB Latency | Sequential | Grevm 1.0 | Grevm 2.1 | Speedup | Gigagas/s |
-|-----------------|---------|------------|------------|-----------|-----------|---------|-----------|
+| --------------- | ------- | ---------- | ---------- | --------- | --------- | ------- | --------- |
 | Raw Transfers   | 47620   | 0          | 185.74     | 69.172    | 66.17     | 2.81    | 15.11     |
 |                 |         | 20us       | 3703.5     | N/A       | 95.66     | 38.72   | 10.45     |
 |                 |         | 40us       | 4654.0     | N/A       | 108.79    | 42.78   | 9.19      |
@@ -250,6 +254,22 @@ Additionally, with **parallel state storage**, all tests now include overheads t
 bundling. This explains why the Grevm 1.0 benchmark results referenced here are **end-to-end execution time**, as
 reported in Table 3 of the original paper.
 
+Compared to Grevm 2.0, the new lock-free scheduler in Grevm 2.1 significantly improves overall performance, especially
+for simple and fast transactions like ERC20 and raw transfers, where we observed nearly **2×** higher throughput. For
+more complex transactions such as Uniswap swaps, performance drops by 32%. However, since the achieved throughput
+already surpasses our target of 1 Gigagas/s—reaching 11.25 Gigagas/s—we believe this is a worthwhile trade-off.
+
+| Test            | Num Txs | DB Latency | Sequential | Grevm 2.0 | Grevm 2.1 | Speedup |
+| --------------- | ------- | ---------- | ---------- | --------- | --------- | ------- |
+| Raw Transfers   | 47620   | 0          | 185.74     | 123.01    | 66.17     | 1.85    |
+|                 |         | 100us      | 7511.1     | 152.96    | 155.34    | 0.98    |
+| ERC20 Transfers | 33628   | 0          | 329.55     | 105.51    | 65.19     | 1.61    |
+|                 |         | 100us      | 10681      | 205.30    | 205.48    | 0.99    |
+| Uniswap Swaps   | 6413    | 0          | 771.83     | 60.36     | 88.89     | 0.68    |
+|                 |         | 100us      | 24530      | 403.18    | 439.35    | 0.91    |
+
+_Table 2: Grevm 2.0 v.s. Grevm 2.1 (uint = milliseconds)_
+
 ### Contention Transactions
 
 We uses the same setup for contention transactions as 1.0, with a **hot ratio** parameter to simulate contention in
@@ -274,7 +294,7 @@ We also introduced a a test set called **Hybrid**, consisting of
 | ERC20 Transfers | 33,628  | 1,161,842,024 |
 | Hybrid          | 36,580  | 1,002,841,727 |
 
-_Table 2: Contention Transactions Execution Test Setup_
+_Table 3: Contention Transactions Execution Test Setup_
 
 In Grevm 1.0, the performance of high-contention transactions was constrained by their high interdependence. Grevm 2.1
 significantly improves performance in high-conflict scenarios. With a **30% hot ratio**, Grevm 2.1 outperforms 1.0 in
@@ -283,7 +303,7 @@ improvement is in the **Hybrid test case**, where Grevm 2.1 achieves a **29× sp
 is **5.55× over Grevm 1.0**, reaching a throughput of **2.96 gigagas/s**.
 
 | Test            | Num Txs | DB Latency | Sequential | Grevm 1.0 | Grevm 2.1 | Total Speedup | ThroughPut(Gigagas/s) |
-|-----------------|---------|------------|------------|-----------|-----------|---------------|-----------------------|
+| --------------- | ------- | ---------- | ---------- | --------- | --------- | ------------- | --------------------- |
 | Raw Transfers   | 47620   | 0          | 228.03     | 171.65    | 85.54     | 2.67          | 11.69                 |
 |                 |         | 100us      | 8933.0     | 4328.08   | 183.14    | 48.78         | 5.46                  |
 | ERC20 Transfers | 33628   | 0          | 366.76     | 92.07     | 88.89     | 4.13          | 11.25                 |
@@ -291,7 +311,7 @@ is **5.55× over Grevm 1.0**, reaching a throughput of **2.96 gigagas/s**.
 | Hybrid          | 36580   | 0          | 333.66     | 220.14    | 235.33    | 1.42          | 4.25                  |
 |                 |         | 100us      | 9799.9     | 1874.7    | 344.88    | 28.42         | 2.90                  |
 
-_Table 3: Grevm 2.1 Contention Transactions Execution Speedup (unit = milliseconds, hot ratio = 30%)_
+_Table 4: Grevm 2.1 Contention Transactions Execution Speedup (unit = milliseconds, hot ratio = 30%)_
 
 ### Non-Parallelizable Transactions
 
@@ -305,7 +325,7 @@ Grevm 1.0, we use pevm as the reference implementation for Block-STM.
 | Worst ERC20 Transfers | 33,628  | 350.32     | 369.96   | 0.95    | 2.70      | 128%      |
 | Worst Uniswap         | 6,414   | 550.19     | 567.32   | 0.97    | 1.76      | 115%      |
 
-_Table 4: Grevm 2.1 Non-Parallelizable Transactions Test (unit = milliseconds)_
+_Table 5: Grevm 2.1 Non-Parallelizable Transactions Test (unit = milliseconds)_
 
 In these tests, Grevm 2.1 experiences only a **5% performance degradation** for ERC20 transfers and **3%** for Uniswap
 swaps compared to sequential execution. This result is a significant improvement over Block-STM, which suffers a **~30%
@@ -323,7 +343,7 @@ transaction dependencies.
 | Worst ERC20   | 33,628  | 292.45           | 423.45         | 0.69    | 2.36      | 2987%     |
 | Worst Uniswap | 6,414   | 488.12           | 687.13         | 0.71    | 1.46      | 2761%     |
 
-_Table 5: Block-STM (pevm implementation) Non-Parallelizable Transactions Test (unit = milliseconds)_
+_Table 6: Block-STM (pevm implementation) Non-Parallelizable Transactions Test (unit = milliseconds)_
 
 ## Comparison, Analysis, and Future Work
 
