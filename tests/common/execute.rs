@@ -12,14 +12,15 @@ use revm::{
         alloy_primitives::U160, uint, AccountInfo, Address, Bytecode, EVMError, Env,
         ExecutionResult, SpecId, TxEnv, B256, KECCAK_EMPTY, U256,
     },
-    DatabaseCommit, DatabaseRef, EvmBuilder, StateBuilder,
+    CacheState, DatabaseCommit, DatabaseRef, EvmBuilder, StateBuilder, TransitionState,
 };
 use revm_primitives::{EnvWithHandlerCfg, ResultAndState};
 use std::{
+    cmp::min,
     collections::{BTreeMap, HashMap},
-    fmt::Debug,
+    fmt::{Debug, Display},
     fs::{self, File},
-    io::BufReader,
+    io::{BufReader, BufWriter},
     sync::Arc,
     time::Instant,
 };
@@ -144,7 +145,7 @@ pub(crate) fn compare_evm_execute<DB>(
 
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
-        let state = ParallelState::new(db.clone(), true);
+        let state = ParallelState::new(db.clone(), true, true);
         let mut executor =
             Scheduler::new(SpecId::LATEST, env.clone(), txs.clone(), state, with_hints);
         // set determined partitions
@@ -225,6 +226,65 @@ pub(crate) fn load_bytecodes_from_disk() -> HashMap<B256, Bytecode> {
     .unwrap()
 }
 
+pub(crate) fn continuous_blocks_exist(blocks: String) -> bool {
+    if let Ok(exist) = fs::exists(format!("{TEST_DATA_DIR}/con_eth_blocks/{blocks}")) {
+        exist
+    } else {
+        false
+    }
+}
+
+pub(crate) fn load_continuous_blocks(
+    blocks: String,
+    num_blocks: Option<usize>,
+) -> (Vec<(EnvWithHandlerCfg, Vec<TxEnv>, HashMap<Address, u128>)>, InMemoryDB) {
+    let splits: Vec<&str> = blocks.split('_').collect();
+    let start_block: usize = splits[0].parse().unwrap();
+    let mut end_block: usize = splits[1].parse::<usize>().unwrap() + 1;
+    if let Some(num_blocks) = num_blocks {
+        end_block = min(end_block, start_block + num_blocks);
+    }
+    let mut block_txs = Vec::with_capacity(end_block - start_block);
+    for block_number in start_block..end_block {
+        let env: EnvWithHandlerCfg = serde_json::from_reader(BufReader::new(
+            File::open(format!("{TEST_DATA_DIR}/con_eth_blocks/{blocks}/{block_number}/env.json"))
+                .unwrap(),
+        ))
+        .unwrap();
+        let txs: Vec<TxEnv> = serde_json::from_reader(BufReader::new(
+            File::open(format!("{TEST_DATA_DIR}/con_eth_blocks/{blocks}/{block_number}/txs.json"))
+                .unwrap(),
+        ))
+        .unwrap();
+        let post: HashMap<Address, u128> = serde_json::from_reader(BufReader::new(
+            File::open(format!("{TEST_DATA_DIR}/con_eth_blocks/{blocks}/{block_number}/post.json"))
+                .unwrap(),
+        ))
+        .unwrap();
+        block_txs.push((env, txs, post));
+    }
+
+    // Parse state
+    let accounts: HashMap<Address, PlainAccount> = serde_json::from_reader(BufReader::new(
+        File::open(format!("{TEST_DATA_DIR}/con_eth_blocks/{blocks}/pre_state.json")).unwrap(),
+    ))
+    .unwrap();
+
+    // Parse block hashes
+    let block_hashes: HashMap<u64, B256> =
+        File::open(format!("{TEST_DATA_DIR}/con_eth_blocks/{blocks}/block_hashes.json"))
+            .map(|file| serde_json::from_reader(BufReader::new(file)).unwrap())
+            .unwrap_or_default();
+
+    // Parse bytecodes
+    let bytecodes: HashMap<B256, Bytecode> =
+        File::open(format!("{TEST_DATA_DIR}/con_eth_blocks/{blocks}/bytecodes.bincode"))
+            .map(|file| bincode::deserialize_from(BufReader::new(file)).unwrap())
+            .unwrap_or_default();
+
+    (block_txs, InMemoryDB::new(accounts, bytecodes, block_hashes))
+}
+
 pub(crate) fn load_block_from_disk(
     block_number: u64,
 ) -> (EnvWithHandlerCfg, Vec<TxEnv>, InMemoryDB) {
@@ -276,4 +336,73 @@ pub(crate) fn for_each_block_from_disk(
         }
         handler(env, txs, db);
     }
+}
+
+pub(crate) fn dump_block_env(
+    env: &EnvWithHandlerCfg,
+    txs: &[TxEnv],
+    cache_state: &CacheState,
+    transition_state: &TransitionState,
+    block_hashes: &BTreeMap<u64, B256>,
+) {
+    let path = format!("{}/large_block", TEST_DATA_DIR);
+
+    // Write env data to file
+    serde_json::to_writer(BufWriter::new(File::create(format!("{path}/env.json")).unwrap()), env)
+        .unwrap();
+
+    // Write txs data to file
+    serde_json::to_writer(BufWriter::new(File::create(format!("{path}/txs.json")).unwrap()), txs)
+        .unwrap();
+
+    // Write pre-state and bytecodes data to file
+    let mut pre_state: HashMap<Address, PlainAccount> =
+        HashMap::with_capacity(transition_state.transitions.len());
+    let mut bytecodes = cache_state.contracts.clone();
+    for (addr, account) in cache_state.accounts.iter() {
+        if let Some(transition_account) = transition_state.transitions.get(addr) {
+            // account has been modified by execution, use previous info
+            if let Some(info) = transition_account.previous_info.as_ref() {
+                let mut storage = if let Some(account) = account.account.as_ref() {
+                    account.storage.clone()
+                } else {
+                    HashMap::default()
+                };
+                storage.extend(
+                    transition_account.storage.iter().map(|(k, v)| (*k, v.original_value())),
+                );
+
+                let mut info = info.clone();
+                if let Some(code) = info.code.take() {
+                    bytecodes.entry(info.code_hash).or_insert_with(|| code);
+                }
+                pre_state.insert(*addr, PlainAccount { info, storage });
+            }
+        } else if let Some(account) = account.account.as_ref() {
+            // account has not been modified, use current info in cache
+            let mut account = account.clone();
+            if let Some(code) = account.info.code.take() {
+                bytecodes.entry(account.info.code_hash).or_insert_with(|| code);
+            }
+            pre_state.insert(*addr, account.clone());
+        }
+    }
+
+    serde_json::to_writer(
+        BufWriter::new(File::create(format!("{path}/pre_state.json")).unwrap()),
+        &pre_state,
+    )
+    .unwrap();
+    bincode::serialize_into(
+        BufWriter::new(File::create(format!("{path}/bytecodes.bincode")).unwrap()),
+        &bytecodes,
+    )
+    .unwrap();
+
+    // Write block hashes to file
+    serde_json::to_writer(
+        BufWriter::new(File::create(format!("{path}/block_hashes.json")).unwrap()),
+        block_hashes,
+    )
+    .unwrap();
 }

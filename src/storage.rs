@@ -15,7 +15,14 @@ use revm_primitives::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// A trait that provides functionality for applying state transitions in parallel
+/// and creating reverts for a `BundleState`.
+///
+/// This trait is designed to optimize the process of applying transitions and
+/// generating reverts by leveraging parallelism, especially when dealing with
+/// large sets of transitions.
 pub trait ParallelBundleState {
+    /// apply transitions to create reverts for BundleState in parallel
     fn parallel_apply_transitions_and_create_reverts(
         &mut self,
         transitions: TransitionState,
@@ -42,7 +49,7 @@ impl ParallelBundleState for BundleState {
         let reverts: Vec<Option<(Address, AccountRevert)>> = vec![None; reverts_capacity];
         let bundle_state: Vec<Option<(Address, BundleAccount)>> = vec![None; transitions.len()];
         let state_size = AtomicUsize::new(0);
-        let contracts = Mutex::new(std::collections::HashMap::new());
+        let contracts = Mutex::new(revm_primitives::HashMap::default());
 
         fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
             #[allow(invalid_reference_casting)]
@@ -97,7 +104,15 @@ impl ParallelBundleState for BundleState {
     }
 }
 
+/// Provides functionality for extracting a `BundleState` from a `ParallelState`
+/// while applying state transitions in parallel.
+///
+/// This trait is designed to optimize the process of taking a `BundleState` by leveraging
+/// parallelism to apply transitions and generate reverts efficiently. It ensures that the
+/// resulting `BundleState` reflects the latest state changes based on the provided retention
+/// policy.
 pub trait ParallelTakeBundle {
+    /// take bundle in parallel
     fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
 }
 
@@ -118,7 +133,7 @@ where
     coinbase: Address,
     db: &'a DB,
     mv_memory: &'a MVMemory,
-    num_commit: &'a AtomicUsize,
+    commit_idx: &'a AtomicUsize,
 
     read_set: HashMap<LocationAndType, ReadVersion>,
     read_accounts: HashMap<Address, AccountBasic>,
@@ -131,17 +146,17 @@ impl<'a, DB> CacheDB<'a, DB>
 where
     DB: DatabaseRef,
 {
-    pub fn new(
+    pub(crate) fn new(
         coinbase: Address,
         db: &'a DB,
         mv_memory: &'a MVMemory,
-        num_commit: &'a AtomicUsize,
+        commit_idx: &'a AtomicUsize,
     ) -> Self {
         Self {
             coinbase,
             db,
             mv_memory,
-            num_commit,
+            commit_idx,
             read_set: HashMap::new(),
             read_accounts: HashMap::new(),
             current_tx: TxVersion::new(0, 0),
@@ -150,7 +165,7 @@ where
         }
     }
 
-    pub fn reset_state(&mut self, tx_version: TxVersion) {
+    pub(crate) fn reset_state(&mut self, tx_version: TxVersion) {
         self.current_tx = tx_version;
         self.read_set.clear();
         self.read_accounts.clear();
@@ -158,15 +173,15 @@ where
         self.estimate_txs.clear();
     }
 
-    pub fn read_accurate_origin(&self) -> bool {
+    pub(crate) fn read_accurate_origin(&self) -> bool {
         self.accurate_origin
     }
 
-    pub fn take_estimate_txs(&mut self) -> HashSet<TxId> {
+    pub(crate) fn take_estimate_txs(&mut self) -> HashSet<TxId> {
         std::mem::take(&mut self.estimate_txs)
     }
 
-    pub fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
+    pub(crate) fn take_read_set(&mut self) -> HashMap<LocationAndType, ReadVersion> {
         std::mem::take(&mut self.read_set)
     }
 
@@ -186,12 +201,7 @@ where
                     MemoryValue::SelfDestructed,
                     estimate,
                 );
-                write_set.insert(LocationAndType::Code(address.clone()));
                 write_set.insert(LocationAndType::Basic(address.clone()));
-                self.mv_memory
-                    .entry(LocationAndType::Code(address.clone()))
-                    .or_default()
-                    .insert(self.current_tx.txid, memory_entry.clone());
                 self.mv_memory
                     .entry(LocationAndType::Basic(address.clone()))
                     .or_default()
@@ -281,16 +291,6 @@ where
                         read_version =
                             ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
-                    MemoryValue::SelfDestructed => {
-                        if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
-                            // make sure read after the latest self-destructed
-                            read_version =
-                                ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
-                        } else {
-                            self.accurate_origin = false;
-                            result = Some(Bytecode::default());
-                        }
-                    }
                     _ => {}
                 }
             }
@@ -304,6 +304,20 @@ where
         self.read_set.insert(location, read_version);
         Ok(result.expect("No bytecode"))
     }
+
+    fn clear_destructed_entry(&self, account: Address) {
+        let current_tx = self.current_tx.txid;
+        for mut entry in self.mv_memory.iter_mut() {
+            let destructed = match entry.key() {
+                LocationAndType::Basic(address) => *address == account,
+                LocationAndType::Storage(address, _) => *address == account,
+                LocationAndType::Code(address) => *address == account,
+            };
+            if destructed {
+                *entry.value_mut() = entry.value_mut().split_off(&current_tx);
+            }
+        }
+    }
 }
 
 impl<'a, DB> Database for CacheDB<'a, DB>
@@ -315,13 +329,14 @@ where
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut result = None;
         if address == self.coinbase {
-            self.accurate_origin = self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid;
+            self.accurate_origin = self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid;
             result = self.db.basic_ref(address.clone())?;
         } else {
             let mut read_version = ReadVersion::Storage;
             let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, code_hash: None };
             let location = LocationAndType::Basic(address.clone());
             // 1. read from multi-version memory
+            let mut clear_destructed_entry = false;
             if let Some(written_transactions) = self.mv_memory.get(&location) {
                 if let Some((&txid, entry)) =
                     written_transactions.range(..self.current_tx.txid).next_back()
@@ -345,10 +360,9 @@ where
                                 ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                         }
                         MemoryValue::SelfDestructed => {
-                            if self.num_commit.load(Ordering::Relaxed) == self.current_tx.txid {
+                            if self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid {
                                 // make sure read after the latest self-destructed
-                                read_version =
-                                    ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
+                                clear_destructed_entry = true;
                             } else {
                                 self.accurate_origin = false;
                                 result = Some(AccountInfo::default());
@@ -357,6 +371,9 @@ where
                         _ => {}
                     }
                 }
+            }
+            if clear_destructed_entry {
+                self.clear_destructed_entry(address);
             }
             // 2. read from database
             if result.is_none() {

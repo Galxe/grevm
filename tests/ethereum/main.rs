@@ -146,7 +146,7 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 tx: Default::default(),
             };
             let db = InMemoryDB::new(accounts.clone(), bytecodes, Default::default());
-            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), ParallelState::new(db, true), true);
+            let mut executor = Scheduler::new(spec_name.to_spec_id(), env, Arc::new(vec![tx_env.unwrap()]), ParallelState::new(db, true, true), true);
 
             match (
                 test.expect_exception.as_deref(),
@@ -168,8 +168,8 @@ fn run_test_unit(path: &Path, unit: TestUnit) {
                 }
                 // Remaining tests that expect execution to fail -> match error
                 (Some(exception), Err(error)) => {
-                    println!("Error-Error: {}: {:?}", exception, error.to_string());
-                    let error = error.to_string();
+                    println!("Error-Error: {}: {:?}", exception, error);
+                    let error = error.error.to_string();
                     assert!(match exception {
                         "TransactionException.INSUFFICIENT_ACCOUNT_FUNDS|TransactionException.INTRINSIC_GAS_TOO_LOW" => error == "transaction validation error: call gas cost exceeds the gas limit",
                         "TransactionException.INSUFFICIENT_ACCOUNT_FUNDS" => error.contains("lack of funds"),

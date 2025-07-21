@@ -4,7 +4,7 @@ use revm::primitives::{
     alloy_primitives::U160, keccak256, ruint::UintTryFrom, Address, Bytes, TxEnv, TxKind, B256,
     U256,
 };
-use std::{cmp::max, collections::BTreeSet, sync::Arc};
+use std::{cmp::max, sync::Arc};
 
 /// This module provides functionality for parsing and handling execution hints
 /// for parallel transaction execution in the context of Ethereum-like blockchains.
@@ -96,13 +96,11 @@ impl ParallelExecutionHints {
         Self { rw_set: vec![RWSet::new(); txs.len()], txs }
     }
 
-    #[fastrace::trace]
     fn generate_dependency(&self) -> TxDependency {
         let num_txs = self.txs.len();
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
         let mut dependent_tx: Vec<Option<TxId>> = vec![None; num_txs];
         let mut affect_txs = vec![HashSet::new(); num_txs];
-        let mut no_dep_txs = BTreeSet::new();
         for (txid, rw_set) in self.rw_set.iter().enumerate() {
             for location in rw_set.read_set.iter() {
                 if let Some(&previous) = last_write_tx.get(location) {
@@ -111,17 +109,13 @@ impl ParallelExecutionHints {
                     affect_txs[previous].insert(txid);
                 }
             }
-            if dependent_tx[txid].is_none() {
-                no_dep_txs.insert(txid);
-            }
             for location in rw_set.write_set.iter() {
                 last_write_tx.insert(location.clone(), txid);
             }
         }
-        TxDependency::create(dependent_tx, affect_txs, no_dep_txs)
+        TxDependency::create(dependent_tx, affect_txs)
     }
 
-    #[fastrace::trace]
     pub(crate) fn parse_hints(&self) -> TxDependency {
         let txs = self.txs.clone();
         // Utilize fork-join utility to process transactions in parallel
