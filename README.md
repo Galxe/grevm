@@ -1,6 +1,6 @@
 # Grevm
 
-> Grevm (both 1.0 and 2.0/2.1) is reth-ready, please see [use-with-reth.md](docs/use-with-reth.md) for more details.
+> Grevm (both 1.0 and 2.1) is reth-ready, please see [use-with-reth.md](docs/use-with-reth.md) for more details.
 
 Grevm is a Block-STM inspired optimistic parallel EVM execution engine that leverages DAG-based task scheduling, dynamic
 dependency management, and parallel state storage to significantly boost throughput of
@@ -10,7 +10,7 @@ dependency management, and parallel state storage to significantly boost through
 
 ## **TL;DR – Highlights of Grevm 2.1**
 
-- **Grevm 2.1 achieves near-optimal performance in low-contention scenarios**, matching Block-STM with **16.57
+- **Grevm 2.1 achieves near-optimal performance in low-contention scenarios**, matching Block-STM with **11.25
   gigagas/s** for Uniswap workloads and outperforming it with **95% less CPU usage** in inherently non-parallelizable
   cases by **20–30%**, achieving performance close to sequential execution.
 - **Breaks Grevm 1.0’s limitations in handling highly dependent transactions**, delivering a **5.5× throughput
@@ -22,8 +22,9 @@ dependency management, and parallel state storage to significantly boost through
   sequential fallbacks.
 - **In-depth analysis of optimistic parallel execution** reveals the **underestimated efficiency of Block-STM** and the
   strength of **optimistic parallelism**, providing new insights into parallel execution.
-- **Lock-free DAG** replaces global locks with fine-grained node-level synchronization. Improved scheduling performance
-  by 60% and overall performance by over 30% in low conflict situations.
+- **Lock-Free DAG** (introduced in 2.1) replaces global locking with fine-grained, node-level synchronization. This
+  change reduces DAG scheduling overhead by **60%** and improves overall performance by more than **30%**. In workloads
+  with fast-executing transactions—such as raw and ERC20 transfers—it delivers nearly **2×** higher throughput.
 
 ## Architecture Overview
 
@@ -58,5 +59,4 @@ For a comprehensive explanation of the design, algorithmic choices, and in-depth
 full technical report.
 
 - [Grevm 2.1 Tech Report](docs/v2/grevm2.1.md)
-- [Grevm 2.0 Tech Report](docs/v2/grevm2.md)
 - [Grevm 1.0 Tech Report](docs/v1/README.md)
