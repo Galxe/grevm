@@ -7,12 +7,12 @@ build = "build.rs"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-revm = { package = "revm", git = "https://github.com/Galxe/revm", branch = "v26.0.1-gravity", default-features = false }
-revm-database = { package = "revm-database", git = "https://github.com/Galxe/revm", branch = "v26.0.1-gravity", default-features = false }
-revm-state = { package = "revm-state", git = "https://github.com/Galxe/revm", branch = "v26.0.1-gravity", default-features = false }
-revm-primitives = { package = "revm-primitives", git = "https://github.com/Galxe/revm", branch = "v26.0.1-gravity", default-features = false }
-revm-inspector = { package = "revm-inspector", git = "https://github.com/Galxe/revm", branch = "v26.0.1-gravity", default-features = false }
-revm-context = { package = "revm-context", git = "https://github.com/Galxe/revm", branch = "v26.0.1-gravity", default-features = false }
+revm = { package = "revm", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
+revm-database = { package = "revm-database", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
+revm-state = { package = "revm-state", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
+revm-primitives = { package = "revm-primitives", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
+revm-inspector = { package = "revm-inspector", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
+revm-context = { package = "revm-context", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
 
 ahash = "0.8"
 rayon = "1.10.0"
@@ -20,7 +20,7 @@ atomic = "0.6.0"
 parking_lot = "0.12"
 
 # Alloy
-alloy-evm = { package = "alloy-evm", git = "https://github.com/Galxe/alloy-evm", branch = "v0.12.0-gravity", default-features = false }
+alloy-evm = { package = "alloy-evm", git = "https://github.com/Galxe/alloy-evm", branch = "v0.15.0-gravity", default-features = false }
 
 # async
 futures = "0.3"

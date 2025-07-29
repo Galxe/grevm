@@ -124,6 +124,7 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CacheDB<'a, DB>
 where
     DB: DatabaseRef,
