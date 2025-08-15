@@ -68,19 +68,23 @@ where
         // processing without immediate validation failures. However, during the final commitment
         // phase, the system enforces strict nonce monotonicity checks to guarantee transaction
         // integrity and prevent double-spending attacks.
+        let ResultAndState { result, state, lazy_reward } = result_and_state;
         if !self.disable_nonce_check {
             match self.state.basic_ref(tx_env.caller) {
                 Ok(info) => {
                     if let Some(info) = info {
-                        let state = info.nonce;
-                        match tx_env.nonce.cmp(&state) {
+                        let expect = info.nonce;
+                        if let Some(change) = state.get(&tx_env.caller) {
+                            assert!(change.info.nonce == expect + 1);
+                        }
+                        match tx_env.nonce.cmp(&expect) {
                             Ordering::Greater => {
                                 self.commit_result = Err(GrevmError {
                                     txid,
                                     error: EVMError::Transaction(
                                         InvalidTransaction::NonceTooHigh {
                                             tx: tx_env.nonce,
-                                            state,
+                                            state: expect,
                                         },
                                     ),
                                 });
@@ -90,7 +94,7 @@ where
                                     txid,
                                     error: EVMError::Transaction(InvalidTransaction::NonceTooLow {
                                         tx: tx_env.nonce,
-                                        state,
+                                        state: expect,
                                     }),
                                 });
                             }
@@ -103,9 +107,9 @@ where
                 }
             }
         }
-        let ResultAndState { result, state, lazy_reward } = result_and_state;
         self.results.push(result);
         self.state_mut().commit(state);
+
         // In Ethereum, each transaction includes a miner reward, which would introduce write
         // conflicts in the read-write set if implemented naively, preventing parallel transaction
         // execution. Grevm adopts an optimized approach: it defers miner reward distribution until

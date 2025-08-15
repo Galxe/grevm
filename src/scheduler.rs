@@ -665,22 +665,18 @@ where
         self.scheduler_ctx.executed(txid);
 
         if let Some(next) = next {
-            if txid < self.scheduler_ctx.validation_idx() {
-                self.scheduler_ctx.reset_validation_idx(txid);
-            }
+            self.scheduler_ctx.reset_validation_idx(txid);
             drop(tx_state);
             return self.execution_task(next);
         }
-        if txid < self.scheduler_ctx.validation_idx() {
-            if conflict {
-                self.scheduler_ctx.reset_validation_idx(txid + 1);
+        if conflict {
+            self.scheduler_ctx.reset_validation_idx(txid + 1);
+        } else {
+            if write_new_locations {
+                self.scheduler_ctx.reset_validation_idx(txid);
             } else {
-                if write_new_locations {
-                    self.scheduler_ctx.reset_validation_idx(txid);
-                } else {
-                    tx_state.status = TransactionStatus::Validating;
-                    return Some(Task::Validation(TxVersion::new(txid, incarnation)));
-                }
+                tx_state.status = TransactionStatus::Validating;
+                return Some(Task::Validation(TxVersion::new(txid, incarnation)));
             }
         }
         None
@@ -741,9 +737,7 @@ where
 
         // update transaction status
         tx_state.status = if conflict {
-            if txid < self.scheduler_ctx.validation_idx() {
-                self.scheduler_ctx.reset_validation_idx(txid + 1);
-            }
+            self.scheduler_ctx.reset_validation_idx(txid + 1);
             TransactionStatus::Conflict
         } else {
             self.scheduler_ctx.unconfirmed(txid, ts);
