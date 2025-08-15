@@ -1,11 +1,11 @@
 #![allow(missing_docs)]
 
+use rand::Rng;
 use revm::primitives::{Address, B256, U256};
 use revm_context::TxEnv;
 use revm_database::{DbAccount, PlainAccount};
 use revm_primitives::{HashMap, TxKind, uint};
 use revm_state::{AccountInfo, Bytecode};
-use rand::Rng;
 
 pub mod erc20_contract;
 use erc20_contract::ERC20Token;
@@ -100,7 +100,8 @@ pub fn generate_erc20_batch(
                 }
                 TransactionModeType::Empty => Address::new([0; 20]),
             };
-            let to_address: Address = sca_addresses[rand::rng().random_range(0..sca_addresses.len())];
+            let to_address: Address =
+                sca_addresses[rand::rng().random_range(0..sca_addresses.len())];
 
             let mut tx_env = TxEnv {
                 caller: sender,

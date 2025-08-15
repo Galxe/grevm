@@ -21,10 +21,10 @@ mod hint;
 mod parallel_state;
 mod scheduler;
 mod storage;
-mod tx_dependency;
-mod utils;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
+mod tx_dependency;
+mod utils;
 
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use lazy_static::lazy_static;
