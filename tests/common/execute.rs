@@ -32,7 +32,7 @@ pub(crate) fn compare_result_and_state(left: &Vec<ResultAndState>, right: &Vec<R
     assert_eq!(left.len(), right.len());
     for (l, r) in left.iter().zip(right.iter()) {}
     for txid in 0..left.len() {
-        assert_eq!(left[txid].reward, right[txid].reward, "Tx {}", txid);
+        assert_eq!(left[txid].lazy_reward, right[txid].lazy_reward, "Tx {}", txid);
         assert_eq!(left[txid].result, right[txid].result, "Tx {}", txid);
         let l = &left[txid].state;
         let r = &right[txid].state;
@@ -135,7 +135,7 @@ pub(crate) fn compare_evm_execute<DB>(
     disable_nonce_check: bool,
     parallel_metrics: HashMap<&str, usize>,
 ) where
-    DB: DatabaseRef + Send + Sync,
+    DB: DatabaseRef + Send + Sync + Debug,
     DB::Error: Send + Sync + Clone + Debug + 'static,
 {
     // create registry for metrics
@@ -200,7 +200,7 @@ pub(crate) fn execute_revm_sequential<DB>(
     txs: &[TxEnv],
 ) -> Result<(Vec<ExecutionResult>, BundleState), EVMError<DB::Error>>
 where
-    DB: DatabaseRef,
+    DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + Debug + 'static,
 {
     let db: revm_database::State<revm_database::WrapDatabaseRef<DB>> =
