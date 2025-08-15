@@ -1,52 +1,24 @@
 use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
-use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
+use crate::{ParallelState, ParallelTakeBundle, Scheduler};
 use revm::{
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
 };
 use revm_context::{
     BlockEnv, CfgEnv, TxEnv,
-    result::{EVMError, ExecutionResult, ResultAndState},
+    result::{EVMError, ExecutionResult},
 };
 use revm_database::{
-    AccountRevert, BundleAccount, BundleState, PlainAccount, StateBuilder,
+    AccountRevert, BundleAccount, BundleState, StateBuilder,
     states::{StorageSlot, bundle_state::BundleRetention},
 };
 use revm_inspector::NoOpInspector;
-use revm_primitives::{
-    Address, KECCAK_EMPTY, U256, alloy_primitives::U160, hardfork::SpecId, uint,
-};
-use revm_state::AccountInfo;
+use revm_primitives::{Address, HashMap, U256, hardfork::SpecId};
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt::Debug,
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::BTreeMap, fmt::Debug, sync::Arc, time::Instant};
 
-use crate::common::MINER_ADDRESS;
-
-pub(crate) fn compare_result_and_state(left: &Vec<ResultAndState>, right: &Vec<ResultAndState>) {
-    assert_eq!(left.len(), right.len());
-    for (l, r) in left.iter().zip(right.iter()) {}
-    for txid in 0..left.len() {
-        assert_eq!(left[txid].lazy_reward, right[txid].lazy_reward, "Tx {}", txid);
-        assert_eq!(left[txid].result, right[txid].result, "Tx {}", txid);
-        let l = &left[txid].state;
-        let r = &right[txid].state;
-        for (address, l) in l {
-            let r =
-                r.get(address).expect(format!("no account {:?} in Tx {}", address, txid).as_str());
-            assert_eq!(l.info, r.info, "account {:?} info in Tx {}", address, txid);
-            assert_eq!(l.storage, r.storage, "account {:?} storage in Tx {}", address, txid);
-            assert_eq!(l.status, r.status, "account {:?} status in Tx {}", address, txid);
-        }
-    }
-}
-
-pub(crate) fn compare_bundle_state(left: &BundleState, right: &BundleState) {
+pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert!(
         left.contracts.keys().all(|k| right.contracts.contains_key(k)),
         "Left contracts: {:?}, Right contracts: {:?}",
@@ -90,45 +62,14 @@ pub(crate) fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     }
 }
 
-pub(crate) fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<ExecutionResult>) {
+pub fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<ExecutionResult>) {
     for (i, (left_res, right_res)) in left.iter().zip(right.iter()).enumerate() {
         assert_eq!(left_res, right_res, "Tx {}", i);
     }
     assert_eq!(left.len(), right.len());
 }
 
-pub(crate) fn mock_miner_account() -> (Address, PlainAccount) {
-    let address = Address::from(U160::from(MINER_ADDRESS));
-    let account = PlainAccount {
-        info: AccountInfo { balance: U256::from(0), nonce: 1, code_hash: KECCAK_EMPTY, code: None },
-        storage: Default::default(),
-    };
-    (address, account)
-}
-
-pub(crate) fn mock_eoa_account(idx: usize) -> (Address, PlainAccount) {
-    let address = Address::from(U160::from(idx));
-    let account = PlainAccount {
-        info: AccountInfo {
-            balance: uint!(1_000_000_000_000_000_000_U256),
-            nonce: 1,
-            code_hash: KECCAK_EMPTY,
-            code: None,
-        },
-        storage: Default::default(),
-    };
-    (address, account)
-}
-
-pub(crate) fn mock_block_accounts(from: usize, size: usize) -> HashMap<Address, PlainAccount> {
-    let mut accounts: HashMap<Address, PlainAccount> =
-        (from..(from + size)).map(mock_eoa_account).collect();
-    let miner = mock_miner_account();
-    accounts.insert(miner.0, miner.1);
-    accounts
-}
-
-pub(crate) fn compare_evm_execute<DB>(
+pub fn compare_evm_execute<DB>(
     db: DB,
     txs: Vec<TxEnv>,
     with_hints: bool,
@@ -144,14 +85,14 @@ pub(crate) fn compare_evm_execute<DB>(
     let mut env = BlockEnv::default();
     let mut cfg = CfgEnv::new_with_spec(SpecId::SHANGHAI);
     cfg.disable_nonce_check = disable_nonce_check;
-    env.beneficiary = Address::from(U160::from(MINER_ADDRESS));
+    env.beneficiary = super::account::MINER_ADDRESS;
     let db = Arc::new(db);
     let txs = Arc::new(txs);
 
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
         let state = ParallelState::new(db.clone(), true, true);
-        let mut executor = Scheduler::new(cfg.clone(), env.clone(), txs.clone(), state, with_hints);
+        let executor = Scheduler::new(cfg.clone(), env.clone(), txs.clone(), state, with_hints);
         // set determined partitions
         executor.parallel_execute(Some(23)).expect("parallel execute failed");
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
@@ -193,7 +134,7 @@ pub(crate) fn compare_evm_execute<DB>(
 }
 
 /// Simulate the sequential execution of transactions in reth
-pub(crate) fn execute_revm_sequential<DB>(
+pub fn execute_revm_sequential<DB>(
     db: DB,
     cfg: CfgEnv,
     env: BlockEnv,
@@ -203,8 +144,7 @@ where
     DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + Debug + 'static,
 {
-    let db: revm_database::State<revm_database::WrapDatabaseRef<DB>> =
-        StateBuilder::new().with_bundle_update().with_database_ref(db).build();
+    let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
     let evm = Context::mainnet()
         .with_db(db)
         .with_cfg(cfg)

@@ -1,14 +1,14 @@
-use std::collections::HashMap;
+#![allow(missing_docs)]
 
 use revm::primitives::{Address, B256, U256};
 use revm_context::TxEnv;
 use revm_database::{DbAccount, PlainAccount};
-use revm_primitives::{TxKind, uint};
+use revm_primitives::{HashMap, TxKind, uint};
 use revm_state::{AccountInfo, Bytecode};
-
-use crate::erc20::erc20_contract::ERC20Token;
+use rand::Rng;
 
 pub mod erc20_contract;
+use erc20_contract::ERC20Token;
 
 pub const GAS_LIMIT: u64 = 35_000;
 pub const ESTIMATED_GAS_USED: u64 = 29_738;
@@ -96,11 +96,11 @@ pub fn generate_erc20_batch(
             let recipient: Address = match transaction_mode_type {
                 TransactionModeType::SameCaller => sender,
                 TransactionModeType::Random => {
-                    eoa_addresses[rand::random::<usize>() % eoa_addresses.len()]
+                    eoa_addresses[rand::rng().random_range(0..eoa_addresses.len())]
                 }
                 TransactionModeType::Empty => Address::new([0; 20]),
             };
-            let to_address: Address = sca_addresses[rand::random::<usize>() % sca_addresses.len()];
+            let to_address: Address = sca_addresses[rand::rng().random_range(0..sca_addresses.len())];
 
             let mut tx_env = TxEnv {
                 caller: sender,
@@ -178,7 +178,7 @@ pub fn generate_cluster_and_txs(
 }
 
 /// Return a tuple of (contract_accounts, bytecodes)
-pub(crate) fn generate_contract_accounts(
+pub fn generate_contract_accounts(
     num_sca: usize,
     eoa_addresses: &[Address],
 ) -> (Vec<(Address, PlainAccount)>, HashMap<B256, Bytecode>) {

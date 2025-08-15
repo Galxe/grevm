@@ -33,9 +33,13 @@ dashmap = "6.0"
 metrics = "0.24"
 metrics-derive = "0.1"
 
+# test_utils
+metrics-util = { version = "0.19.0", optional = true }
+
 [dev-dependencies]
+# revm-statetest-types = { package = "revm-statetest-types", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
+# revme = { package = "revme", git = "https://github.com/Galxe/revm", branch = "v27.0.3-gravity", default-features = false }
 criterion = "0.5.1"
-metrics-util = "0.19.0"
 walkdir = "2.5.0"
 rayon = "1.10.0"
 tikv-jemallocator = "0.6"
@@ -51,14 +55,6 @@ rust.unreachable_pub = "warn"
 name = "gigagas"
 harness = false
 
-[[bench]]
-name = "mainnet"
-harness = false
-
-[[bench]]
-name = "continuous_blocks"
-harness = false
-
 [profile.release]
 codegen-units = 1
 panic = "abort"
@@ -70,6 +66,7 @@ opt-level = 3
 lto = "off"
 
 [features]
+test-utils = ["metrics-util"]
 update-test-submodule = ["update-submodule-test-data", "update-submodule-ethereum-tests"]
 update-submodule-test-data = []
 update-submodule-ethereum-tests = []

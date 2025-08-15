@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display};
+use std::fmt::Display;
 
 use revm::{
     DatabaseRef,
@@ -8,6 +8,7 @@ use revm::{
 };
 use revm_context::DBErrorMarker;
 use revm_database::PlainAccount;
+use revm_primitives::HashMap;
 use revm_state::{AccountInfo, Bytecode};
 
 /// A DatabaseRef that stores chain data in memory.
