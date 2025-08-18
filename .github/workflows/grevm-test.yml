@@ -24,4 +24,4 @@ jobs:
           override: true
 
       - name: Run tests
-        run: cargo test --features update-submodule-test-data -- --skip ethereum
+        run: cargo test --features test-utils -- --skip ethereum
