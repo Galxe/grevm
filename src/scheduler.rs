@@ -1,27 +1,29 @@
 use crate::{
+    AbortReason, CONCURRENT_LEVEL, GrevmError, LocationAndType, MemoryEntry, ParallelState,
+    ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
     async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::ContinuousDetectSet, AbortReason, GrevmError,
-    LocationAndType, MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult,
-    TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
+    tx_dependency::TxDependency, utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use dashmap::DashMap;
 use metrics::histogram;
 use metrics_derive::Metrics;
 use parking_lot::Mutex;
-use revm::{Evm, EvmBuilder};
-use revm_primitives::{
-    db::{DatabaseCommit, DatabaseRef},
-    EVMError, Env, ExecutionResult, SpecId, TxEnv,
+use revm::{Context, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles};
+use revm_context::{
+    BlockEnv, CfgEnv, TxEnv,
+    result::{EVMError, ExecutionResult},
 };
+use revm_inspector::NoOpInspector;
 
 use std::{
     cmp::max,
     collections::BTreeMap,
     fmt::Debug,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Instant,
@@ -248,8 +250,8 @@ pub struct Scheduler<DB>
 where
     DB: DatabaseRef,
 {
-    spec_id: SpecId,
-    env: Env,
+    cfg: CfgEnv,
+    env: BlockEnv,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
     state: ParallelState<DB>,
@@ -272,7 +274,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scheduler")
-            .field("spec_id", &self.spec_id)
+            .field("cfg", &self.cfg)
             .field("env", &self.env)
             .field("block_size", &self.block_size)
             .field("txs", &self.txs)
@@ -283,12 +285,12 @@ where
 impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
-    DB::Error: Clone + Send + Sync,
+    DB::Error: Clone + Send + Sync + 'static,
 {
     /// Create a Scheduler for parallel execution
     pub fn new(
-        spec_id: SpecId,
-        env: Env,
+        cfg: CfgEnv,
+        env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
         with_hints: bool,
@@ -300,7 +302,7 @@ where
             TxDependency::new(num_txs)
         };
         Self {
-            spec_id,
+            cfg,
             env,
             block_size: num_txs,
             txs,
@@ -365,7 +367,7 @@ where
                 start = Instant::now();
                 println!(
                     "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}",
-                    self.env.block.number,
+                    self.env.number,
                     self.scheduler_ctx.finality_idx(),
                     self.scheduler_ctx.validation_idx(),
                     self.scheduler_ctx.executed_set.continuous_idx(),
@@ -406,13 +408,6 @@ where
         }
     }
 
-    fn state_mut(&self) -> &mut ParallelState<DB> {
-        #[allow(invalid_reference_casting)]
-        unsafe {
-            &mut *(&self.state as *const ParallelState<DB> as *mut ParallelState<DB>)
-        }
-    }
-
     /// Take `ExecutionResult` and `ParallelState`
     pub fn take_result_and_state(self) -> (Vec<ExecutionResult>, ParallelState<DB>) {
         (self.results.into_inner(), self.state)
@@ -429,7 +424,11 @@ where
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
         );
-        let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
+        let commiter = Mutex::new(StateAsyncCommit::new(
+            self.env.beneficiary,
+            &self.state,
+            self.cfg.disable_nonce_check,
+        ));
         commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
         thread::scope(|scope| {
             scope.spawn(|| {
@@ -443,17 +442,27 @@ where
             });
             for _ in 0..concurrency_level {
                 scope.spawn(|| {
-                    let mut cache_db = CacheDB::new(
-                        self.env.block.coinbase,
+                    let cache_db = CacheDB::new(
+                        self.env.beneficiary,
                         &self.state,
                         &self.mv_memory,
                         &self.scheduler_ctx.commit_idx,
                     );
-                    let mut evm = EvmBuilder::default()
-                        .with_db(&mut cache_db)
-                        .with_spec_id(self.spec_id.clone())
-                        .with_env(Box::new(self.env.clone()))
-                        .build();
+                    let mut cfg = self.cfg.clone();
+                    // Disable noce check to bypass the EVM's strict sequential
+                    // nonce verification, but the nonce will be checked when transaction commit
+                    cfg.disable_nonce_check = true;
+                    cfg.lazy_reward = true;
+                    let evm = Context::mainnet()
+                        .with_db(cache_db)
+                        .with_cfg(cfg)
+                        .with_block(self.env.clone())
+                        .build_mainnet_with_inspector(NoOpInspector {})
+                        .with_precompiles(PrecompilesMap::from_static(
+                            EthPrecompiles::default().precompiles,
+                        ));
+                    let mut evm = EthEvm::new(evm, false);
+
                     let mut task = self.next();
                     while task.is_some() {
                         task = match task.unwrap() {
@@ -511,40 +520,11 @@ where
                     // degradation that could otherwise drastically slow down parallel execution
                     // throughput.
                     AbortReason::SelfDestructed | AbortReason::FallbackSequential => {
-                        return self.fallback_sequential();
+                        panic!("Not support fallback yet");
                     }
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Fallback to sequential execution
-    pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
-        let mut results = self.results.lock();
-        let num_commit = results.len();
-        if num_commit == self.block_size {
-            return Ok(());
-        }
-
-        let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
-        let state_mut = self.state_mut();
-        {
-            let mut evm = EvmBuilder::default()
-                .with_db(state_mut)
-                .with_spec_id(self.spec_id)
-                .with_env(Box::new(self.env.clone()))
-                .build();
-            for txid in num_commit..self.block_size {
-                *evm.tx_mut() = self.txs[txid].clone();
-                let result_and_state =
-                    evm.transact().map_err(|e| GrevmError { txid, error: e.clone() })?;
-                evm.db_mut().commit(result_and_state.state);
-                sequential_results.push(result_and_state.result);
-                self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        results.extend(sequential_results);
         Ok(())
     }
 
@@ -561,7 +541,7 @@ where
     ///   commit_idx)
     fn execute(
         &self,
-        evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
+        evm: &mut EthEvm<CacheDB<ParallelState<DB>>, NoOpInspector, PrecompilesMap>,
         tx_version: TxVersion,
     ) -> Option<Task> {
         let TxVersion { txid, incarnation } = tx_version;
@@ -575,13 +555,9 @@ where
         self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
 
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
-        let mut tx_env = self.txs[txid].clone();
-        // Transaction nonces are temporarily set to `None` to bypass the EVM's strict sequential
-        // nonce verification, but the nonce will be checked when transaction commit
-        tx_env.nonce = None;
-        *evm.tx_mut() = tx_env;
+        let tx_env = self.txs[txid].clone();
         let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
-        let result = evm.transact_lazy_reward();
+        let result = evm.transact_raw(tx_env);
 
         // The `​write_new_locations` mechanism optimizes validation by intelligently reducing
         // redundant verification tasks. Under standard validation logic, when a conflicted
@@ -597,11 +573,12 @@ where
             Ok(result_and_state) => {
                 // only the miner involved in transaction should accumulate the rewards of finality
                 // txs return true if the tx doesn't visit the miner account
-                let read_accurate_origin = evm.db().read_accurate_origin();
+                let read_accurate_origin = evm.db_mut().read_accurate_origin();
+
                 let blocking_txs = evm.db_mut().take_estimate_txs();
                 conflict = !read_accurate_origin || !blocking_txs.is_empty();
                 let read_set = evm.db_mut().take_read_set();
-                let write_set = evm.db().update_mv_memory(&result_and_state.state, conflict);
+                let write_set = evm.db_mut().update_mv_memory(&result_and_state.state, conflict);
 
                 let mut last_result = self.tx_results[txid].lock();
                 if let Some(last_result) = last_result.as_ref() {
@@ -688,22 +665,18 @@ where
         self.scheduler_ctx.executed(txid);
 
         if let Some(next) = next {
-            if txid < self.scheduler_ctx.validation_idx() {
-                self.scheduler_ctx.reset_validation_idx(txid);
-            }
+            self.scheduler_ctx.reset_validation_idx(txid);
             drop(tx_state);
             return self.execution_task(next);
         }
-        if txid < self.scheduler_ctx.validation_idx() {
-            if conflict {
-                self.scheduler_ctx.reset_validation_idx(txid + 1);
+        if conflict {
+            self.scheduler_ctx.reset_validation_idx(txid + 1);
+        } else {
+            if write_new_locations {
+                self.scheduler_ctx.reset_validation_idx(txid);
             } else {
-                if write_new_locations {
-                    self.scheduler_ctx.reset_validation_idx(txid);
-                } else {
-                    tx_state.status = TransactionStatus::Validating;
-                    return Some(Task::Validation(TxVersion::new(txid, incarnation)));
-                }
+                tx_state.status = TransactionStatus::Validating;
+                return Some(Task::Validation(TxVersion::new(txid, incarnation)));
             }
         }
         None
@@ -764,9 +737,7 @@ where
 
         // update transaction status
         tx_state.status = if conflict {
-            if txid < self.scheduler_ctx.validation_idx() {
-                self.scheduler_ctx.reset_validation_idx(txid + 1);
-            }
+            self.scheduler_ctx.reset_validation_idx(txid + 1);
             TransactionStatus::Conflict
         } else {
             self.scheduler_ctx.unconfirmed(txid, ts);
@@ -777,11 +748,7 @@ where
         if conflict {
             // update dependency
             let dep_tx = dependency.and_then(|dep| {
-                if dep >= self.scheduler_ctx.finality_idx() {
-                    Some(dep)
-                } else {
-                    None
-                }
+                if dep >= self.scheduler_ctx.finality_idx() { Some(dep) } else { None }
             });
             self.tx_dependency.add(txid, dep_tx);
         }

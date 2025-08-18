@@ -1,13 +1,10 @@
-use crate::common::storage::{from_address, from_indices, from_short_string, StorageBuilder};
-use lazy_static::lazy_static;
-use revm::{
-    db::PlainAccount,
-    interpreter::analysis::to_analysed,
-    primitives::{
-        fixed_bytes, hex::FromHex, ruint::UintTryFrom, AccountInfo, Address, Bytecode, Bytes, B256,
-        U256,
-    },
+use crate::test_utils::common::storage::{
+    StorageBuilder, from_address, from_indices, from_short_string,
 };
+use lazy_static::lazy_static;
+use revm::primitives::{Address, B256, Bytes, U256, fixed_bytes, hex::FromHex, ruint::UintTryFrom};
+use revm_database::PlainAccount;
+use revm_state::{AccountInfo, Bytecode};
 use std::collections::HashMap;
 
 const ERC20_TOKEN: &str = include_str!("./contracts/ERC20Token.hex");
@@ -85,7 +82,6 @@ impl ERC20Token {
     pub fn build(&self) -> PlainAccount {
         let hex = ERC20_TOKEN.trim();
         let bytecode = Bytecode::new_raw(Bytes::from_hex(hex).unwrap());
-        let bytecode = to_analysed(bytecode);
 
         let mut store = StorageBuilder::new();
         store.set(0, 0); // mapping
@@ -110,7 +106,7 @@ impl ERC20Token {
                 code_hash: bytecode.hash_slow(),
                 code: Some(bytecode),
             },
-            storage: store.build(),
+            storage: store.build().into_iter().collect(),
         }
     }
 

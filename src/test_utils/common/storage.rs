@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::fmt::Display;
 
 use revm::{
-    db::PlainAccount,
-    primitives::{
-        alloy_primitives::U160, keccak256, ruint::UintTryFrom, AccountInfo, Address, Bytecode,
-        B256, I256, U256,
-    },
     DatabaseRef,
+    primitives::{
+        Address, B256, I256, U256, alloy_primitives::U160, keccak256, ruint::UintTryFrom,
+    },
 };
+use revm_context::DBErrorMarker;
+use revm_database::PlainAccount;
+use revm_primitives::HashMap;
+use revm_state::{AccountInfo, Bytecode};
 
 /// A DatabaseRef that stores chain data in memory.
 #[derive(Debug, Default, Clone)]
@@ -29,8 +31,26 @@ impl InMemoryDB {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CustomDBError(String);
+
+impl Display for CustomDBError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl DBErrorMarker for CustomDBError {}
+impl core::error::Error for CustomDBError {}
+
+impl CustomDBError {
+    pub fn new(msg: String) -> Self {
+        CustomDBError(msg)
+    }
+}
+
 impl DatabaseRef for InMemoryDB {
-    type Error = String;
+    type Error = CustomDBError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         if self.latency_us > 0 {
@@ -46,14 +66,17 @@ impl DatabaseRef for InMemoryDB {
         self.bytecodes
             .get(&code_hash)
             .cloned()
-            .ok_or(String::from(format!("can't find code by hash {code_hash}")))
+            .ok_or(CustomDBError::new(format!("can't find code by hash {code_hash}")))
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         if self.latency_us > 0 {
             std::thread::sleep(std::time::Duration::from_micros(self.latency_us));
         }
-        let storage = self.accounts.get(&address).ok_or(format!("can't find account {address}"))?;
+        let storage = self
+            .accounts
+            .get(&address)
+            .ok_or(CustomDBError::new(format!("can't find account {address}")))?;
         Ok(storage.storage.get(&index).cloned().unwrap_or_default())
     }
 
@@ -72,7 +95,7 @@ impl DatabaseRef for InMemoryDB {
 
 #[derive(Debug, Default)]
 pub struct StorageBuilder {
-    dict: revm_primitives::HashMap<U256, U256>,
+    dict: HashMap<U256, U256>,
 }
 
 impl StorageBuilder {
@@ -112,7 +135,7 @@ impl StorageBuilder {
         *entry = buffer.into();
     }
 
-    pub fn build(self) -> revm_primitives::HashMap<U256, U256> {
+    pub fn build(self) -> HashMap<U256, U256> {
         self.dict
     }
 }

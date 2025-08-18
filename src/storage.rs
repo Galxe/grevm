@@ -1,18 +1,16 @@
 use crate::{
-    fork_join_util, scheduler::MVMemory, AccountBasic, LocationAndType, MemoryEntry, MemoryValue,
-    ParallelState, ReadVersion, TxId, TxVersion,
+    AccountBasic, LocationAndType, MemoryEntry, MemoryValue, ParallelState, ReadVersion, TxId,
+    TxVersion, fork_join_util, scheduler::MVMemory,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use parking_lot::Mutex;
-use revm::{
-    db::{states::bundle_state::BundleRetention, AccountRevert, BundleAccount, BundleState},
-    interpreter::analysis::to_analysed,
-    TransitionState,
+use revm::{Database, DatabaseRef};
+use revm_database::{
+    AccountRevert, BundleAccount, BundleState, TransitionState,
+    states::bundle_state::BundleRetention,
 };
-use revm_primitives::{
-    db::{Database, DatabaseRef},
-    AccountInfo, Address, Bytecode, EvmState, B256, U256,
-};
+use revm_primitives::{Address, B256, U256};
+use revm_state::{AccountInfo, Bytecode, EvmState};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A trait that provides functionality for applying state transitions in parallel
@@ -126,6 +124,7 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CacheDB<'a, DB>
 where
     DB: DatabaseRef,
@@ -227,7 +226,7 @@ where
                         self.current_tx.txid,
                         MemoryEntry::new(
                             self.current_tx.incarnation,
-                            MemoryValue::Code(to_analysed(account.info.code.clone().unwrap())),
+                            MemoryValue::Code(account.info.code.clone().unwrap()),
                             estimate,
                         ),
                     );

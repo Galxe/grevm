@@ -1,13 +1,15 @@
+#![allow(missing_docs)]
+
 pub mod contract;
 
-use crate::erc20::erc20_contract::ERC20Token;
+use crate::test_utils::erc20::erc20_contract::ERC20Token;
 use contract::{SingleSwap, SwapRouter, UniswapV3Factory, UniswapV3Pool, WETH9};
 use revm::{
-    db::PlainAccount,
-    interpreter::analysis::to_analysed,
-    primitives::{
-        uint, AccountInfo, Address, Bytecode, Bytes, HashMap, TransactTo, TxEnv, B256, U256,
-    },
+    bytecode::Bytecode,
+    context::TxEnv,
+    database::PlainAccount,
+    primitives::{Address, B256, Bytes, HashMap, TxKind, U256, uint},
+    state::AccountInfo,
 };
 
 pub const GAS_LIMIT: u64 = 200_000;
@@ -15,7 +17,7 @@ pub const ESTIMATED_GAS_USED: u64 = 155_934;
 
 /// Return a tuple of (contract_accounts, bytecodes, single_swap_address)
 /// `single_swap_address` is the entrance of the contract.
-pub(crate) fn generate_contract_accounts(
+pub fn generate_contract_accounts(
     eoa_addresses: &[Address],
 ) -> (Vec<(Address, PlainAccount)>, HashMap<B256, Bytecode>, Address) {
     let (dai_address, usdc_address) = {
@@ -102,7 +104,6 @@ pub(crate) fn generate_contract_accounts(
     for (_, account) in accounts.iter_mut() {
         let code = account.info.code.take();
         if let Some(code) = code {
-            let code = to_analysed(code);
             bytecodes.insert(account.info.code_hash, code);
         }
     }
@@ -152,10 +153,10 @@ pub fn generate_cluster(
             txs.push(TxEnv {
                 caller: *person,
                 gas_limit: GAS_LIMIT,
-                gas_price: U256::from(0xb2d05e07u64),
-                transact_to: TransactTo::Call(single_swap_address),
+                gas_price: 0x_b2d0_5e07u128,
+                kind: TxKind::Call(single_swap_address),
                 data: Bytes::from(data_bytes),
-                nonce: Some(nonce as u64),
+                nonce: nonce as u64,
                 ..TxEnv::default()
             })
         }

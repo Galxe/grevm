@@ -1,14 +1,14 @@
-use std::collections::HashMap;
+#![allow(missing_docs)]
 
-use revm::{
-    db::{DbAccount, PlainAccount},
-    interpreter::analysis::to_analysed,
-    primitives::{uint, AccountInfo, Address, Bytecode, TransactTo, TxEnv, B256, U256},
-};
-
-use crate::erc20::erc20_contract::ERC20Token;
+use rand::Rng;
+use revm::primitives::{Address, B256, U256};
+use revm_context::TxEnv;
+use revm_database::{DbAccount, PlainAccount};
+use revm_primitives::{HashMap, TxKind, uint};
+use revm_state::{AccountInfo, Bytecode};
 
 pub mod erc20_contract;
+use erc20_contract::ERC20Token;
 
 pub const GAS_LIMIT: u64 = 35_000;
 pub const ESTIMATED_GAS_USED: u64 = 29_738;
@@ -96,19 +96,20 @@ pub fn generate_erc20_batch(
             let recipient: Address = match transaction_mode_type {
                 TransactionModeType::SameCaller => sender,
                 TransactionModeType::Random => {
-                    eoa_addresses[rand::random::<usize>() % eoa_addresses.len()]
+                    eoa_addresses[rand::rng().random_range(0..eoa_addresses.len())]
                 }
                 TransactionModeType::Empty => Address::new([0; 20]),
             };
-            let to_address: Address = sca_addresses[rand::random::<usize>() % sca_addresses.len()];
+            let to_address: Address =
+                sca_addresses[rand::rng().random_range(0..sca_addresses.len())];
 
             let mut tx_env = TxEnv {
                 caller: sender,
                 gas_limit: GAS_LIMIT,
-                gas_price: U256::from(0xb2d05e07u64),
-                transact_to: TransactTo::Call(to_address),
+                gas_price: 0xb2d05e07u128,
+                kind: TxKind::Call(to_address),
                 value: U256::from(0),
-                nonce: Some(nonce as u64),
+                nonce: nonce as u64,
                 ..TxEnv::default()
             };
 
@@ -178,7 +179,7 @@ pub fn generate_cluster_and_txs(
 }
 
 /// Return a tuple of (contract_accounts, bytecodes)
-pub(crate) fn generate_contract_accounts(
+pub fn generate_contract_accounts(
     num_sca: usize,
     eoa_addresses: &[Address],
 ) -> (Vec<(Address, PlainAccount)>, HashMap<B256, Bytecode>) {
@@ -190,8 +191,7 @@ pub(crate) fn generate_contract_accounts(
             ERC20Token::new("Gold Token", "GLD", 18, 222_222_000_000_000_000_000_000u128)
                 .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
                 .build();
-        bytecodes
-            .insert(gld_account.info.code_hash, to_analysed(gld_account.info.code.take().unwrap()));
+        bytecodes.insert(gld_account.info.code_hash, gld_account.info.code.take().unwrap());
         accounts.push((gld_address, gld_account));
     }
     (accounts, bytecodes)

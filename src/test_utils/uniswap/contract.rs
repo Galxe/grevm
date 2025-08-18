@@ -1,13 +1,15 @@
-use crate::common::storage::{
-    from_address, from_indices, from_short_string, from_tick, StorageBuilder,
+use crate::test_utils::common::storage::{
+    StorageBuilder, from_address, from_indices, from_short_string, from_tick,
 };
 use revm::{
-    db::PlainAccount,
+    bytecode::Bytecode,
+    database::PlainAccount,
     primitives::{
-        fixed_bytes,
+        Address, B256, Bytes, FixedBytes, U256, fixed_bytes,
         hex::{FromHex, ToHexExt},
-        keccak256, uint, AccountInfo, Address, Bytecode, Bytes, FixedBytes, B256, U256,
+        keccak256, uint,
     },
+    state::AccountInfo,
 };
 use std::collections::HashMap;
 

@@ -1,8 +1,11 @@
-use crate::{GrevmError, ParallelState, TxId};
-use revm_primitives::{
-    db::{Database, DatabaseCommit, DatabaseRef},
-    Address, EVMError, ExecutionResult, InvalidTransaction, ResultAndState, TxEnv,
+use revm::{Database, DatabaseCommit, DatabaseRef};
+use revm_context::{
+    TxEnv,
+    result::{EVMError, ExecutionResult, InvalidTransaction, ResultAndState},
 };
+use revm_primitives::Address;
+
+use crate::{GrevmError, ParallelState, TxId};
 use std::cmp::Ordering;
 
 /// `StateAsyncCommit` asynchronously finalizes transaction states,
@@ -19,14 +22,19 @@ where
     results: Vec<ExecutionResult>,
     state: &'a ParallelState<DB>,
     commit_result: Result<(), GrevmError<DB::Error>>,
+    disable_nonce_check: bool,
 }
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
 where
     DB: DatabaseRef,
 {
-    pub(crate) fn new(coinbase: Address, state: &'a ParallelState<DB>) -> Self {
-        Self { coinbase, results: vec![], state, commit_result: Ok(()) }
+    pub(crate) fn new(
+        coinbase: Address,
+        state: &'a ParallelState<DB>,
+        disable_nonce_check: bool,
+    ) -> Self {
+        Self { coinbase, results: vec![], state, commit_result: Ok(()), disable_nonce_check }
     }
 
     fn state_mut(&self) -> &mut ParallelState<DB> {
@@ -60,17 +68,24 @@ where
         // processing without immediate validation failures. However, during the final commitment
         // phase, the system enforces strict nonce monotonicity checks to guarantee transaction
         // integrity and prevent double-spending attacks.
-        if let Some(tx) = tx_env.nonce {
+        let ResultAndState { result, state, lazy_reward } = result_and_state;
+        if !self.disable_nonce_check {
             match self.state.basic_ref(tx_env.caller) {
                 Ok(info) => {
                     if let Some(info) = info {
-                        let state = info.nonce;
-                        match tx.cmp(&state) {
+                        let expect = info.nonce;
+                        if let Some(change) = state.get(&tx_env.caller) {
+                            assert_eq!(change.info.nonce, expect + 1);
+                        }
+                        match tx_env.nonce.cmp(&expect) {
                             Ordering::Greater => {
                                 self.commit_result = Err(GrevmError {
                                     txid,
                                     error: EVMError::Transaction(
-                                        InvalidTransaction::NonceTooHigh { tx, state },
+                                        InvalidTransaction::NonceTooHigh {
+                                            tx: tx_env.nonce,
+                                            state: expect,
+                                        },
                                     ),
                                 });
                             }
@@ -78,8 +93,8 @@ where
                                 self.commit_result = Err(GrevmError {
                                     txid,
                                     error: EVMError::Transaction(InvalidTransaction::NonceTooLow {
-                                        tx,
-                                        state,
+                                        tx: tx_env.nonce,
+                                        state: expect,
                                     }),
                                 });
                             }
@@ -92,9 +107,9 @@ where
                 }
             }
         }
-        let ResultAndState { result, state, rewards } = result_and_state;
         self.results.push(result);
         self.state_mut().commit(state);
+
         // In Ethereum, each transaction includes a miner reward, which would introduce write
         // conflicts in the read-write set if implemented naively, preventing parallel transaction
         // execution. Grevm adopts an optimized approach: it defers miner reward distribution until
@@ -102,6 +117,6 @@ where
         // correct concurrency - even if subsequent transactions access the miner's account, they
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
-        assert!(self.state_mut().increment_balances(vec![(self.coinbase, rewards)]).is_ok());
+        assert!(self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]).is_ok());
     }
 }

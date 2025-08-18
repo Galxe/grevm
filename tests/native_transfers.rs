@@ -1,78 +1,71 @@
 #![allow(missing_docs)]
 
-pub mod common;
-
-use crate::common::{MINER_ADDRESS, START_ADDRESS};
-use common::storage::InMemoryDB;
-
-use revm::primitives::{alloy_primitives::U160, Address, TransactTo, TxEnv, U256};
-use std::collections::HashMap;
+use grevm::test_utils::{
+    TRANSFER_GAS_LIMIT,
+    common::{account, execute, storage::InMemoryDB},
+};
+use revm_context::TxEnv;
+use revm_primitives::{HashMap, TxKind, U256};
 
 const GIGA_GAS: u64 = 1_000_000_000;
 
 #[test]
 fn native_gigagas() {
-    let block_size = (GIGA_GAS as f64 / common::TRANSFER_GAS_LIMIT as f64).ceil() as usize;
-    let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let block_size = (GIGA_GAS as f64 / TRANSFER_GAS_LIMIT as f64).ceil() as usize;
+    let accounts = account::mock_block_accounts(block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    // START_ADDRESS + block_size
-    // let txs: Vec<TxEnv> = (1..=block_size)
     let txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
-            let address = Address::from(U160::from(START_ADDRESS + i));
+            let address = account::mock_eoa_address(i);
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(1),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, true, Default::default());
+    execute::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
 fn native_transfers_independent() {
     let block_size = 10_000; // number of transactions
-    let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let accounts = account::mock_block_accounts(block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
-            let address = Address::from(U160::from(START_ADDRESS + i));
+            let address = account::mock_eoa_address(i);
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(1),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: Some(1),
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, true, Default::default());
+    execute::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
 fn native_with_same_sender() {
     let block_size = 100;
-    let accounts = common::mock_block_accounts(START_ADDRESS, block_size + 1);
+    let accounts = account::mock_block_accounts(block_size + 1);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
 
-    let sender_address = Address::from(U160::from(START_ADDRESS));
-    let receiver_address = Address::from(U160::from(START_ADDRESS + 1));
+    let sender_address = account::mock_eoa_address(0);
+    let receiver_address = account::mock_eoa_address(1);
     let mut sender_nonce = 0;
     let txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
             let (address, to, _) = if i % 4 != 1 {
-                (
-                    Address::from(U160::from(START_ADDRESS + i)),
-                    Address::from(U160::from(START_ADDRESS + i)),
-                    1,
-                )
+                (account::mock_eoa_address(i), account::mock_eoa_address(i), 1)
             } else {
                 sender_nonce += 1;
                 (sender_address, receiver_address, sender_nonce)
@@ -80,257 +73,248 @@ fn native_with_same_sender() {
 
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(i),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
                 // If setting nonce, then nonce validation against the account's nonce,
                 // the parallel execution will fail for the nonce validation.
                 // However, the failed evm.transact() doesn't generate write set,
                 // then there's no dependency can be detected even two txs are related.
                 // TODO(gaoxin): lazily update nonce
-                nonce: None,
+                nonce: 0,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, false, Default::default());
+    execute::compare_evm_execute(db, txs, false, true, Default::default());
 }
 
 #[test]
 fn native_with_all_related() {
     let block_size = 47620;
-    let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let accounts = account::mock_block_accounts(block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
             // tx(i) => tx(i+1), all transactions should execute sequentially.
-            let from = Address::from(U160::from(START_ADDRESS + i));
-            let to = Address::from(U160::from(START_ADDRESS + i + 1));
+            let from = account::mock_eoa_address(i);
+            let to = account::mock_eoa_address(i + 1);
 
             TxEnv {
                 caller: from,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(1000),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
+                nonce: 0,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, false, Default::default());
+    execute::compare_evm_execute(db, txs, false, true, Default::default());
 }
 
 #[test]
 fn native_with_unconfirmed_reuse() {
     let block_size = 100;
-    let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let accounts = account::mock_block_accounts(block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
             let (from, to) = if i % 10 == 0 {
-                (
-                    Address::from(U160::from(START_ADDRESS + i)),
-                    Address::from(U160::from(START_ADDRESS + i + 1)),
-                )
+                (account::mock_eoa_address(i), account::mock_eoa_address(i + 1))
             } else {
-                (
-                    Address::from(U160::from(START_ADDRESS + i)),
-                    Address::from(U160::from(START_ADDRESS + i)),
-                )
+                (account::mock_eoa_address(i), account::mock_eoa_address(i))
             };
             // tx0 tx10, tx20, tx30 ... tx90 will produce dependency for the next tx,
             // so tx1, tx11, tx21, tx31, tx91 maybe redo on next round.
             // However, tx2 ~ tx9, tx12 ~ tx19 can reuse the result from the pre-round context.
             TxEnv {
                 caller: from,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(100),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
+                nonce: 0,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, false, HashMap::new());
+    execute::compare_evm_execute(db, txs, false, true, HashMap::new());
 }
 
 #[test]
 fn native_zero_or_one_tx() {
-    let accounts = common::mock_block_accounts(START_ADDRESS, 0);
+    let accounts = account::mock_block_accounts(0);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = vec![];
     // empty block
-    common::compare_evm_execute(db, txs, false, HashMap::new());
+    execute::compare_evm_execute(db, txs, false, false, HashMap::new());
 
     // one tx
     let txs = vec![TxEnv {
-        caller: Address::from(U160::from(START_ADDRESS)),
-        transact_to: TransactTo::Call(Address::from(U160::from(START_ADDRESS))),
+        caller: account::mock_eoa_address(0),
+        kind: TxKind::Call(account::mock_eoa_address(0)),
         value: U256::from(1000),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: None,
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 1,
         ..TxEnv::default()
     }];
-    let accounts = common::mock_block_accounts(START_ADDRESS, 1);
+    let accounts = account::mock_block_accounts(1);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    common::compare_evm_execute(db, txs, false, HashMap::new());
+    execute::compare_evm_execute(db, txs, false, false, HashMap::new());
 }
 
 #[test]
 fn native_loaded_not_existing_account() {
     let block_size = 100; // number of transactions
-    let mut accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let mut accounts = account::mock_block_accounts(block_size);
     // remove miner address
-    let miner_address = Address::from(U160::from(MINER_ADDRESS));
-    accounts.remove(&miner_address);
+    accounts.remove(&account::MINER_ADDRESS);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    let txs: Vec<TxEnv> = (START_ADDRESS..START_ADDRESS + block_size)
+    let txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
-            let address = Address::from(U160::from(i));
+            let address = account::mock_eoa_address(i);
             // transfer to not existing account
-            let to = Address::from(U160::from(i + block_size));
+            let to = account::mock_eoa_address(i + block_size);
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(to),
+                kind: TxKind::Call(to),
                 value: U256::from(999),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: Some(1),
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    common::compare_evm_execute(db, txs, true, HashMap::new());
+    execute::compare_evm_execute(db, txs, true, false, HashMap::new());
 }
 
 #[test]
 fn native_transfer_with_beneficiary() {
     let block_size = 20; // number of transactions
-    let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let accounts = account::mock_block_accounts(block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    let mut txs: Vec<TxEnv> = (START_ADDRESS..START_ADDRESS + block_size)
+    let mut txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
-            let address = Address::from(U160::from(i));
+            let address = account::mock_eoa_address(i);
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(100),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    let start_address = Address::from(U160::from(START_ADDRESS));
-    let miner_address = Address::from(U160::from(MINER_ADDRESS));
+    let start_address = account::mock_eoa_address(0);
     // miner => start
     txs.push(TxEnv {
-        caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        caller: account::MINER_ADDRESS,
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(1),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 1,
         ..TxEnv::default()
     });
     // miner => start
     txs.push(TxEnv {
-        caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        caller: account::MINER_ADDRESS,
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // start => miner
     txs.push(TxEnv {
         caller: start_address,
-        transact_to: TransactTo::Call(miner_address),
+        kind: TxKind::Call(account::MINER_ADDRESS),
         value: U256::from(1),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // miner => miner
     txs.push(TxEnv {
-        caller: miner_address,
-        transact_to: TransactTo::Call(miner_address),
+        caller: account::MINER_ADDRESS,
+        kind: TxKind::Call(account::MINER_ADDRESS),
         value: U256::from(1),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(3),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 3,
         ..TxEnv::default()
     });
-    common::compare_evm_execute(db, txs, true, Default::default());
+    execute::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
 fn native_transfer_with_beneficiary_enough() {
     let block_size = 20; // number of transactions
-    let accounts = common::mock_block_accounts(START_ADDRESS, block_size);
+    let accounts = account::mock_block_accounts(block_size);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    let mut txs: Vec<TxEnv> = (START_ADDRESS..START_ADDRESS + block_size)
+    let mut txs: Vec<TxEnv> = (0..block_size)
         .map(|i| {
-            let address = Address::from(U160::from(i));
+            let address = account::mock_eoa_address(i);
             TxEnv {
                 caller: address,
-                transact_to: TransactTo::Call(address),
+                kind: TxKind::Call(address),
                 value: U256::from(100),
-                gas_limit: common::TRANSFER_GAS_LIMIT,
-                gas_price: U256::from(1),
-                nonce: None,
+                gas_limit: TRANSFER_GAS_LIMIT,
+                gas_price: 1,
+                nonce: 1,
                 ..TxEnv::default()
             }
         })
         .collect();
-    let start_address = Address::from(U160::from(START_ADDRESS));
-    let miner_address = Address::from(U160::from(MINER_ADDRESS));
+    let start_address = account::mock_eoa_address(0);
     // start => miner
     txs.push(TxEnv {
         caller: start_address,
-        transact_to: TransactTo::Call(miner_address),
+        kind: TxKind::Call(account::MINER_ADDRESS),
         value: U256::from(100000),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // miner => start
     txs.push(TxEnv {
-        caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        caller: account::MINER_ADDRESS,
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(1),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 1,
         ..TxEnv::default()
     });
     // miner => start
     txs.push(TxEnv {
-        caller: miner_address,
-        transact_to: TransactTo::Call(start_address),
+        caller: account::MINER_ADDRESS,
+        kind: TxKind::Call(start_address),
         value: U256::from(1),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(2),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 2,
         ..TxEnv::default()
     });
     // miner => miner
     txs.push(TxEnv {
-        caller: miner_address,
-        transact_to: TransactTo::Call(miner_address),
+        caller: account::MINER_ADDRESS,
+        kind: TxKind::Call(account::MINER_ADDRESS),
         value: U256::from(1),
-        gas_limit: common::TRANSFER_GAS_LIMIT,
-        gas_price: U256::from(1),
-        nonce: Some(3),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 3,
         ..TxEnv::default()
     });
-    common::compare_evm_execute(db, txs, true, Default::default());
+    execute::compare_evm_execute(db, txs, true, false, Default::default());
 }
