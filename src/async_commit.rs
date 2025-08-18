@@ -75,7 +75,7 @@ where
                     if let Some(info) = info {
                         let expect = info.nonce;
                         if let Some(change) = state.get(&tx_env.caller) {
-                            assert!(change.info.nonce == expect + 1);
+                            assert_eq!(change.info.nonce, expect + 1);
                         }
                         match tx_env.nonce.cmp(&expect) {
                             Ordering::Greater => {

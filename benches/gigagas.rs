@@ -251,6 +251,11 @@ fn benchmark_gigagas(c: &mut Criterion) {
     let hot_ratio = std::env::var("HOT_RATIO").map(|s| s.parse().unwrap()).unwrap_or(0.0);
     let filter: String = std::env::var("FILTER").unwrap_or_default();
     let filter: HashSet<&str> = filter.split(',').filter(|s| !s.is_empty()).collect();
+    if std::env::var("ASYNC_COMMIT_STATE").is_err() {
+        unsafe {
+            std::env::set_var("ASYNC_COMMIT_STATE", "false");
+        }
+    }
 
     if !filter.is_empty() && filter.contains("independent") {
         bench_raw_transfers(c, db_latency_us);
@@ -261,9 +266,6 @@ fn benchmark_gigagas(c: &mut Criterion) {
         bench_dependent_erc20(c, db_latency_us, num_eoa, hot_ratio);
         bench_hybrid(c, db_latency_us, num_eoa, hot_ratio);
     } else if !filter.is_empty() && filter.contains("worst") {
-        unsafe {
-            std::env::set_var("WITH_HINTS", "true");
-        }
         bench_worst_raw_transfers(c, db_latency_us);
         bench_worst_erc20(c, db_latency_us);
         bench_worst_uniswap(c, db_latency_us, num_eoa, hot_ratio);
