@@ -1,6 +1,6 @@
 [package]
 name = "grevm"
-version = "0.1.0"
+version = "2.2.0"
 edition = "2024"
 description = "Create Parallel EVM"
 build = "build.rs"
