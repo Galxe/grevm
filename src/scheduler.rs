@@ -10,7 +10,9 @@ use dashmap::DashMap;
 use metrics::histogram;
 use metrics_derive::Metrics;
 use parking_lot::Mutex;
-use revm::{Context, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles};
+use revm::{
+    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
+};
 use revm_context::{
     BlockEnv, CfgEnv, TxEnv,
     result::{EVMError, ExecutionResult},
@@ -219,7 +221,7 @@ impl SchedulerContext {
         self.validation_idx.load(Ordering::Relaxed)
     }
 
-    fn should_shedule(&self, executing_idx: usize) -> bool {
+    fn should_schedule(&self, executing_idx: usize) -> bool {
         let validation_idx = self.validation_idx.load(Ordering::Relaxed);
         let should_validation =
             validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx();
@@ -424,6 +426,11 @@ where
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
         );
+        let fallback =
+            std::env::var("GREVM_FALLBACK_SEQUENTIAL").map_or(true, |s| s.parse().unwrap());
+        if fallback && self.block_size < concurrency_level * 4 {
+            return self.fallback_sequential();
+        }
         let commiter = Mutex::new(StateAsyncCommit::new(
             self.env.beneficiary,
             &self.state,
@@ -520,11 +527,51 @@ where
                     // degradation that could otherwise drastically slow down parallel execution
                     // throughput.
                     AbortReason::SelfDestructed | AbortReason::FallbackSequential => {
-                        panic!("Not support fallback yet");
+                        return self.fallback_sequential();
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn state_mut(&self) -> &mut ParallelState<DB> {
+        #[allow(invalid_reference_casting)]
+        unsafe {
+            &mut *(&self.state as *const ParallelState<DB> as *mut ParallelState<DB>)
+        }
+    }
+
+    /// Fallback to sequential execution
+    pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
+        let mut results = self.results.lock();
+        let num_commit = results.len();
+        if num_commit == self.block_size {
+            return Ok(());
+        }
+
+        let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
+        let state_mut = self.state_mut();
+        {
+            let evm = Context::mainnet()
+                .with_db(state_mut)
+                .with_cfg(self.cfg.clone())
+                .with_block(self.env.clone())
+                .build_mainnet_with_inspector(NoOpInspector {})
+                .with_precompiles(PrecompilesMap::from_static(
+                    EthPrecompiles::default().precompiles,
+                ));
+            let mut evm = EthEvm::new(evm, false);
+            for txid in num_commit..self.block_size {
+                let tx_env = self.txs[txid].clone();
+                let result_and_state =
+                    evm.transact_raw(tx_env).map_err(|e| GrevmError { txid, error: e.clone() })?;
+                evm.db_mut().commit(result_and_state.state);
+                sequential_results.push(result_and_state.result);
+                self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        results.extend(sequential_results);
         Ok(())
     }
 
@@ -805,7 +852,7 @@ where
 
     fn next(&self) -> Option<Task> {
         while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
-            if !self.scheduler_ctx.should_shedule(self.tx_dependency.index()) {
+            if !self.scheduler_ctx.should_schedule(self.tx_dependency.index()) {
                 thread::yield_now();
             }
 
