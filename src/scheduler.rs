@@ -1,7 +1,7 @@
 use crate::{
-    AbortReason, CONCURRENT_LEVEL, GrevmError, LocationAndType, MemoryEntry, ParallelState,
-    ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
-    async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
+    AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType, MemoryEntry,
+    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
+    TxVersion, async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
     tx_dependency::TxDependency, utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -11,7 +11,8 @@ use metrics::histogram;
 use metrics_derive::Metrics;
 use parking_lot::Mutex;
 use revm::{
-    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
+    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext,
+    precompile::{PrecompileSpecId, Precompiles},
 };
 use revm_context::{
     BlockEnv, CfgEnv, TxEnv,
@@ -186,19 +187,19 @@ impl SchedulerContext {
 
     fn reset_validation_idx(&self, index: usize) {
         if index < self.num_txs {
-            let ts = self.logical_ts.fetch_add(1, Ordering::Relaxed);
+            let ts = self.logical_ts.fetch_add(1, Ordering::AcqRel);
             // Rolling back the `validation_idx` implies that the commitment time of subsequent
             // transactions must be logically later than the current timestamp.
-            self.lower_ts[index].fetch_max(ts, Ordering::Release);
-            let prev = self.validation_idx.fetch_min(index, Ordering::Relaxed);
+            self.lower_ts[index].fetch_max(ts, Ordering::AcqRel);
+            let prev = self.validation_idx.fetch_min(index, Ordering::AcqRel);
             if prev > index {
-                self.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
+                self.reset_validation_idx_cnt.fetch_add(1, Ordering::AcqRel);
             }
         }
     }
 
     fn logical_timestamp(&self) -> usize {
-        self.logical_ts.fetch_add(1, Ordering::Relaxed)
+        self.logical_ts.fetch_add(1, Ordering::AcqRel)
     }
 
     fn executed(&self, index: usize) {
@@ -206,23 +207,23 @@ impl SchedulerContext {
     }
 
     fn unconfirmed(&self, index: usize, ts: usize) {
-        self.unconfirmed_ts[index].fetch_max(ts, Ordering::Release);
+        self.unconfirmed_ts[index].fetch_max(ts, Ordering::AcqRel);
     }
 
     fn finished(&self) -> bool {
-        self.finality_idx.load(Ordering::Relaxed) >= self.num_txs
+        self.finality_idx.load(Ordering::Acquire) >= self.num_txs
     }
 
     fn finality_idx(&self) -> usize {
-        self.finality_idx.load(Ordering::Relaxed)
+        self.finality_idx.load(Ordering::Acquire)
     }
 
     fn validation_idx(&self) -> usize {
-        self.validation_idx.load(Ordering::Relaxed)
+        self.validation_idx.load(Ordering::Acquire)
     }
 
     fn should_schedule(&self, executing_idx: usize) -> bool {
-        let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+        let validation_idx = self.validation_idx.load(Ordering::Acquire);
         let should_validation =
             validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx();
         let should_execution = executing_idx < self.num_txs;
@@ -230,9 +231,9 @@ impl SchedulerContext {
     }
 
     fn next_validation_idx(&self, executing_idx: usize) -> Option<usize> {
-        let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+        let validation_idx = self.validation_idx.load(Ordering::Acquire);
         if validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx() {
-            let validation_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);
+            let validation_idx = self.validation_idx.fetch_add(1, Ordering::AcqRel);
             if validation_idx < self.num_txs {
                 return Some(validation_idx);
             }
@@ -326,7 +327,7 @@ where
         let mut finality_idx = 0;
         let mut lower_ts = 0;
         let dependency_distance = histogram!("grevm.dependency_distance");
-        while !self.abort.load(Ordering::Relaxed) && finality_idx < self.block_size {
+        while !self.abort.load(Ordering::Acquire) && finality_idx < self.block_size {
             while finality_idx < self.block_size &&
                 finality_idx < self.scheduler_ctx.validation_idx()
             {
@@ -346,7 +347,7 @@ where
                 }
                 let mut tx_state = self.tx_states[finality_idx].lock();
                 tx_state.status = TransactionStatus::Finality;
-                self.scheduler_ctx.finality_idx.fetch_add(1, Ordering::Relaxed);
+                self.scheduler_ctx.finality_idx.fetch_add(1, Ordering::AcqRel);
 
                 if tx_state.incarnation > 1 {
                     self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
@@ -387,8 +388,8 @@ where
         let mut commiter = commiter.lock();
         let async_commit_state =
             std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap());
-        while !self.abort.load(Ordering::Relaxed) && commit_idx < self.block_size {
-            while commit_idx < self.scheduler_ctx.finality_idx.load(Ordering::Relaxed) {
+        while !self.abort.load(Ordering::Acquire) && commit_idx < self.block_size {
+            while commit_idx < self.scheduler_ctx.finality_idx.load(Ordering::Acquire) {
                 if async_commit_state {
                     let result = self.tx_results[commit_idx].lock().take().unwrap().execute_result;
                     let Ok(result) = result else { panic!("Commit error tx: {}", commit_idx) };
@@ -402,7 +403,7 @@ where
                         return;
                     }
                 }
-                self.scheduler_ctx.commit_idx.fetch_add(1, Ordering::Release);
+                self.scheduler_ctx.commit_idx.fetch_add(1, Ordering::AcqRel);
                 self.tx_dependency.commit(commit_idx);
                 commit_idx += 1;
             }
@@ -426,9 +427,7 @@ where
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
         );
-        let fallback =
-            std::env::var("GREVM_FALLBACK_SEQUENTIAL").map_or(true, |s| s.parse().unwrap());
-        if fallback && self.block_size < concurrency_level * 4 {
+        if *FALLBACK_SEQUENTIAL {
             return self.fallback_sequential();
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
@@ -450,6 +449,7 @@ where
             for _ in 0..concurrency_level {
                 scope.spawn(|| {
                     let cache_db = CacheDB::new(
+                        self.cfg.spec,
                         self.env.beneficiary,
                         &self.state,
                         &self.mv_memory,
@@ -465,9 +465,9 @@ where
                         .with_cfg(cfg)
                         .with_block(self.env.clone())
                         .build_mainnet_with_inspector(NoOpInspector {})
-                        .with_precompiles(PrecompilesMap::from_static(
-                            EthPrecompiles::default().precompiles,
-                        ));
+                        .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
+                            PrecompileSpecId::from_spec_id(self.cfg.spec),
+                        )));
                     let mut evm = EthEvm::new(evm, false);
 
                     let mut task = self.next();
@@ -476,7 +476,7 @@ where
                             Task::Execution(tx_version) => self.execute(&mut evm, tx_version),
                             Task::Validation(tx_version) => self.validate(tx_version),
                         };
-                        if task.is_none() && !self.abort.load(Ordering::Relaxed) {
+                        if task.is_none() && !self.abort.load(Ordering::Acquire) {
                             task = self.next();
                         }
                     }
@@ -503,7 +503,7 @@ where
     }
 
     fn post_execute(&self) -> Result<(), GrevmError<DB::Error>> {
-        if self.abort.load(Ordering::Relaxed) {
+        if self.abort.load(Ordering::Acquire) {
             if let Some(abort_reason) = self.abort_reason.get() {
                 match abort_reason {
                     AbortReason::EvmError => {
@@ -558,9 +558,9 @@ where
                 .with_cfg(self.cfg.clone())
                 .with_block(self.env.clone())
                 .build_mainnet_with_inspector(NoOpInspector {})
-                .with_precompiles(PrecompilesMap::from_static(
-                    EthPrecompiles::default().precompiles,
-                ));
+                .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
+                    PrecompileSpecId::from_spec_id(self.cfg.spec),
+                )));
             let mut evm = EthEvm::new(evm, false);
             for txid in num_commit..self.block_size {
                 let tx_env = self.txs[txid].clone();
@@ -577,7 +577,7 @@ where
 
     fn abort(&self, abort_reason: AbortReason) {
         self.abort_reason.get_or_init(|| abort_reason);
-        self.abort.store(true, Ordering::Relaxed);
+        self.abort.store(true, Ordering::Release);
     }
 
     /// After execution, transactions are marked as conflict status in three scenarios:
@@ -851,7 +851,7 @@ where
     }
 
     fn next(&self) -> Option<Task> {
-        while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
+        while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Acquire) {
             if !self.scheduler_ctx.should_schedule(self.tx_dependency.index()) {
                 thread::yield_now();
             }

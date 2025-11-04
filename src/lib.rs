@@ -37,6 +37,8 @@ use std::{cmp::min, thread};
 lazy_static! {
     static ref CONCURRENT_LEVEL: usize =
         thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    static ref FALLBACK_SEQUENTIAL: bool =
+        std::env::var("GREVM_FALLBACK_SEQUENTIAL").map_or(false, |s| s.parse().unwrap_or(false));
 }
 
 type TxId = usize;
