@@ -9,7 +9,7 @@ use revm_database::{
     AccountRevert, BundleAccount, BundleState, TransitionState,
     states::bundle_state::BundleRetention,
 };
-use revm_primitives::{Address, B256, U256};
+use revm_primitives::{Address, B256, U256, hardfork::SpecId};
 use revm_state::{AccountInfo, Bytecode, EvmState};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -129,6 +129,7 @@ pub(crate) struct CacheDB<'a, DB>
 where
     DB: DatabaseRef,
 {
+    spec: SpecId,
     coinbase: Address,
     db: &'a DB,
     mv_memory: &'a MVMemory,
@@ -146,12 +147,14 @@ where
     DB: DatabaseRef,
 {
     pub(crate) fn new(
+        spec: SpecId,
         coinbase: Address,
         db: &'a DB,
         mv_memory: &'a MVMemory,
         commit_idx: &'a AtomicUsize,
     ) -> Self {
         Self {
+            spec,
             coinbase,
             db,
             mv_memory,
@@ -194,7 +197,7 @@ where
             if *address == self.coinbase {
                 continue;
             }
-            if account.is_selfdestructed() {
+            if account.is_selfdestructed() || account.state_clear_aware_is_empty(self.spec) {
                 let memory_entry = MemoryEntry::new(
                     self.current_tx.incarnation,
                     MemoryValue::SelfDestructed,
@@ -390,7 +393,9 @@ where
                     result = Some(info.clone());
                 }
             }
-            self.read_accounts.insert(address, read_account);
+            if result.is_some() {
+                self.read_accounts.insert(address, read_account);
+            }
             self.read_set.insert(location, read_version);
         }
 
