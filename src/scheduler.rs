@@ -1,8 +1,8 @@
 use crate::{
     AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType, MemoryEntry,
-    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
-    TxVersion, async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::ContinuousDetectSet,
+    ParallelState, PrewarmTask, ReadVersion, Task, TransactionResult, TransactionStatus, TxId,
+    TxState, TxVersion, async_commit::StateAsyncCommit, hint::ParallelExecutionHints,
+    storage::CacheDB, tx_dependency::TxDependency, utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
@@ -19,6 +19,7 @@ use revm_context::{
     result::{EVMError, ExecutionResult},
 };
 use revm_inspector::NoOpInspector;
+use tokio::sync::mpsc;
 
 use std::{
     cmp::max,
@@ -269,6 +270,7 @@ where
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason>,
     metrics: ExecuteMetricsCollector,
+    prewarm_sender: Option<mpsc::UnboundedSender<PrewarmTask>>,
 }
 
 impl<DB> Debug for Scheduler<DB>
@@ -319,7 +321,14 @@ where
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
+            prewarm_sender: None,
         }
+    }
+
+    /// Sets the prewarm sender for MPT prewarming.
+    pub fn with_prewarm_sender(mut self, sender: mpsc::UnboundedSender<PrewarmTask>) -> Self {
+        self.prewarm_sender = Some(sender);
+        self
     }
 
     fn async_finality(&self) {
@@ -430,12 +439,15 @@ where
         if *FALLBACK_SEQUENTIAL {
             return self.fallback_sequential();
         }
-        let commiter = Mutex::new(StateAsyncCommit::new(
-            self.env.beneficiary,
-            &self.state,
-            self.cfg.disable_nonce_check,
-        ));
-        commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
+        let mut commiter =
+            StateAsyncCommit::new(self.env.beneficiary, &self.state, self.cfg.disable_nonce_check);
+        let block_number = self.env.number.to::<u64>();
+        commiter = commiter.with_block_number(block_number);
+        if let Some(ref sender) = self.prewarm_sender {
+            commiter = commiter.with_prewarm_sender(sender.clone());
+        }
+        commiter.init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
+        let commiter = Mutex::new(commiter);
         thread::scope(|scope| {
             scope.spawn(|| {
                 self.async_finality();

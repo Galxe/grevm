@@ -25,6 +25,7 @@ alloy-evm = { package = "alloy-evm", git = "https://github.com/Galxe/alloy-evm",
 # async
 futures = "0.3"
 rand = "0.9"
+tokio = { version = "1.44", features = ["sync"] }
 auto_impl = "1.3"
 lazy_static = "1.5.0"
 dashmap = "6.0"
