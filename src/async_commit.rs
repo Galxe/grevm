@@ -4,8 +4,9 @@ use revm_context::{
     result::{EVMError, ExecutionResult, InvalidTransaction, ResultAndState},
 };
 use revm_primitives::Address;
+use tokio::sync::mpsc;
 
-use crate::{GrevmError, ParallelState, TxId};
+use crate::{GrevmError, ParallelState, PrewarmTask, TxId};
 use std::cmp::Ordering;
 
 /// `StateAsyncCommit` asynchronously finalizes transaction states,
@@ -23,6 +24,8 @@ where
     state: &'a ParallelState<DB>,
     commit_result: Result<(), GrevmError<DB::Error>>,
     disable_nonce_check: bool,
+    block_number: u64,
+    prewarm_sender: Option<mpsc::UnboundedSender<PrewarmTask>>,
 }
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
@@ -34,7 +37,30 @@ where
         state: &'a ParallelState<DB>,
         disable_nonce_check: bool,
     ) -> Self {
-        Self { coinbase, results: vec![], state, commit_result: Ok(()), disable_nonce_check }
+        Self {
+            coinbase,
+            results: vec![],
+            state,
+            commit_result: Ok(()),
+            disable_nonce_check,
+            block_number: 0,
+            prewarm_sender: None,
+        }
+    }
+
+    /// Sets the block number for prewarm task validation.
+    pub(crate) fn with_block_number(mut self, block_number: u64) -> Self {
+        self.block_number = block_number;
+        self
+    }
+
+    /// Sets the prewarm sender for MPT prewarming.
+    pub(crate) fn with_prewarm_sender(
+        mut self,
+        sender: mpsc::UnboundedSender<PrewarmTask>,
+    ) -> Self {
+        self.prewarm_sender = Some(sender);
+        self
     }
 
     fn state_mut(&self) -> &mut ParallelState<DB> {
@@ -69,6 +95,9 @@ where
         // phase, the system enforces strict nonce monotonicity checks to guarantee transaction
         // integrity and prevent double-spending attacks.
         let ResultAndState { result, state, lazy_reward } = result_and_state;
+
+        let state_for_prewarm = self.prewarm_sender.as_ref().map(|_| state.clone());
+
         if !self.disable_nonce_check {
             match self.state.basic_ref(tx_env.caller) {
                 Ok(info) => {
@@ -118,5 +147,16 @@ where
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
         assert!(self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]).is_ok());
+
+        // Send prewarm task for MPT prewarming if sender is available
+        if let Some(ref sender) = self.prewarm_sender.as_ref() {
+            // state_for_prewarm is Some if and only if prewarm_sender is Some
+            let state = state_for_prewarm
+                .expect("state_for_prewarm should be Some when prewarm_sender is Some");
+            let _ = sender.send(PrewarmTask {
+                block_number: self.block_number,
+                evm_state: state,
+            });
+        }
     }
 }
