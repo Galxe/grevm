@@ -1,25 +1,25 @@
 use crate::{
-    async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::ContinuousDetectSet, AbortReason, GrevmError,
-    LocationAndType, MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult,
-    TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL,
+    AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType, MemoryEntry,
+    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
+    TxVersion, async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
+    tx_dependency::TxDependency, utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use alloy_evm::{
-    precompiles::{DynPrecompile, PrecompilesMap},
     EthEvm, Evm,
+    precompiles::{DynPrecompile, PrecompilesMap},
 };
 use dashmap::DashMap;
 use metrics::histogram;
 use metrics_derive::Metrics;
 use parking_lot::Mutex;
 use revm::{
-    precompile::{PrecompileSpecId, Precompiles},
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext,
+    precompile::{PrecompileSpecId, Precompiles},
 };
 use revm_context::{
-    result::{EVMError, ExecutionResult},
     BlockEnv, CfgEnv, TxEnv,
+    result::{EVMError, ExecutionResult},
 };
 use revm_inspector::NoOpInspector;
 use revm_primitives::Address;
@@ -29,8 +29,8 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Instant,
@@ -336,8 +336,8 @@ where
         let mut lower_ts = 0;
         let dependency_distance = histogram!("grevm.dependency_distance");
         while !self.abort.load(Ordering::Acquire) && finality_idx < self.block_size {
-            while finality_idx < self.block_size
-                && finality_idx < self.scheduler_ctx.validation_idx()
+            while finality_idx < self.block_size &&
+                finality_idx < self.scheduler_ctx.validation_idx()
             {
                 if self.tx_states[finality_idx].lock().status != TransactionStatus::Unconfirmed {
                     break;
@@ -348,8 +348,8 @@ where
                 );
                 // Rolling back the `validation_idx` implies that the commitment time of subsequent
                 // transactions must be logically later than the current timestamp.
-                if self.scheduler_ctx.unconfirmed_ts[finality_idx].load(Ordering::Acquire)
-                    <= lower_ts
+                if self.scheduler_ctx.unconfirmed_ts[finality_idx].load(Ordering::Acquire) <=
+                    lower_ts
                 {
                     break;
                 }
@@ -779,8 +779,8 @@ where
                     if latest_version.estimate {
                         conflict = true;
                     } else if let ReadVersion::MvMemory(version) = version {
-                        if version.txid != previous_id
-                            || version.incarnation != latest_version.incarnation
+                        if version.txid != previous_id ||
+                            version.incarnation != latest_version.incarnation
                         {
                             conflict = true;
                         }
@@ -814,11 +814,7 @@ where
         if conflict {
             // update dependency
             let dep_tx = dependency.and_then(|dep| {
-                if dep >= self.scheduler_ctx.finality_idx() {
-                    Some(dep)
-                } else {
-                    None
-                }
+                if dep >= self.scheduler_ctx.finality_idx() { Some(dep) } else { None }
             });
             self.tx_dependency.add(txid, dep_tx);
         }
@@ -846,8 +842,8 @@ where
                 // To prevent dependency explosion, only add the tx with the highest TxId in
                 // written_transactions
                 if let Some((&dep_id, _)) = written_transactions.range(..txid).next_back() {
-                    if (max_dep_id.is_none() || dep_id > max_dep_id.unwrap())
-                        && dep_id >= self.scheduler_ctx.finality_idx()
+                    if (max_dep_id.is_none() || dep_id > max_dep_id.unwrap()) &&
+                        dep_id >= self.scheduler_ctx.finality_idx()
                     {
                         max_dep_id = Some(dep_id);
                         if dep_id == txid - 1 {
