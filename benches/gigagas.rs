@@ -48,6 +48,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
                     black_box(txs.clone()),
                     black_box(state),
                     with_hints,
+                    None,
                 );
                 executor.parallel_execute(None).unwrap();
             });

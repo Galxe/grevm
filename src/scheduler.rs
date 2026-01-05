@@ -5,7 +5,10 @@ use crate::{
     tx_dependency::TxDependency, utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
+use alloy_evm::{
+    EthEvm, Evm,
+    precompiles::{DynPrecompile, PrecompilesMap},
+};
 use dashmap::DashMap;
 use metrics::histogram;
 use metrics_derive::Metrics;
@@ -19,6 +22,7 @@ use revm_context::{
     result::{EVMError, ExecutionResult},
 };
 use revm_inspector::NoOpInspector;
+use revm_primitives::Address;
 
 use std::{
     cmp::max,
@@ -265,6 +269,7 @@ where
 
     mv_memory: MVMemory,
     scheduler_ctx: SchedulerContext,
+    custom_precompiles: Arc<std::collections::HashMap<Address, DynPrecompile>>,
 
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason>,
@@ -297,6 +302,7 @@ where
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
         with_hints: bool,
+        custom_precompiles: Option<Arc<std::collections::HashMap<Address, DynPrecompile>>>,
     ) -> Self {
         let num_txs = txs.len();
         let tx_dependency = if with_hints {
@@ -316,6 +322,8 @@ where
             tx_dependency,
             mv_memory: MVMemory::new(),
             scheduler_ctx: SchedulerContext::new(num_txs),
+            custom_precompiles: custom_precompiles
+                .unwrap_or_else(|| Arc::new(std::collections::HashMap::new())),
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
@@ -469,6 +477,12 @@ where
                             PrecompileSpecId::from_spec_id(self.cfg.spec),
                         )));
                     let mut evm = EthEvm::new(evm, false);
+                    // Apply additional precompiles if provided
+                    for (address, precompile) in self.custom_precompiles.iter() {
+                        let precompile_clone = precompile.clone();
+                        evm.precompiles_mut()
+                            .apply_precompile(address, move |_| Some(precompile_clone));
+                    }
 
                     let mut task = self.next();
                     while task.is_some() {
@@ -562,6 +576,11 @@ where
                     PrecompileSpecId::from_spec_id(self.cfg.spec),
                 )));
             let mut evm = EthEvm::new(evm, false);
+            // Apply additional precompiles if provided
+            for (address, precompile) in self.custom_precompiles.iter() {
+                let precompile_clone = precompile.clone();
+                evm.precompiles_mut().apply_precompile(address, move |_| Some(precompile_clone));
+            }
             for txid in num_commit..self.block_size {
                 let tx_env = self.txs[txid].clone();
                 let result_and_state =

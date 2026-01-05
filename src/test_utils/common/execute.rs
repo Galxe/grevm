@@ -92,7 +92,8 @@ pub fn compare_evm_execute<DB>(
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
         let state = ParallelState::new(db.clone(), true, true);
-        let executor = Scheduler::new(cfg.clone(), env.clone(), txs.clone(), state, with_hints);
+        let executor =
+            Scheduler::new(cfg.clone(), env.clone(), txs.clone(), state, with_hints, None);
         // set determined partitions
         executor.parallel_execute(Some(23)).expect("parallel execute failed");
         println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
