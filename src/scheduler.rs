@@ -269,7 +269,7 @@ where
 
     mv_memory: MVMemory,
     scheduler_ctx: SchedulerContext,
-    custom_precompiles: Arc<std::collections::HashMap<Address, DynPrecompile>>,
+    custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>,
 
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason>,
@@ -302,7 +302,7 @@ where
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
         with_hints: bool,
-        custom_precompiles: Option<Arc<std::collections::HashMap<Address, DynPrecompile>>>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
     ) -> Self {
         let num_txs = txs.len();
         let tx_dependency = if with_hints {
@@ -322,8 +322,7 @@ where
             tx_dependency,
             mv_memory: MVMemory::new(),
             scheduler_ctx: SchedulerContext::new(num_txs),
-            custom_precompiles: custom_precompiles
-                .unwrap_or_else(|| Arc::new(std::collections::HashMap::new())),
+            custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
@@ -481,7 +480,7 @@ where
                     for (address, precompile) in self.custom_precompiles.iter() {
                         let precompile_clone = precompile.clone();
                         evm.precompiles_mut()
-                            .apply_precompile(address, move |_| Some(precompile_clone));
+                            .apply_precompile(&address, move |_| Some(precompile_clone));
                     }
 
                     let mut task = self.next();
@@ -579,7 +578,7 @@ where
             // Apply additional precompiles if provided
             for (address, precompile) in self.custom_precompiles.iter() {
                 let precompile_clone = precompile.clone();
-                evm.precompiles_mut().apply_precompile(address, move |_| Some(precompile_clone));
+                evm.precompiles_mut().apply_precompile(&address, move |_| Some(precompile_clone));
             }
             for txid in num_commit..self.block_size {
                 let tx_env = self.txs[txid].clone();
