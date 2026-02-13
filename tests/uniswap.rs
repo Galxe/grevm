@@ -15,7 +15,7 @@ fn uniswap_clusters() {
     const NUM_PEOPLE_PER_CLUSTER: usize = 20;
     const NUM_SWAPS_PER_PERSON: usize = 20;
 
-    let mut final_state = HashMap::from([account::mock_miner_account()]);
+    let mut final_state = HashMap::from_iter([account::mock_miner_account()]);
     let mut final_bytecodes = HashMap::default();
     let mut final_txs = Vec::<TxEnv>::new();
     for _ in 0..NUM_CLUSTERS {
@@ -27,5 +27,5 @@ fn uniswap_clusters() {
     }
 
     let db = InMemoryDB::new(final_state, final_bytecodes, Default::default());
-    execute::compare_evm_execute(db, final_txs, false, false, HashMap::new());
+    execute::compare_evm_execute(db, final_txs, false, false, HashMap::default());
 }

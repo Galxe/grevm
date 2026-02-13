@@ -64,7 +64,7 @@ fn erc20_hints_test() {
     let account3 = account::mock_eoa_address(3);
     let account4 = account::mock_eoa_address(4);
     let mut accounts = account::mock_block_accounts(4);
-    let mut bytecodes = HashMap::new();
+    let mut bytecodes = HashMap::default();
     let contract_address = account::mock_eoa_address(0);
     let galxe_account =
         ERC20Token::new("Galxe Token", "G", 18, 222_222_000_000_000_000_000_000u128)
@@ -149,7 +149,7 @@ fn erc20_batch_transfer() {
         TransactionModeType::Random,
     );
 
-    let mut final_state = HashMap::from([account::mock_miner_account()]);
+    let mut final_state = HashMap::from_iter([account::mock_miner_account()]);
     let mut final_bytecodes = HashMap::default();
     let mut final_txs = Vec::<TxEnv>::new();
     for _ in 0..1 {
