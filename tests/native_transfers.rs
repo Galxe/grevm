@@ -141,7 +141,7 @@ fn native_with_unconfirmed_reuse() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, false, true, HashMap::new());
+    execute::compare_evm_execute(db, txs, false, true, HashMap::default());
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn native_zero_or_one_tx() {
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = vec![];
     // empty block
-    execute::compare_evm_execute(db, txs, false, false, HashMap::new());
+    execute::compare_evm_execute(db, txs, false, false, HashMap::default());
 
     // one tx
     let txs = vec![TxEnv {
@@ -164,7 +164,7 @@ fn native_zero_or_one_tx() {
     }];
     let accounts = account::mock_block_accounts(1);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    execute::compare_evm_execute(db, txs, false, false, HashMap::new());
+    execute::compare_evm_execute(db, txs, false, false, HashMap::default());
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn native_loaded_not_existing_account() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, true, false, HashMap::new());
+    execute::compare_evm_execute(db, txs, true, false, HashMap::default());
 }
 
 #[test]

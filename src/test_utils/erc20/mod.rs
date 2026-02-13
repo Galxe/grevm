@@ -137,7 +137,7 @@ pub fn generate_cluster(
     num_eoa: usize,
     num_sca: usize,
 ) -> (HashMap<Address, PlainAccount>, HashMap<B256, Bytecode>, Vec<Address>, Vec<Address>) {
-    let mut state = HashMap::new();
+    let mut state = HashMap::default();
     let eoa_addresses: Vec<Address> = generate_addresses(num_eoa);
 
     for person in eoa_addresses.iter() {
@@ -184,7 +184,7 @@ pub fn generate_contract_accounts(
     eoa_addresses: &[Address],
 ) -> (Vec<(Address, PlainAccount)>, HashMap<B256, Bytecode>) {
     let mut accounts = Vec::with_capacity(num_sca);
-    let mut bytecodes = HashMap::new();
+    let mut bytecodes = HashMap::default();
     for _ in 0..num_sca {
         let gld_address = Address::new(rand::random());
         let mut gld_account =
