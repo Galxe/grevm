@@ -6,12 +6,37 @@ use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use parking_lot::Mutex;
 use revm::{Database, DatabaseRef};
 use revm_database::{
-    AccountRevert, BundleAccount, BundleState, TransitionState,
+    BundleState, TransitionState,
     states::bundle_state::BundleRetention,
 };
 use revm_primitives::{Address, B256, U256, hardfork::SpecId};
 use revm_state::{AccountInfo, Bytecode, EvmState};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{cell::UnsafeCell, sync::atomic::{AtomicUsize, Ordering}};
+
+/// A wrapper around `Vec<T>` that allows disjoint parallel writes to different indices.
+///
+/// SAFETY: Callers must ensure that concurrent accesses target non-overlapping index ranges.
+/// This is guaranteed by `fork_join_util` which partitions indices into disjoint ranges.
+struct DisjointVec<T>(UnsafeCell<Vec<T>>);
+
+// SAFETY: DisjointVec is only used within fork_join_util where each thread writes to
+// a disjoint range of indices, so no data race can occur.
+unsafe impl<T: Send> Sync for DisjointVec<T> {}
+
+impl<T> DisjointVec<T> {
+    fn new(vec: Vec<T>) -> Self {
+        Self(UnsafeCell::new(vec))
+    }
+
+    /// SAFETY: Caller must ensure no other thread accesses the same index concurrently.
+    unsafe fn set(&self, index: usize, value: T) {
+        unsafe { (&mut (*self.0.get()))[index] = value };
+    }
+
+    fn into_inner(self) -> Vec<T> {
+        self.0.into_inner()
+    }
+}
 
 /// A trait that provides functionality for applying state transitions in parallel
 /// and creating reverts for a `BundleState`.
@@ -44,26 +69,12 @@ impl ParallelBundleState for BundleState {
         let reverts_capacity = if include_reverts { transitions.transitions.len() } else { 0 };
         let transitions = transitions.transitions;
         let addresses: Vec<Address> = transitions.keys().cloned().collect();
-        let reverts: Vec<Option<(Address, AccountRevert)>> = vec![None; reverts_capacity];
-        let bundle_state: Vec<Option<(Address, BundleAccount)>> = vec![None; transitions.len()];
+        let reverts = DisjointVec::new(vec![None; reverts_capacity]);
+        let bundle_state = DisjointVec::new(vec![None; transitions.len()]);
         let state_size = AtomicUsize::new(0);
         let contracts = Mutex::new(revm_primitives::HashMap::default());
 
         fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
-            #[allow(invalid_reference_casting)]
-            let reverts = unsafe {
-                &mut *(&reverts as *const Vec<Option<(Address, AccountRevert)>>
-                    as *mut Vec<Option<(Address, AccountRevert)>>)
-            };
-            #[allow(invalid_reference_casting)]
-            let addresses =
-                unsafe { &mut *(&addresses as *const Vec<Address> as *mut Vec<Address>) };
-            #[allow(invalid_reference_casting)]
-            let bundle_state = unsafe {
-                &mut *(&bundle_state as *const Vec<Option<(Address, BundleAccount)>>
-                    as *mut Vec<Option<(Address, BundleAccount)>>)
-            };
-
             for pos in start_pos..end_pos {
                 let address = addresses[pos];
                 let transition = transitions.get(&address).cloned().unwrap();
@@ -75,9 +86,10 @@ impl ParallelBundleState for BundleState {
                 let revert = transition.create_revert();
                 if let Some(revert) = revert {
                     state_size.fetch_add(present_bundle.size_hint(), Ordering::Relaxed);
-                    bundle_state[pos] = Some((address, present_bundle));
+                    // SAFETY: fork_join_util guarantees each thread writes to disjoint indices.
+                    unsafe { bundle_state.set(pos, Some((address, present_bundle))) };
                     if include_reverts {
-                        reverts[pos] = Some((address, revert));
+                        unsafe { reverts.set(pos, Some((address, revert))) };
                     }
                 }
             }
@@ -86,13 +98,13 @@ impl ParallelBundleState for BundleState {
 
         // much faster than bundle_state.into_iter().filter_map(|r| r).collect()
         self.state.reserve(transitions.len());
-        for bundle in bundle_state {
+        for bundle in bundle_state.into_inner() {
             if let Some((address, state)) = bundle {
                 self.state.insert(address, state);
             }
         }
         let mut final_reverts = Vec::with_capacity(reverts_capacity);
-        for revert in reverts {
+        for revert in reverts.into_inner() {
             if let Some(r) = revert {
                 final_reverts.push(r);
             }
@@ -203,9 +215,9 @@ where
                     MemoryValue::SelfDestructed,
                     estimate,
                 );
-                write_set.insert(LocationAndType::Basic(address.clone()));
+                write_set.insert(LocationAndType::Basic(*address));
                 self.mv_memory
-                    .entry(LocationAndType::Basic(address.clone()))
+                    .entry(LocationAndType::Basic(*address))
                     .or_default()
                     .insert(self.current_tx.txid, memory_entry);
                 continue;
@@ -332,7 +344,7 @@ where
         let mut result = None;
         if address == self.coinbase {
             self.accurate_origin = self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid;
-            result = self.db.basic_ref(address.clone())?;
+            result = self.db.basic_ref(address)?;
         } else {
             let mut read_version = ReadVersion::Storage;
             let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, code_hash: None };
@@ -379,7 +391,7 @@ where
             }
             // 2. read from database
             if result.is_none() {
-                let info = self.db.basic_ref(address.clone())?;
+                let info = self.db.basic_ref(address)?;
                 if let Some(info) = info {
                     read_account = AccountBasic {
                         balance: info.balance,
@@ -421,7 +433,7 @@ where
                 written_transactions.range(..self.current_tx.txid).next_back()
             {
                 if let MemoryValue::Storage(slot) = &entry.data {
-                    result = Some(slot.clone());
+                    result = Some(*slot);
                     if entry.estimate {
                         self.estimate_txs.insert(txid);
                     }
@@ -439,7 +451,7 @@ where
             }
             let slot =
                 if new_ca { U256::default() } else { self.db.storage_ref(address, index)? };
-            result = Some(slot.clone());
+            result = Some(slot);
         }
 
         self.read_set.insert(location, read_version);

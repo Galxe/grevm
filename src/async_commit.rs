@@ -6,7 +6,7 @@ use revm_context::{
 use revm_primitives::Address;
 
 use crate::{GrevmError, ParallelState, TxId};
-use std::cmp::Ordering;
+use std::{cell::UnsafeCell, cmp::Ordering};
 
 /// `StateAsyncCommit` asynchronously finalizes transaction states,
 /// serving two critical purposes:
@@ -20,9 +20,25 @@ where
 {
     coinbase: Address,
     results: Vec<ExecutionResult>,
-    state: &'a ParallelState<DB>,
+    /// SAFETY: The `UnsafeCell` allows the commit thread to mutate `ParallelState` while worker
+    /// threads hold shared references for reads. This is safe because:
+    /// 1. The commit thread is the sole writer (serialized by the finality ordering).
+    /// 2. Worker threads only read via `DatabaseRef` methods which access `DashMap`-based caches
+    ///    (inherently thread-safe) or the immutable underlying database.
+    /// 3. `commit()` and `increment_balances()` only mutate `transition_state` (append-only
+    ///    transitions) and `cache` (DashMap, thread-safe).
+    state: &'a UnsafeCell<ParallelState<DB>>,
     commit_result: Result<(), GrevmError<DB::Error>>,
     disable_nonce_check: bool,
+}
+
+// SAFETY: StateAsyncCommit is only used within a single commit thread (never shared).
+// The UnsafeCell<ParallelState<DB>> requires manual Send/Sync because UnsafeCell is !Sync,
+// but our usage pattern guarantees single-writer access from the commit thread.
+unsafe impl<DB: DatabaseRef + Send + Sync> Send for StateAsyncCommit<'_, DB>
+where
+    DB::Error: Send,
+{
 }
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
@@ -31,17 +47,22 @@ where
 {
     pub(crate) fn new(
         coinbase: Address,
-        state: &'a ParallelState<DB>,
+        state: &'a UnsafeCell<ParallelState<DB>>,
         disable_nonce_check: bool,
     ) -> Self {
         Self { coinbase, results: vec![], state, commit_result: Ok(()), disable_nonce_check }
     }
 
+    /// SAFETY: Caller must ensure exclusive mutable access — only the commit thread calls this,
+    /// and it is serialized by the finality ordering protocol.
     fn state_mut(&self) -> &mut ParallelState<DB> {
-        #[allow(invalid_reference_casting)]
-        unsafe {
-            &mut *(self.state as *const ParallelState<DB> as *mut ParallelState<DB>)
-        }
+        unsafe { &mut *self.state.get() }
+    }
+
+    /// SAFETY: Shared read access to state is safe because `ParallelState` reads go through
+    /// `DashMap` (thread-safe) or the immutable database.
+    fn state_ref(&self) -> &ParallelState<DB> {
+        unsafe { &*self.state.get() }
     }
 
     pub(crate) fn init(&mut self) -> Result<(), DB::Error> {
@@ -70,12 +91,23 @@ where
         // integrity and prevent double-spending attacks.
         let ResultAndState { result, state, lazy_reward } = result_and_state;
         if !self.disable_nonce_check {
-            match self.state.basic_ref(tx_env.caller) {
+            match self.state_ref().basic_ref(tx_env.caller) {
                 Ok(info) => {
                     if let Some(info) = info {
                         let expect = info.nonce;
                         if let Some(change) = state.get(&tx_env.caller) {
-                            assert_eq!(change.info.nonce, expect + 1);
+                            if change.info.nonce != expect + 1 {
+                                self.commit_result = Err(GrevmError {
+                                    txid,
+                                    error: EVMError::Transaction(
+                                        InvalidTransaction::NonceTooHigh {
+                                            tx: change.info.nonce,
+                                            state: expect,
+                                        },
+                                    ),
+                                });
+                                return;
+                            }
                         }
                         match tx_env.nonce.cmp(&expect) {
                             Ordering::Greater => {
@@ -117,6 +149,8 @@ where
         // correct concurrency - even if subsequent transactions access the miner's account, they
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
-        assert!(self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]).is_ok());
+        if let Err(e) = self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]) {
+            self.commit_result = Err(GrevmError { txid, error: EVMError::Database(e) });
+        }
     }
 }
