@@ -424,7 +424,9 @@ fn bench_dependent_erc20(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, 
 
 fn bench_uniswap(c: &mut Criterion, db_latency_us: u64) {
     let block_size = (GIGA_GAS as f64 / uniswap::ESTIMATED_GAS_USED as f64).ceil() as usize;
-    let mut final_state = HashMap::from([account::mock_miner_account()]);
+    let mut final_state = HashMap::default();
+    let miner = account::mock_miner_account();
+    final_state.insert(miner.0, miner.1);
     let mut final_bytecodes = HashMap::default();
     let mut final_txs = Vec::<TxEnv>::new();
     for _ in 0..block_size {

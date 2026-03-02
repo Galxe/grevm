@@ -35,11 +35,7 @@ where
 // SAFETY: StateAsyncCommit is only used within a single commit thread (never shared).
 // The UnsafeCell<ParallelState<DB>> requires manual Send/Sync because UnsafeCell is !Sync,
 // but our usage pattern guarantees single-writer access from the commit thread.
-unsafe impl<DB: DatabaseRef + Send + Sync> Send for StateAsyncCommit<'_, DB>
-where
-    DB::Error: Send,
-{
-}
+unsafe impl<DB: DatabaseRef + Send + Sync> Send for StateAsyncCommit<'_, DB> where DB::Error: Send {}
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
 where
@@ -96,18 +92,7 @@ where
                     if let Some(info) = info {
                         let expect = info.nonce;
                         if let Some(change) = state.get(&tx_env.caller) {
-                            if change.info.nonce != expect + 1 {
-                                self.commit_result = Err(GrevmError {
-                                    txid,
-                                    error: EVMError::Transaction(
-                                        InvalidTransaction::NonceTooHigh {
-                                            tx: change.info.nonce,
-                                            state: expect,
-                                        },
-                                    ),
-                                });
-                                return;
-                            }
+                            assert_eq!(change.info.nonce, expect + 1);
                         }
                         match tx_env.nonce.cmp(&expect) {
                             Ordering::Greater => {
@@ -149,8 +134,6 @@ where
         // correct concurrency - even if subsequent transactions access the miner's account, they
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
-        if let Err(e) = self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]) {
-            self.commit_result = Err(GrevmError { txid, error: EVMError::Database(e) });
-        }
+        assert!(self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]).is_ok());
     }
 }

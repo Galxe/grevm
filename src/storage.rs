@@ -5,13 +5,13 @@ use crate::{
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use parking_lot::Mutex;
 use revm::{Database, DatabaseRef};
-use revm_database::{
-    BundleState, TransitionState,
-    states::bundle_state::BundleRetention,
-};
+use revm_database::{BundleState, TransitionState, states::bundle_state::BundleRetention};
 use revm_primitives::{Address, B256, U256, hardfork::SpecId};
 use revm_state::{AccountInfo, Bytecode, EvmState};
-use std::{cell::UnsafeCell, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 /// A wrapper around `Vec<T>` that allows disjoint parallel writes to different indices.
 ///

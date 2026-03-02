@@ -236,19 +236,14 @@ impl SchedulerContext {
     }
 
     fn next_validation_idx(&self, executing_idx: usize) -> Option<usize> {
-        loop {
-            let idx = self.validation_idx.load(Ordering::Acquire);
-            if idx >= executing_idx || idx >= self.executed_set.continuous_idx() {
-                return None;
-            }
-            if self
-                .validation_idx
-                .compare_exchange(idx, idx + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return if idx < self.num_txs { Some(idx) } else { None };
+        let validation_idx = self.validation_idx.load(Ordering::Acquire);
+        if validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx() {
+            let validation_idx = self.validation_idx.fetch_add(1, Ordering::AcqRel);
+            if validation_idx < self.num_txs {
+                return Some(validation_idx);
             }
         }
+        None
     }
 }
 
@@ -265,6 +260,7 @@ where
 {
     cfg: CfgEnv,
     env: BlockEnv,
+    block_size: usize,
     txs: Arc<Vec<TxEnv>>,
     /// SAFETY: `UnsafeCell` allows the commit thread to mutate state while worker threads read.
     /// The commit thread has exclusive write access (serialized by finality ordering).
@@ -298,7 +294,7 @@ where
         f.debug_struct("Scheduler")
             .field("cfg", &self.cfg)
             .field("env", &self.env)
-            .field("num_txs", &self.txs.len())
+            .field("block_size", &self.block_size)
             .field("txs", &self.txs)
             .finish()
     }
@@ -327,6 +323,7 @@ where
         Self {
             cfg,
             env,
+            block_size: num_txs,
             txs,
             state: UnsafeCell::new(state),
             results: Mutex::new(vec![]),
@@ -347,14 +344,11 @@ where
         let mut finality_idx = 0;
         let mut lower_ts = 0;
         let dependency_distance = histogram!("grevm.dependency_distance");
-        while !self.abort.load(Ordering::Acquire) && finality_idx < self.txs.len() {
-            while finality_idx < self.txs.len() &&
+        while !self.abort.load(Ordering::Acquire) && finality_idx < self.block_size {
+            while finality_idx < self.block_size &&
                 finality_idx < self.scheduler_ctx.validation_idx()
             {
-                // Hold the lock across the entire check-and-set to prevent TOCTOU race
-                // where status could change between the check and the Finality assignment.
-                let mut tx_state = self.tx_states[finality_idx].lock();
-                if tx_state.status != TransactionStatus::Unconfirmed {
+                if self.tx_states[finality_idx].lock().status != TransactionStatus::Unconfirmed {
                     break;
                 }
                 lower_ts = max(
@@ -368,6 +362,7 @@ where
                 {
                     break;
                 }
+                let mut tx_state = self.tx_states[finality_idx].lock();
                 tx_state.status = TransactionStatus::Finality;
                 self.scheduler_ctx.finality_idx.fetch_add(1, Ordering::AcqRel);
 
@@ -407,14 +402,11 @@ where
         let mut commiter = commiter.lock();
         let async_commit_state =
             std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap_or(true));
-        while !self.abort.load(Ordering::Acquire) && commit_idx < self.txs.len() {
+        while !self.abort.load(Ordering::Acquire) && commit_idx < self.block_size {
             while commit_idx < self.scheduler_ctx.finality_idx.load(Ordering::Acquire) {
                 if async_commit_state {
                     let result = self.tx_results[commit_idx].lock().take().unwrap().execute_result;
-                    let Ok(result) = result else {
-                        self.abort(AbortReason::EvmError);
-                        return;
-                    };
+                    let Ok(result) = result else { panic!("Commit error tx: {}", commit_idx) };
                     let commit_start = Instant::now();
                     commiter.commit(commit_idx, &self.txs[commit_idx], result);
                     self.metrics
@@ -444,7 +436,7 @@ where
         concurrency_level: Option<usize>,
     ) -> Result<(), GrevmError<DB::Error>> {
         let start_time = Instant::now();
-        self.metrics.total_tx_cnt.store(self.txs.len(), Ordering::Relaxed);
+        self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap_or(*CONCURRENT_LEVEL)),
@@ -545,12 +537,7 @@ where
                                 return Err(GrevmError { txid, error: e.clone() });
                             }
                         }
-                        return Err(GrevmError {
-                            txid,
-                            error: EVMError::Custom(
-                                "Abort: no error found in finality transaction".into(),
-                            ),
-                        });
+                        panic!("Wrong abort transaction")
                     }
                     // Grevm maintains full compatibility with self-destruct operations while
                     // preserving the ability to fall back to sequential execution when necessary.
@@ -581,11 +568,11 @@ where
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
         let mut results = self.results.lock();
         let num_commit = results.len();
-        if num_commit == self.txs.len() {
+        if num_commit == self.block_size {
             return Ok(());
         }
 
-        let mut sequential_results = Vec::with_capacity(self.txs.len() - num_commit);
+        let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
         // SAFETY: fallback_sequential is called either before parallel execution starts
         // (when FALLBACK_SEQUENTIAL is true) or after post_execute (after thread::scope
         // has joined all threads), so no concurrent access exists.
@@ -605,7 +592,7 @@ where
                 let precompile_clone = precompile.clone();
                 evm.precompiles_mut().apply_precompile(&address, move |_| Some(precompile_clone));
             }
-            for txid in num_commit..self.txs.len() {
+            for txid in num_commit..self.block_size {
                 let tx_env = self.txs[txid].clone();
                 let result_and_state =
                     evm.transact_raw(tx_env).map_err(|e| GrevmError { txid, error: e.clone() })?;
@@ -640,8 +627,7 @@ where
             return None;
         }
         if tx_state.incarnation != incarnation {
-            // Incarnation mismatch means this task is stale — skip it.
-            return None;
+            panic!("Inconsistent incarnation when execution");
         }
         self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
 
@@ -781,17 +767,14 @@ where
             return None;
         }
         if tx_state.incarnation != incarnation {
-            // Incarnation mismatch means this validation task is stale — skip it.
-            return None;
+            panic!("Inconsistent incarnation when validating");
         }
         self.metrics.validation_cnt.fetch_add(1, Ordering::Relaxed);
         let Some(result) = tx_result.as_ref() else {
-            // No result available — skip validation (execution may still be in progress).
-            return None;
+            panic!("No result when validating");
         };
-        if result.execute_result.is_err() {
-            // Error transactions should already be in Conflict state — skip.
-            return None;
+        if let Err(_) = &result.execute_result {
+            panic!("Error transaction should take as conflict before validating");
         }
 
         let ts = self.scheduler_ctx.logical_timestamp();

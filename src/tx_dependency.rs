@@ -124,18 +124,9 @@ impl TxDependency {
 
     pub(crate) fn add(&self, txid: TxId, dep_id: Option<TxId>) {
         if let Some(dep_id) = dep_id {
-            // Lock in consistent order: affect_txs[dep_id] first, then dependent_state
-            // in ascending index order, to prevent deadlock with remove().
             let mut dep = self.affect_txs[dep_id].lock();
-            let (mut dep_state, mut state) = if dep_id < txid {
-                let dep_state = self.dependent_state[dep_id].lock();
-                let state = self.dependent_state[txid].lock();
-                (dep_state, state)
-            } else {
-                let state = self.dependent_state[txid].lock();
-                let dep_state = self.dependent_state[dep_id].lock();
-                (dep_state, state)
-            };
+            let mut dep_state = self.dependent_state[dep_id].lock();
+            let mut state = self.dependent_state[txid].lock();
             state.dependency = Some(dep_id);
             if !state.onboard {
                 state.onboard = true;

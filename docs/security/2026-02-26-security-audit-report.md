@@ -53,6 +53,8 @@ This is instant **Undefined Behavior** under Rust's aliasing model (stacked borr
 - `storage.rs` fork-join → partition data ownership per thread, or use `UnsafeCell`-based parallel slice
 - `hint.rs` → partition `rw_set` slices per thread (each thread writes disjoint indices)
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
+
 ---
 
 ### GREVM-002: Data Race on `ContinuousDetectSet::index_flag`
@@ -91,6 +93,8 @@ if !self.index_flag[index].swap(true, Ordering::Release) {
 }
 ```
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
+
 ---
 
 ### GREVM-003: Unsound Concurrent Mutation of `ParallelState` via Async Commit
@@ -106,6 +110,8 @@ Meanwhile, worker threads concurrently read from the same `ParallelState` via `s
 **Impact:** Concurrent read/write of `HashMap` causes data races: corrupted hash table, infinite loops in probe sequences, memory corruption. The nonce check at line 73 (`self.state.basic_ref(tx_env.caller)`) reads while `commit()` at line 111 writes.
 
 **Recommendation:** Split `ParallelState` into read-only and write-only portions. The commit thread should own a separate mutable handle (e.g., `Mutex<TransitionState>` or channel-based approach). Worker threads should only access the immutable database reference.
+
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
 
 ---
 
@@ -144,6 +150,8 @@ if tx_state.status != TransactionStatus::Unconfirmed { break; }
 tx_state.status = TransactionStatus::Finality;
 ```
 
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: In the async commit algorithm, a logical timestamp `lower_ts` is introduced. The algorithm ensures that the `lower_ts` of transactions is monotonically increasing. This implies that when the status is modified to `Finality`, it is guaranteed to be the final state. The current algorithm uses a minimal lock scope to ensure optimal program performance.
+
 ---
 
 ### GREVM-005: Potential Deadlock in `TxDependency::add()`
@@ -164,6 +172,8 @@ This creates a lock cycle → deadlock.
 **Impact:** Consensus halt — the block execution thread pool deadlocks, blocking the entire chain.
 
 **Recommendation:** Enforce a consistent global lock ordering (always acquire lower index first), or restructure to avoid holding multiple locks simultaneously.
+
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: The `dep_id` is strictly guaranteed to be less than the `txid` at the business logic level, as a transaction (`txid`) can only depend on a preceding transaction (`dep_id`). Because of this strictly monotonic dependency ordering (`dep_id < txid`), a lock cycle cannot occur and thus this deadlock is impossible in practice.
 
 ---
 
@@ -203,6 +213,7 @@ loop {
     }
 }
 ```
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: Even if multiple threads call `next_validation_idx()` simultaneously, although the returned `validation_idx` might momentarily violate the initial guard condition, the function remains valid as long as it returns all index values since the last reset. In other words, this function only needs to guarantee that all values in the range `[reset_value, num_txs)` are returned to some worker thread; it does not need to guarantee strict ordering or boundary limits at the exact moment of assignment. If a worker gets an index that is not yet executed, it simply skips it, and the transaction's own execution completion will handle its subsequent validation. Therefore, this modification is unnecessary and overlooks the core design of the Block-STM algorithm, which favors the performance of `fetch_add` over strict `compare_exchange` loops.
 
 ---
 
@@ -224,6 +235,8 @@ loop {
 
 **Recommendation:** Replace panics with error returns (`GrevmError`) and propagate to the caller. The scheduler should abort gracefully and fall back to sequential execution.
 
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: The `panic` and `assert` statements in GREVM-007 are designed to protect severe algorithmic invariants. Violations of these invariants represent fundamental consensus or concurrency failures (e.g., incorrect nonce updates, balance increment failures, or inconsistent execution/validation states in the Block-STM logic). In a blockchain execution engine, no exceptions or graceful fallbacks are allowed when state integrity is fundamentally broken. A hard panic is required to immediately halt the node and prevent it from producing or accepting a corrupted state root.
+
 ---
 
 ### GREVM-008: Environment Variable Parsing with `unwrap()` at Runtime
@@ -241,6 +254,8 @@ std::env::var("GREVM_CONCURRENT_LEVEL").map_or(*CONCURRENT_LEVEL, |s| s.parse().
 **Impact:** Setting `ASYNC_COMMIT_STATE=abc` or `GREVM_CONCURRENT_LEVEL=xyz` crashes the node.
 
 **Recommendation:** Use `parse().unwrap_or(default)` or `parse().ok()`.
+
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
 
 ---
 
@@ -266,6 +281,8 @@ The second case is the security concern: if the hint incorrectly models storage 
 
 **Recommendation:** Return `ContractType::UNKNOWN` for unrecognized contracts (making hints conservative), or remove the hint system for non-ERC20 contracts.
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
+
 ---
 
 ### GREVM-010: `println!()` Debug Output in Production Code
@@ -285,6 +302,8 @@ println!("transaction status: {:?}", status);
 
 **Recommendation:** Use `tracing::warn!()` or `log::warn!()` with structured fields, gated behind a log level.
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
+
 ---
 
 ### GREVM-011: `fork_join_util` Parallel Mutation via Unsound Unsafe
@@ -299,6 +318,8 @@ println!("transaction status: {:?}", status);
 
 **Recommendation:** Use `std::cell::UnsafeCell` wrapping the vectors with a documented safety comment explaining the disjoint-access invariant. Or use `split_at_mut()` to get non-overlapping mutable slices.
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
+
 ---
 
 ## LOW Severity (5)
@@ -308,24 +329,28 @@ println!("transaction status: {:?}", status);
 **File:** `src/hint.rs:231-232, 250-254`
 **Issue:** `parameters[0].as_slice()[12..]` used with `try_into().expect("try into failed")`. If parameters have unexpected padding, the 20-byte extraction could fail.
 **Recommendation:** Use proper ABI decoding instead of manual slice operations.
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: The elements in `parameters` are of type `FixedBytes<32>` (i.e., `B256`), which are strictly 32 bytes in length. Taking the slice `[12..]` leaves exactly 20 bytes, which is guaranteed to be convertible to `[u8; 20]`. This operation cannot fail under normal circumstances due to strong type constraints. If it were to fail, it would indicate a severe, unrecoverable system invariant violation, making a panic via `expect()` completely appropriate.
 
 ### GREVM-013: `TODO` Comments Indicate Incomplete Implementation
 
 **Files:** `src/hint.rs:267, 285`
 **Issue:** Two TODO comments suggest incomplete logic: `TODO(gaoxin): if from_slot == to_slot, what happened?` and the contract type detection TODO.
 **Recommendation:** Resolve or document these known limitations.
+**Review Comments** reviewer: Xin GAO; state: ignored; comments:
 
 ### GREVM-014: Relaxed Ordering Used for Cross-Thread Coordination
 
 **File:** `src/utils.rs:22-36`
 **Issue:** `check_continuous()` uses `Ordering::Relaxed` for both load and CAS operations. While the CAS provides atomicity, Relaxed ordering provides no happens-before guarantee with the flag writes in `add()`.
 **Recommendation:** Use `Ordering::Acquire` for loads and `Ordering::Release` for stores to establish proper synchronization.
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
 
 ### GREVM-015: `block_size` vs `txs.len()` Redundancy
 
 **File:** `src/scheduler.rs:262, 307`
 **Issue:** `block_size` is always set to `txs.len()` but both are stored separately. If they ever diverge, index-out-of-bounds panics will occur.
 **Recommendation:** Remove `block_size` and use `self.txs.len()` directly.
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: The `block_size` field is heavily used throughout the code for brevity and readability. Since it is set precisely to `self.txs.len()` in the constructor and the `txs` list is immutable after initialization, there is zero practical risk of divergence or out-of-bounds panics. Keeping `block_size` is much more convenient than repeatedly calling `self.txs.len()`. Removing it provides no actual security or stability benefit, and merely adds verbosity.
 
 ### GREVM-016: No Maximum Transaction Count Limit
 
@@ -333,6 +358,7 @@ println!("transaction status: {:?}", status);
 **Issue:** `Scheduler::new()` allocates `Vec` of size `num_txs` for states, results, dependency tracking, etc. No upper bound is enforced.
 **Impact:** A block with millions of transactions could cause OOM.
 **Recommendation:** Add a `MAX_BLOCK_SIZE` constant and validate at construction.
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: The internal state vectors must exactly match `txs.len()` for the parallel scheduling algorithm to function correctly; allocating a different size would break the entire execution logic. The auditor's concern about an unbounded `txs.len()` causing OOM is unfounded in practice because the maximum number of transactions in a block is already strictly bounded by the protocol's block gas limit at the consensus layer (e.g., maximum gas divided by 21,000). Enforcing an artificial `MAX_BLOCK_SIZE` inside the execution engine is redundant and incorrectly misplaces consensus-level validation into the execution layer.
 
 ---
 
@@ -341,11 +367,14 @@ println!("transaction status: {:?}", status);
 ### GREVM-INFO-001: Dead `func_id` Initialization
 **File:** `src/hint.rs:290`
 **Issue:** `let func_id: u32 = 0;` is immediately shadowed by line 296. Dead code.
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sensen.
 
 ### GREVM-INFO-002: Metrics Not Gated Behind Feature Flag
 **File:** `src/scheduler.rs:41-79`
 **Issue:** `ExecuteMetrics` is always initialized even if no metrics backend is configured.
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sensen.
 
 ### GREVM-INFO-003: `clone()` on `Address` and `U256` (Copy types)
 **File:** `src/storage.rs:206, 335, 382, 417`
 **Issue:** `.clone()` called on `Copy` types. Harmless but noisy.
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sensen.
