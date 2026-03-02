@@ -303,6 +303,8 @@ panic = "abort"
 
 Combined with the remaining `panic!`/`assert!` calls (acknowledged as intentional in Round 1), this means any assertion failure immediately terminates the process without unwinding. While this is a deliberate design choice for a blockchain node (preventing corrupted state propagation), it also means that `Drop` implementations for open file handles, network connections, or database cursors will **not** be called on panic.
 
+**Review Comments** reviewer: neko; state: rejected; comments: grevm is a library crate, not a binary. `[profile.release]` settings in a library's `Cargo.toml` are overridden by the downstream binary's profile (e.g., reth). The only scenario where this setting actually takes effect is `cargo bench` (the `gigagas` benchmark with `harness = false`), where `panic = "abort"` is perfectly appropriate. This finding is invalid for a library crate.
+
 ---
 
 ### GREVM-R2-INFO-002: Forked Dependencies on Private Branch
