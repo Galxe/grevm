@@ -315,6 +315,8 @@ Combined with the remaining `panic!`/`assert!` calls (acknowledged as intentiona
 
 **Recommendation:** Establish a documented process for periodically syncing with upstream releases. Consider subscribing to upstream security advisories. Track the delta between the fork and upstream to minimize merge conflicts.
 
+**Review Comments** reviewer: neko; state: rejected; comments: The forked revm is intentional — our self-maintained EVM fork introduces the lazy reward mechanism, which is a core design requirement for parallel execution. This is not an oversight but a deliberate architectural decision.
+
 ---
 
 ## Appendix: Methodology
