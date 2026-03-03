@@ -86,7 +86,6 @@ impl ParallelBundleState for BundleState {
                 let revert = transition.create_revert();
                 if let Some(revert) = revert {
                     state_size.fetch_add(present_bundle.size_hint(), Ordering::Relaxed);
-                    // SAFETY: fork_join_util guarantees each thread writes to disjoint indices.
                     unsafe { bundle_state.set(pos, Some((address, present_bundle))) };
                     if include_reverts {
                         unsafe { reverts.set(pos, Some((address, revert))) };

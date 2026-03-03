@@ -41,6 +41,9 @@ use std::{
     time::Instant,
 };
 
+/// min number of txs to parallel execute.
+const MIN_PARALLEL_TXS: usize = 64;
+
 pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
 #[derive(Metrics)]
@@ -266,9 +269,6 @@ where
     env: BlockEnv,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
-    /// SAFETY: `UnsafeCell` allows the commit thread to mutate state while worker threads read.
-    /// The commit thread has exclusive write access (serialized by finality ordering).
-    /// Worker threads only read via `DatabaseRef` (DashMap-based, thread-safe).
     state: UnsafeCell<ParallelState<DB>>,
     results: Mutex<Vec<ExecutionResult>>,
     tx_states: Vec<Mutex<TxState>>,
@@ -445,7 +445,7 @@ where
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap_or(*CONCURRENT_LEVEL)),
         );
-        if *FALLBACK_SEQUENTIAL {
+        if *FALLBACK_SEQUENTIAL || self.block_size < MIN_PARALLEL_TXS {
             return self.fallback_sequential();
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
@@ -453,8 +453,7 @@ where
             CommitGuard::new(&self.state),
             self.cfg.disable_nonce_check,
         ));
-        // SAFETY: Worker threads access `ParallelState` only through `DatabaseRef` (read-only,
-        // DashMap-based, inherently thread-safe). The commit thread is the sole writer.
+
         let state_ref = unsafe { &*self.state.get() };
         commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
         thread::scope(|scope| {
@@ -571,9 +570,6 @@ where
         }
 
         let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
-        // SAFETY: fallback_sequential is called either before parallel execution starts
-        // (when FALLBACK_SEQUENTIAL is true) or after post_execute (after thread::scope
-        // has joined all threads), so no concurrent access exists.
         let mut commit_guard = CommitGuard::new(&self.state);
         let state_mut = commit_guard.state_mut();
         {

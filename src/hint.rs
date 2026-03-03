@@ -87,8 +87,6 @@ impl RWSet {
 /// Struct to hold shared transaction states and provide methods for parsing
 /// and handling execution hints for parallel transaction execution.
 pub(crate) struct ParallelExecutionHints {
-    /// SAFETY: Wrapped in `UnsafeCell` to allow disjoint parallel writes.
-    /// Each thread in `fork_join_util` writes only to its own index range.
     rw_set: UnsafeCell<Vec<RWSet>>,
     txs: Arc<Vec<TxEnv>>,
 }
@@ -106,8 +104,6 @@ impl ParallelExecutionHints {
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
         let mut dependent_tx: Vec<Option<TxId>> = vec![None; num_txs];
         let mut affect_txs = vec![HashSet::new(); num_txs];
-        // SAFETY: generate_dependency is called after parse_hints completes (fork_join is done),
-        // so no concurrent access exists.
         let rw_set = unsafe { &*self.rw_set.get() };
         for (txid, rw_set) in rw_set.iter().enumerate() {
             for location in rw_set.read_set.iter() {
@@ -128,8 +124,6 @@ impl ParallelExecutionHints {
         let txs = self.txs.clone();
         // Utilize fork-join utility to process transactions in parallel
         fork_join_util(txs.len(), None, |start_tx, end_tx, _| {
-            // SAFETY: Each thread writes to disjoint index ranges [start_tx..end_tx],
-            // guaranteed by fork_join_util's partitioning.
             let hints = unsafe { &mut *self.rw_set.get() };
             for index in start_tx..end_tx {
                 let tx_env = &txs[index];
