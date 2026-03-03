@@ -1,8 +1,12 @@
 use crate::{
     AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType, MemoryEntry,
     ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
-    TxVersion, async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::ContinuousDetectSet,
+    TxVersion,
+    async_commit::{CommitGuard, StateAsyncCommit},
+    hint::ParallelExecutionHints,
+    storage::CacheDB,
+    tx_dependency::TxDependency,
+    utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use alloy_evm::{
@@ -446,7 +450,7 @@ where
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
             self.env.beneficiary,
-            &self.state,
+            CommitGuard::new(&self.state),
             self.cfg.disable_nonce_check,
         ));
         // SAFETY: Worker threads access `ParallelState` only through `DatabaseRef` (read-only,
@@ -558,12 +562,6 @@ where
         Ok(())
     }
 
-    /// SAFETY: Must only be called when no other threads access the state
-    /// (after `thread::scope` has joined all threads, or before parallel execution starts).
-    fn state_mut(&self) -> &mut ParallelState<DB> {
-        unsafe { &mut *self.state.get() }
-    }
-
     /// Fallback to sequential execution
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
         let mut results = self.results.lock();
@@ -576,7 +574,8 @@ where
         // SAFETY: fallback_sequential is called either before parallel execution starts
         // (when FALLBACK_SEQUENTIAL is true) or after post_execute (after thread::scope
         // has joined all threads), so no concurrent access exists.
-        let state_mut = self.state_mut();
+        let mut commit_guard = CommitGuard::new(&self.state);
+        let state_mut = commit_guard.state_mut();
         {
             let evm = Context::mainnet()
                 .with_db(state_mut)

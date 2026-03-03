@@ -179,6 +179,9 @@ pub fn fork_join_util<'scope, F>(num_elements: usize, num_partitions: Option<usi
 where
     F: Fn(usize, usize, usize) + Send + Sync + 'scope,
 {
+    if num_elements == 0 {
+        return;
+    }
     let parallel_cnt = num_partitions.unwrap_or(*CONCURRENT_LEVEL);
     let remaining = num_elements % parallel_cnt;
     let chunk_size = num_elements / parallel_cnt;

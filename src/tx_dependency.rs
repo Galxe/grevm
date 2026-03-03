@@ -149,6 +149,7 @@ impl TxDependency {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn print(&self) {
         let dependent_tx: Vec<(TxId, DependentState)> =
             self.dependent_state.iter().map(|dep| dep.lock().clone()).enumerate().collect();

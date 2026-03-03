@@ -64,6 +64,8 @@ impl<'a, DB: DatabaseRef> CommitGuard<'a, DB> {
 
 This makes it structurally impossible for worker threads to obtain mutable access.
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: We agree with the observation. Although the manual safety invariants were correctly maintained, formalizing this through the Rust type system offers stronger guarantees against future regressions. We have introduced `CommitGuard` in `src/async_commit.rs` which encapsulates `UnsafeCell` and exclusively exposes `&mut ParallelState` when borrowing the guard mutably. This structurally restricts mutable access to the commit thread (and sequential fallbacks) at compile time.
+
 ---
 
 ### GREVM-R2-002: Commit Continues After Nonce Validation Failure
@@ -101,6 +103,8 @@ Ordering::Less => {
 }
 ```
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
+
 ---
 
 ## MEDIUM Severity (3)
@@ -135,6 +139,8 @@ if num_elements == 0 { return; }
 let parallel_cnt = min(num_partitions.unwrap_or(*CONCURRENT_LEVEL), num_elements);
 ```
 
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: It makes sense.
+
 ---
 
 ### GREVM-R2-004: `clear_destructed_entry` Full Table Scan is O(n) on MVMemory Size
@@ -164,6 +170,8 @@ fn clear_destructed_entry(&self, account: Address) {
 **Impact:** Performance degradation and potential thread starvation when self-destruct operations occur in blocks with high storage slot counts. A malicious contract could exploit `SELFDESTRUCT` to force this worst-case scan, degrading parallel throughput to near-sequential.
 
 **Recommendation:** Maintain a secondary index `DashMap<Address, HashSet<LocationAndType>>` to enable O(1) lookup of entries by address, avoiding the full table scan. Alternatively, prefix-scan the DashMap only for the target address keys.
+
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: 
 
 ---
 

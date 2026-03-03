@@ -8,6 +8,24 @@ use revm_primitives::Address;
 use crate::{GrevmError, ParallelState, TxId};
 use std::{cell::UnsafeCell, cmp::Ordering};
 
+/// Only constructible within the commit thread's scope (or sequential fallback).
+/// Guarantees exclusive mutable access to ParallelState.
+pub(crate) struct CommitGuard<'a, DB: DatabaseRef> {
+    state: &'a UnsafeCell<ParallelState<DB>>,
+}
+
+impl<'a, DB: DatabaseRef> CommitGuard<'a, DB> {
+    pub(crate) fn new(state: &'a UnsafeCell<ParallelState<DB>>) -> Self {
+        Self { state }
+    }
+
+    pub(crate) fn state_mut(&mut self) -> &mut ParallelState<DB> {
+        // SAFETY: CommitGuard requires `&mut self`, ensuring exclusive access
+        // to the underlying state for the guard's owner.
+        unsafe { &mut *self.state.get() }
+    }
+}
+
 /// `StateAsyncCommit` asynchronously finalizes transaction states,
 /// serving two critical purposes:
 /// ensuring Ethereum-compatible execution results and resolving edge cases like miner rewards and
@@ -20,21 +38,13 @@ where
 {
     coinbase: Address,
     results: Vec<ExecutionResult>,
-    /// SAFETY: The `UnsafeCell` allows the commit thread to mutate `ParallelState` while worker
-    /// threads hold shared references for reads. This is safe because:
-    /// 1. The commit thread is the sole writer (serialized by the finality ordering).
-    /// 2. Worker threads only read via `DatabaseRef` methods which access `DashMap`-based caches
-    ///    (inherently thread-safe) or the immutable underlying database.
-    /// 3. `commit()` and `increment_balances()` only mutate `transition_state` (append-only
-    ///    transitions) and `cache` (DashMap, thread-safe).
-    state: &'a UnsafeCell<ParallelState<DB>>,
+    guard: CommitGuard<'a, DB>,
     commit_result: Result<(), GrevmError<DB::Error>>,
     disable_nonce_check: bool,
 }
 
 // SAFETY: StateAsyncCommit is only used within a single commit thread (never shared).
-// The UnsafeCell<ParallelState<DB>> requires manual Send/Sync because UnsafeCell is !Sync,
-// but our usage pattern guarantees single-writer access from the commit thread.
+// CommitGuard ensures exclusive mutable access through its `&mut self` requirement.
 unsafe impl<DB: DatabaseRef + Send + Sync> Send for StateAsyncCommit<'_, DB> where DB::Error: Send {}
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
@@ -43,29 +53,29 @@ where
 {
     pub(crate) fn new(
         coinbase: Address,
-        state: &'a UnsafeCell<ParallelState<DB>>,
+        guard: CommitGuard<'a, DB>,
         disable_nonce_check: bool,
     ) -> Self {
-        Self { coinbase, results: vec![], state, commit_result: Ok(()), disable_nonce_check }
+        Self { coinbase, results: vec![], guard, commit_result: Ok(()), disable_nonce_check }
     }
 
-    /// SAFETY: Caller must ensure exclusive mutable access — only the commit thread calls this,
-    /// and it is serialized by the finality ordering protocol.
-    fn state_mut(&self) -> &mut ParallelState<DB> {
-        unsafe { &mut *self.state.get() }
+    pub(crate) fn state_mut(&mut self) -> &mut ParallelState<DB> {
+        self.guard.state_mut()
     }
 
     /// SAFETY: Shared read access to state is safe because `ParallelState` reads go through
     /// `DashMap` (thread-safe) or the immutable database.
     fn state_ref(&self) -> &ParallelState<DB> {
-        unsafe { &*self.state.get() }
+        // Safe to get a shared reference since we only mutate exclusively when we have `&mut self`
+        unsafe { &*self.guard.state.get() }
     }
 
     pub(crate) fn init(&mut self) -> Result<(), DB::Error> {
         // Accesses the coinbase account to ensure proper handling of miner rewards (via
         // increment_balances) within ParallelState. This preemptive access guarantees correct state
         // synchronization when applying miner rewards during the final commitment phase.
-        match self.state_mut().basic(self.coinbase) {
+        let coinbase = self.coinbase;
+        match self.state_mut().basic(coinbase) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -125,6 +135,9 @@ where
             }
         }
         self.results.push(result);
+        if self.commit_result.is_err() {
+            return;
+        }
         self.state_mut().commit(state);
 
         // In Ethereum, each transaction includes a miner reward, which would introduce write
@@ -134,6 +147,7 @@ where
         // correct concurrency - even if subsequent transactions access the miner's account, they
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
-        assert!(self.state_mut().increment_balances(vec![(self.coinbase, lazy_reward)]).is_ok());
+        let coinbase = self.coinbase;
+        assert!(self.state_mut().increment_balances(vec![(coinbase, lazy_reward)]).is_ok());
     }
 }
