@@ -41,6 +41,9 @@ use std::{
     time::Instant,
 };
 
+/// min number of txs to parallel execute.
+const MIN_PARALLEL_TXS: usize = 64;
+
 pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
 #[derive(Metrics)]
@@ -445,7 +448,7 @@ where
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap_or(*CONCURRENT_LEVEL)),
         );
-        if *FALLBACK_SEQUENTIAL {
+        if *FALLBACK_SEQUENTIAL || self.block_size < MIN_PARALLEL_TXS {
             return self.fallback_sequential();
         }
         let commiter = Mutex::new(StateAsyncCommit::new(

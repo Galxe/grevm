@@ -171,7 +171,7 @@ fn clear_destructed_entry(&self, account: Address) {
 
 **Recommendation:** Maintain a secondary index `DashMap<Address, HashSet<LocationAndType>>` to enable O(1) lookup of entries by address, avoiding the full table scan. Alternatively, prefix-scan the DashMap only for the target address keys.
 
-**Review Comments** reviewer: Xin GAO; state: ignored; comments: 
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: Resolved by `fallback_sequential`
 
 ---
 
@@ -208,6 +208,8 @@ pub(crate) fn print(&self) {
 
 Or use `tracing`'s lazy evaluation with `tracing::debug!(...)` and deferred formatting.
 
+**Review Comments** reviewer: Xin GAO; state: ignored; comments: Only called in debug mode
+
 ---
 
 ## LOW Severity (3)
@@ -234,6 +236,8 @@ unsafe fn set(&self, index: usize, value: T) {
     unsafe { (&mut (*self.0.get()))[index] = value };
 }
 ```
+
+**Review Comments** reviewer: Xin GAO; state: ignored; comments:
 
 ---
 
@@ -267,6 +271,8 @@ fn write(&mut self, bytes: &[u8]) {
 }
 ```
 
+**Review Comments** reviewer: Xin GAO; state: ignored; comments:
+
 ---
 
 ### GREVM-R2-008: `parallel_apply_transitions_and_create_reverts` Clones Transitions via `get().cloned()`
@@ -294,6 +300,8 @@ fork_join_util(transitions_vec.len(), None, |start, end, _| {
     }
 });
 ```
+
+**Review Comments** reviewer: Xin GAO; state: ignored; comments:
 
 ---
 
