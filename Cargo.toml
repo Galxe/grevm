@@ -29,6 +29,9 @@ auto_impl = "1.3"
 lazy_static = "1.5.0"
 dashmap = "6.0"
 
+# logging
+tracing = "0.1"
+
 # metrics
 metrics = "0.24"
 metrics-derive = "0.1"

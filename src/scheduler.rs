@@ -1,8 +1,12 @@
 use crate::{
     AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType, MemoryEntry,
     ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
-    TxVersion, async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
-    tx_dependency::TxDependency, utils::ContinuousDetectSet,
+    TxVersion,
+    async_commit::{CommitGuard, StateAsyncCommit},
+    hint::ParallelExecutionHints,
+    storage::CacheDB,
+    tx_dependency::TxDependency,
+    utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use alloy_evm::{
@@ -25,6 +29,7 @@ use revm_inspector::NoOpInspector;
 use revm_primitives::Address;
 
 use std::{
+    cell::UnsafeCell,
     cmp::max,
     collections::BTreeMap,
     fmt::Debug,
@@ -35,6 +40,9 @@ use std::{
     thread,
     time::Instant,
 };
+
+/// min number of txs to parallel execute.
+const MIN_PARALLEL_TXS: usize = 64;
 
 pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
@@ -261,7 +269,7 @@ where
     env: BlockEnv,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
-    state: ParallelState<DB>,
+    state: UnsafeCell<ParallelState<DB>>,
     results: Mutex<Vec<ExecutionResult>>,
     tx_states: Vec<Mutex<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
@@ -275,6 +283,12 @@ where
     abort_reason: OnceLock<AbortReason>,
     metrics: ExecuteMetricsCollector,
 }
+
+// SAFETY: Scheduler is shared across threads via `thread::scope`. The `UnsafeCell<ParallelState>`
+// is safe because: (1) only the commit thread mutates it (via StateAsyncCommit), serialized by
+// finality ordering, (2) worker threads only read via DatabaseRef (DashMap, thread-safe),
+// (3) fallback_sequential() is only called after all threads have joined.
+unsafe impl<DB: DatabaseRef + Send + Sync> Sync for Scheduler<DB> where DB::Error: Send + Sync {}
 
 impl<DB> Debug for Scheduler<DB>
 where
@@ -315,7 +329,7 @@ where
             env,
             block_size: num_txs,
             txs,
-            state,
+            state: UnsafeCell::new(state),
             results: Mutex::new(vec![]),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
@@ -375,17 +389,14 @@ where
 
             if (Instant::now() - start).as_millis() > 8_000 {
                 start = Instant::now();
-                println!(
-                    "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}",
-                    self.env.number,
-                    self.scheduler_ctx.finality_idx(),
-                    self.scheduler_ctx.validation_idx(),
-                    self.scheduler_ctx.executed_set.continuous_idx(),
+                tracing::warn!(
+                    target: "grevm::scheduler",
+                    block_number = %self.env.number,
+                    finality_idx = self.scheduler_ctx.finality_idx(),
+                    validation_idx = self.scheduler_ctx.validation_idx(),
+                    execution_idx = self.scheduler_ctx.executed_set.continuous_idx(),
+                    "parallel execution stuck",
                 );
-                let status: Vec<(TxId, TransactionStatus)> =
-                    self.tx_states.iter().map(|s| s.lock().status.clone()).enumerate().collect();
-                println!("transaction status: {:?}", status);
-                self.tx_dependency.print();
             }
         }
     }
@@ -394,7 +405,7 @@ where
         let mut commit_idx = 0;
         let mut commiter = commiter.lock();
         let async_commit_state =
-            std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap());
+            std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap_or(true));
         while !self.abort.load(Ordering::Acquire) && commit_idx < self.block_size {
             while commit_idx < self.scheduler_ctx.finality_idx.load(Ordering::Acquire) {
                 if async_commit_state {
@@ -420,7 +431,7 @@ where
 
     /// Take `ExecutionResult` and `ParallelState`
     pub fn take_result_and_state(self) -> (Vec<ExecutionResult>, ParallelState<DB>) {
-        (self.results.into_inner(), self.state)
+        (self.results.into_inner(), self.state.into_inner())
     }
 
     /// Paralle execution
@@ -432,16 +443,18 @@ where
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(
             std::env::var("GREVM_CONCURRENT_LEVEL")
-                .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
+                .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap_or(*CONCURRENT_LEVEL)),
         );
-        if *FALLBACK_SEQUENTIAL {
+        if *FALLBACK_SEQUENTIAL || self.block_size < MIN_PARALLEL_TXS {
             return self.fallback_sequential();
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
             self.env.beneficiary,
-            &self.state,
+            CommitGuard::new(&self.state),
             self.cfg.disable_nonce_check,
         ));
+
+        let state_ref = unsafe { &*self.state.get() };
         commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
         thread::scope(|scope| {
             scope.spawn(|| {
@@ -458,7 +471,7 @@ where
                     let cache_db = CacheDB::new(
                         self.cfg.spec,
                         self.env.beneficiary,
-                        &self.state,
+                        state_ref,
                         &self.mv_memory,
                         &self.scheduler_ctx.commit_idx,
                     );
@@ -548,13 +561,6 @@ where
         Ok(())
     }
 
-    fn state_mut(&self) -> &mut ParallelState<DB> {
-        #[allow(invalid_reference_casting)]
-        unsafe {
-            &mut *(&self.state as *const ParallelState<DB> as *mut ParallelState<DB>)
-        }
-    }
-
     /// Fallback to sequential execution
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
         let mut results = self.results.lock();
@@ -564,7 +570,8 @@ where
         }
 
         let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
-        let state_mut = self.state_mut();
+        let mut commit_guard = CommitGuard::new(&self.state);
+        let state_mut = commit_guard.state_mut();
         {
             let evm = Context::mainnet()
                 .with_db(state_mut)

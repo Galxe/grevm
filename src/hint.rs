@@ -4,7 +4,7 @@ use revm::primitives::{
     Address, B256, Bytes, TxKind, U256, alloy_primitives::U160, keccak256, ruint::UintTryFrom,
 };
 use revm_context::TxEnv;
-use std::{cmp::max, sync::Arc};
+use std::{cell::UnsafeCell, cmp::max, sync::Arc};
 
 /// This module provides functionality for parsing and handling execution hints
 /// for parallel transaction execution in the context of Ethereum-like blockchains.
@@ -87,13 +87,16 @@ impl RWSet {
 /// Struct to hold shared transaction states and provide methods for parsing
 /// and handling execution hints for parallel transaction execution.
 pub(crate) struct ParallelExecutionHints {
-    rw_set: Vec<RWSet>,
+    rw_set: UnsafeCell<Vec<RWSet>>,
     txs: Arc<Vec<TxEnv>>,
 }
 
+// SAFETY: Each thread in fork_join_util writes to disjoint indices of rw_set.
+unsafe impl Sync for ParallelExecutionHints {}
+
 impl ParallelExecutionHints {
     pub(crate) fn new(txs: Arc<Vec<TxEnv>>) -> Self {
-        Self { rw_set: vec![RWSet::new(); txs.len()], txs }
+        Self { rw_set: UnsafeCell::new(vec![RWSet::new(); txs.len()]), txs }
     }
 
     fn generate_dependency(&self) -> TxDependency {
@@ -101,7 +104,8 @@ impl ParallelExecutionHints {
         let mut last_write_tx: HashMap<LocationAndType, TxId> = HashMap::new();
         let mut dependent_tx: Vec<Option<TxId>> = vec![None; num_txs];
         let mut affect_txs = vec![HashSet::new(); num_txs];
-        for (txid, rw_set) in self.rw_set.iter().enumerate() {
+        let rw_set = unsafe { &*self.rw_set.get() };
+        for (txid, rw_set) in rw_set.iter().enumerate() {
             for location in rw_set.read_set.iter() {
                 if let Some(&previous) = last_write_tx.get(location) {
                     let new_dep = dependent_tx[txid].map_or(previous, |dep| max(dep, previous));
@@ -120,8 +124,7 @@ impl ParallelExecutionHints {
         let txs = self.txs.clone();
         // Utilize fork-join utility to process transactions in parallel
         fork_join_util(txs.len(), None, |start_tx, end_tx, _| {
-            #[allow(invalid_reference_casting)]
-            let hints = unsafe { &mut *(&self.rw_set as *const Vec<RWSet> as *mut Vec<RWSet>) };
+            let hints = unsafe { &mut *self.rw_set.get() };
             for index in start_tx..end_tx {
                 let tx_env = &txs[index];
                 let rw_set = &mut hints[index];
@@ -281,16 +284,25 @@ impl ParallelExecutionHints {
         true
     }
 
-    fn get_contract_type(_contract_address: Address, _data: &Bytes) -> ContractType {
-        // TODO(gaoxin): Parse the correct contract type to determined how to handle call data
-        ContractType::ERC20
+    fn get_contract_type(_contract_address: Address, data: &Bytes) -> ContractType {
+        // Without bytecode analysis, we use a heuristic: if the function selector matches
+        // a known ERC20 function, treat it as ERC20. Otherwise, return UNKNOWN to be
+        // conservative and avoid incorrect dependency hints.
+        if data.len() >= 4 {
+            let func_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+            match ERC20Function::from(func_id) {
+                ERC20Function::UNKNOWN => ContractType::UNKNOWN,
+                _ => ContractType::ERC20,
+            }
+        } else {
+            ContractType::UNKNOWN
+        }
     }
 
     fn decode_contract_parameters(data: &Bytes) -> (u32, Vec<B256>) {
-        let func_id: u32 = 0;
         let mut parameters: Vec<B256> = Vec::new();
         if data.len() <= 4 {
-            return (func_id, parameters);
+            return (0, parameters);
         }
 
         let func_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);

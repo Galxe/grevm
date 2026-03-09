@@ -149,12 +149,17 @@ impl TxDependency {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn print(&self) {
         let dependent_tx: Vec<(TxId, DependentState)> =
             self.dependent_state.iter().map(|dep| dep.lock().clone()).enumerate().collect();
         let affect_txs: Vec<(TxId, HashSet<TxId>)> =
             self.affect_txs.iter().map(|affects| affects.lock().clone()).enumerate().collect();
-        println!("tx_states: {:?}", dependent_tx);
-        println!("affect_txs: {:?}", affect_txs);
+        tracing::debug!(
+            target: "grevm::tx_dependency",
+            ?dependent_tx,
+            ?affect_txs,
+            "dependency state dump",
+        );
     }
 }
