@@ -51,6 +51,7 @@ tx_state.status = TransactionStatus::Finality;
 ```
 
 **Prior:** GREVM-004 (Round 1). **Still exploitable.**
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: Re-check status after re-acquiring the lock
 
 ---
 
@@ -65,6 +66,7 @@ Additionally, `state_ref()` (line 68-71) creates `&ParallelState` while `state_m
 **Impact:** The CommitGuard pattern fails to provide the compile-time safety GREVM-R2-001 was designed to deliver. Future refactors could silently introduce UB.
 
 **Prior:** GREVM-R2-001 (Round 2). **Incomplete fix.**
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: The fix is overly complex; the two functions are temporally exclusive by design—a defining characteristic of the Block-STM algorithm.
 
 ---
 
@@ -75,18 +77,21 @@ Additionally, `state_ref()` (line 68-71) creates `&ParallelState` while `state_m
 **File:** `grevm/src/async_commit.rs:105`
 
 `assert_eq!(change.info.nonce, expect + 1)` — if `expect` is `u64::MAX`, `expect + 1` wraps to 0 in release mode (overflow-checks disabled). The assertion would compare against 0 instead of the intended value.
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: If u64::MAX is reached, the system will face more critical issues. This is a lower-priority edge case.
 
 ### GREVM-R3-004: Write Set Not Cleaned on EVM Error Re-execution
 
 **File:** `grevm/src/scheduler.rs:719-739`
 
 When a tx encounters an EVM error, the old write_set from a previous successful incarnation is preserved and stored back. The stale `mv_memory` entries remain. During re-execution, `write_new_locations` flag may be incorrectly computed, potentially skipping necessary revalidation of dependent transactions.
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: This is a characteristic behavior of the Block-STM algorithm; stale entries are handled by validation re-execution on dependent transactions.
 
 ### GREVM-R3-005: `key_tx` Dependency Race with Concurrent `commit`
 
 **File:** `grevm/src/tx_dependency.rs:112-123`
 
 Race between `key_tx(txid)` and `commit(txid-1)` can cause unnecessary double-scheduling. Benign in current code but creates latent performance degradation under pathological workloads.
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: This scenario cannot occur; commit signifies a transaction is finalized and will not be re-executed. Once committed, transaction state is immutable.
 
 ### GREVM-R3-006: `update_mv_memory` Coinbase Skip Hides User ETH Transfers
 
@@ -95,6 +100,7 @@ Race between `key_tx(txid)` and `commit(txid-1)` can cause unnecessary double-sc
 All coinbase changes are skipped in `update_mv_memory`, including **user-initiated ETH transfers** to the coinbase address. If tx A sends ETH to coinbase and tx B reads the coinbase balance, the change is invisible in MVMemory. The `accurate_origin` flag partially mitigates this but has a gap: when `commit_idx == current_tx.txid` and a preceding executed-but-uncommitted tx sent ETH to coinbase.
 
 **Impact:** Potential stale coinbase balance reads causing incorrect execution that validation may not catch.
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: The condition `commit_idx == current_tx.txid` ensures the transaction reads the correct miner reward directly from the committed state, preventing stale reads.
 
 ---
 
@@ -105,6 +111,7 @@ All coinbase changes are skipped in `update_mv_memory`, including **user-initiat
 **File:** `grevm/src/hint.rs:236-253 vs 255-280`
 
 Inconsistent storage slot assumptions between Transfer (slot 0) and TransferFrom (slot 1) for balance mappings. Performance-only impact since validation catches all conflicts.
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: Hints are still experimental in nature. Even if incorrect, they do not affect the correctness of final execution due to OCC validation.
 
 ### GREVM-R3-008: `results.push(result)` Before Error Check
 
@@ -113,12 +120,14 @@ Inconsistent storage slot assumptions between Transfer (slot 0) and TransferFrom
 The execution result is pushed to `self.results` even when the nonce check fails. The results vector contains an entry for a transaction whose state was never committed.
 
 **Prior:** GREVM-R2-002. **Partially fixed.**
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: The caller's error handling returns immediately on nonce mismatch, preventing further use of invalid results. However, reordering the push after validation would improve code clarity.
 
 ### GREVM-R3-009: `lazy_reward` Applied After Error Not Guarded at Method Entry
 
 **File:** `grevm/src/async_commit.rs:141-151`
 
 The `commit()` method does not check `self.commit_result` at entry. If a caller fails to check between calls, state corruption could compound. Mitigated by caller's check in `async_commit()`.
+**Review Comments** reviewer: Xin GAO; state: rejected; comments: The caller (`async_commit()`) enforces error checking before any subsequent operation. Adding a guard clause at method entry would improve defensive programming despite caller protections.
 
 ---
 
@@ -127,10 +136,12 @@ The `commit()` method does not check `self.commit_result` at entry. If a caller 
 ### GREVM-R3-010: Block-STM Validation Invariant Confirmed ✓
 
 The Block-STM validation loop correctly detects all read-write conflicts and triggers re-execution. The OCC-based approach ensures eventual consistency even when hints are incorrect.
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: Validation correctly maintains OCC invariants; all dependencies are enforced through re-execution.
 
 ### GREVM-R3-011: DAG-based Scheduling Correctly Parallelizes Independent Transactions ✓
 
 The hint-based DAG construction and partition assignment produce correct dependency ordering. Mis-hints only affect performance, not correctness, due to the validation fallback.
+**Review Comments** reviewer: Xin GAO; state: accepted; comments: DAG scheduling correctly enforces transaction dependencies; partition assignment is sound.
 
 ---
 
