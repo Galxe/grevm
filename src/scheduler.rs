@@ -367,6 +367,15 @@ where
                     break;
                 }
                 let mut tx_state = self.tx_states[finality_idx].lock();
+                if tx_state.status != TransactionStatus::Unconfirmed {
+                    tracing::warn!(target: "grevm::scheduler",
+                        block_number = %self.env.number,
+                        finality_idx = finality_idx,
+                        tx_status = ?tx_state.status,
+                        "transaction shoud by marked as finality, but with wrong status"
+                    );
+                    break;
+                }
                 tx_state.status = TransactionStatus::Finality;
                 self.scheduler_ctx.finality_idx.fetch_add(1, Ordering::AcqRel);
 
