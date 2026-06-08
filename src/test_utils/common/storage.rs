@@ -135,8 +135,10 @@ impl StorageBuilder {
         *entry = buffer.into();
     }
 
-    pub fn build(self) -> HashMap<U256, U256> {
-        self.dict
+    pub fn build(self) -> revm_database::states::plain_account::PlainStorage {
+        // revm 38's PlainAccount.storage uses PlainStorage (FbBuildHasher), not the
+        // default-hasher HashMap; re-collect into the expected map type.
+        self.dict.into_iter().collect()
     }
 }
 

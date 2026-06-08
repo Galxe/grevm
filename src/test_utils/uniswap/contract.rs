@@ -59,6 +59,7 @@ impl WETH9 {
                 nonce: 1u64,
                 code_hash: bytecode.hash_slow(),
                 code: Some(bytecode),
+                account_id: None,
             },
             storage: store.build(),
         }
@@ -128,6 +129,7 @@ impl UniswapV3Factory {
                 nonce: 1u64,
                 code_hash: bytecode.hash_slow(),
                 code: Some(bytecode),
+                account_id: None,
             },
             storage: store.build(),
         }
@@ -234,6 +236,7 @@ impl UniswapV3Pool {
                 nonce: 1u64,
                 code_hash: bytecode.hash_slow(),
                 code: Some(bytecode),
+                account_id: None,
             },
             storage: store.build(),
         }
@@ -294,6 +297,7 @@ impl SwapRouter {
                 nonce: 1u64,
                 code_hash: bytecode.hash_slow(),
                 code: Some(bytecode),
+                account_id: None,
             },
             storage: store.build(),
         }
@@ -335,6 +339,7 @@ impl SingleSwap {
                 nonce: 1u64,
                 code_hash: bytecode.hash_slow(),
                 code: Some(bytecode),
+                account_id: None,
             },
             storage: store.build(),
         }

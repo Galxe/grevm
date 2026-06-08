@@ -20,8 +20,8 @@ impl ContinuousDetectSet {
 
     fn check_continuous(&self) {
         let mut continuous_idx = self.continuous_idx.load(Ordering::Acquire);
-        while continuous_idx < self.num_flag &&
-            self.index_flag[continuous_idx].load(Ordering::Acquire)
+        while continuous_idx < self.num_flag
+            && self.index_flag[continuous_idx].load(Ordering::Acquire)
         {
             if self
                 .continuous_idx
@@ -47,8 +47,8 @@ impl ContinuousDetectSet {
     }
 
     pub(crate) fn continuous_idx(&self) -> usize {
-        if self.num_index.load(Ordering::Acquire) >= self.num_flag &&
-            self.continuous_idx.load(Ordering::Acquire) < self.num_flag
+        if self.num_index.load(Ordering::Acquire) >= self.num_flag
+            && self.continuous_idx.load(Ordering::Acquire) < self.num_flag
         {
             self.check_continuous();
         }

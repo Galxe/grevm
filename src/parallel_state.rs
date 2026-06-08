@@ -135,9 +135,9 @@ impl CacheAccountInfo {
 
         if matches!(
             previous_status,
-            AccountStatus::LoadedNotExisting |
-                AccountStatus::Destroyed |
-                AccountStatus::DestroyedAgain
+            AccountStatus::LoadedNotExisting
+                | AccountStatus::Destroyed
+                | AccountStatus::DestroyedAgain
         ) {
             None
         } else {

@@ -122,9 +122,11 @@ pub fn compare_evm_execute<DB>(
     let mut max_gas_used = 0;
     for result in reth_result.0.iter() {
         match result {
-            ExecutionResult::Success { gas_used, gas_refunded, .. } => {
-                max_gas_spent = max_gas_spent.max(gas_used + gas_refunded);
-                max_gas_used = max_gas_used.max(*gas_used);
+            ExecutionResult::Success { gas, .. } => {
+                // revm 38: Success carries a ResultGas struct instead of
+                // gas_used/gas_refunded scalar fields.
+                max_gas_spent = max_gas_spent.max(gas.total_gas_spent());
+                max_gas_used = max_gas_used.max(gas.spent());
             }
             _ => panic!("result is not success"),
         }
@@ -140,7 +142,10 @@ pub fn execute_revm_sequential<DB>(
     cfg: CfgEnv,
     env: BlockEnv,
     txs: &[TxEnv],
-) -> Result<(Vec<ExecutionResult>, BundleState), EVMError<DB::Error>>
+) -> Result<
+    (Vec<ExecutionResult>, BundleState),
+    EVMError<revm_database::bal::EvmDatabaseError<DB::Error>>,
+>
 where
     DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + Debug + 'static,
@@ -151,7 +156,9 @@ where
         .with_cfg(cfg)
         .with_block(env)
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
+        .with_precompiles(PrecompilesMap::from_static(
+            EthPrecompiles::new(SpecId::default()).precompiles,
+        ));
     let mut evm = EthEvm::new(evm, false);
 
     let mut results = Vec::with_capacity(txs.len());

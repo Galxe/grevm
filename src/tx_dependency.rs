@@ -53,7 +53,7 @@ impl TxDependency {
                 let mut state = self.dependent_state[index].lock();
                 if state.onboard && state.dependency.is_none() {
                     state.onboard = false;
-                    return Some(index)
+                    return Some(index);
                 }
             }
         }
