@@ -2,7 +2,7 @@ use revm::{Database, DatabaseCommit, DatabaseRef};
 use revm_context::{
     TxEnv,
     result::{EVMError, ExecutionResult, InvalidTransaction, ResultAndState},
-    transaction::AuthorizationTr,
+    transaction::{AuthorizationTr, TransactionType},
 };
 use revm_primitives::Address;
 
@@ -103,30 +103,44 @@ where
                     if let Some(info) = info {
                         let expect = info.nonce;
                         if let Some(change) = state.get(&tx_env.caller) {
-                            // EIP-7702 (type-4) txs may bump the caller's nonce by more than 1:
-                            // once for the outer tx, plus once for each authorization tuple in
-                            // the same tx whose `authority == caller` and which passes revm's
-                            // per-tuple validation (chain_id / nonce / signature). The EIP
-                            // documents this broken monotonicity invariant in its Backwards
-                            // Compatibility section.
-                            let self_auth_count = tx_env
-                                .authorization_list
-                                .iter()
-                                .filter(|a| a.authority() == Some(tx_env.caller))
-                                .count() as u64;
-                            let min_post = expect + 1;
-                            let max_post = expect + 1 + self_auth_count;
-                            assert!(
-                                change.info.nonce >= min_post && change.info.nonce <= max_post,
-                                "post-state nonce {} out of range [{}, {}] for caller {:?} \
-                                 (tx_type {}, self-auth count {})",
-                                change.info.nonce,
-                                min_post,
-                                max_post,
-                                tx_env.caller,
-                                tx_env.tx_type,
-                                self_auth_count,
-                            );
+                            if tx_env.tx_type == TransactionType::Eip7702 as u8 {
+                                // EIP-7702 self-sponsored self-delegation can bump the caller's
+                                // nonce by more than 1: once for the outer tx, plus once for each
+                                // authorization tuple in the same tx whose `authority == caller`
+                                // that passes revm's per-tuple validation (chain_id /
+                                // existing-code / authority-nonce match / signature). The EIP
+                                // documents this broken monotonicity in its Backwards
+                                // Compatibility section.
+                                //
+                                // revm can skip individual tuples without reverting the tx, so
+                                // the precise applied count depends on dynamic state at the time
+                                // of processing — we can't cheaply re-derive it here without
+                                // duplicating revm's auth-list validation. The tightest invariant
+                                // we can assert is therefore a range: lower bound = outer tx
+                                // alone (any tuple may have been skipped); upper bound = all
+                                // self-auth tuples applied.
+                                let self_auth_count = tx_env
+                                    .authorization_list
+                                    .iter()
+                                    .filter(|a| a.authority() == Some(tx_env.caller))
+                                    .count()
+                                    as u64;
+                                let min_post = expect + 1;
+                                let max_post = expect + 1 + self_auth_count;
+                                assert!(
+                                    change.info.nonce >= min_post && change.info.nonce <= max_post,
+                                    "post-state nonce {} out of range [{}, {}] for caller {:?} \
+                                     (tx_type {}, self-auth count {})",
+                                    change.info.nonce,
+                                    min_post,
+                                    max_post,
+                                    tx_env.caller,
+                                    tx_env.tx_type,
+                                    self_auth_count,
+                                );
+                            } else {
+                                assert_eq!(change.info.nonce, expect + 1);
+                            }
                         }
                         match tx_env.nonce.cmp(&expect) {
                             Ordering::Greater => {
@@ -303,10 +317,11 @@ mod tests {
         run_commit(&state_cell, tx_env, pre_nonce + 2);
     }
 
-    /// Non-7702 path: empty `authorization_list`, post-state nonce = +2 → must still panic
-    /// (regression guard for the original invariant on legacy / 1559 / 4844 txs).
+    /// Non-7702 path: `tx_type != 4`, post-state nonce = +2 → must still panic via the
+    /// original strict equality (regression guard for legacy / 1559 / 4844 txs — panic
+    /// message format must stay bit-identical to upstream `assert_eq!`).
     #[test]
-    #[should_panic(expected = "post-state nonce")]
+    #[should_panic(expected = "left == right")]
     fn legacy_tx_plus_two_still_panics() {
         let caller = Address::from([0xCD; 20]);
         let pre_nonce = 1u64;
