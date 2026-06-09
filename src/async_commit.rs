@@ -117,8 +117,7 @@ where
                             let min_post = expect + 1;
                             let max_post = expect + 1 + self_auth_count;
                             assert!(
-                                change.info.nonce >= min_post
-                                    && change.info.nonce <= max_post,
+                                change.info.nonce >= min_post && change.info.nonce <= max_post,
                                 "post-state nonce {} out of range [{}, {}] for caller {:?} \
                                  (tx_type {}, self-auth count {})",
                                 change.info.nonce,
@@ -180,11 +179,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm_context::either::Either;
-    use revm_context::result::{Output, SuccessReason};
-    use revm_context::transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization};
+    use revm_context::{
+        either::Either,
+        result::{Output, SuccessReason},
+        transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization},
+    };
     use revm_database::EmptyDB;
-    use revm_primitives::{Address, B256, U256, Bytes, HashMap};
+    use revm_primitives::{Address, B256, Bytes, HashMap, U256};
     use revm_state::{Account, AccountInfo, AccountStatus, EvmStorage};
 
     fn make_account_info(nonce: u64) -> AccountInfo {
@@ -220,11 +221,7 @@ mod tests {
         }
     }
 
-    fn make_tx_env_with_auth(
-        caller: Address,
-        pre_nonce: u64,
-        authorities: Vec<Address>,
-    ) -> TxEnv {
+    fn make_tx_env_with_auth(caller: Address, pre_nonce: u64, authorities: Vec<Address>) -> TxEnv {
         let authorization_list = authorities
             .into_iter()
             .map(|authority| {
@@ -239,13 +236,7 @@ mod tests {
                 ))
             })
             .collect();
-        TxEnv {
-            tx_type: 4,
-            caller,
-            nonce: pre_nonce,
-            authorization_list,
-            ..Default::default()
-        }
+        TxEnv { tx_type: 4, caller, nonce: pre_nonce, authorization_list, ..Default::default() }
     }
 
     fn run_commit(state: &UnsafeCell<ParallelState<EmptyDB>>, tx_env: TxEnv, post_nonce: u64) {
