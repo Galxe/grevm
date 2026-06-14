@@ -229,11 +229,18 @@ where
             if account.is_touched() {
                 let read_account = self.read_accounts.get(address);
                 let has_code = !account.info.is_empty_code_hash();
-                // is newly created contract
-                let new_contract = has_code &&
+                // The account's code was set or changed in this transaction. Besides the usual
+                // EOA/CREATE "code appears for the first time" case, EIP-7702 lets an account's
+                // delegation be re-pointed in a later transaction of the same block, so the
+                // post-state `code_hash` can move from one non-empty value to another. We must
+                // (re)publish the `Code` entry whenever the post-state code_hash differs from what
+                // we read; otherwise later txs in the block resolve a stale delegation target from
+                // multi-version memory (it had only the first delegation's `Code` entry).
+                let code_changed = has_code &&
                     account.info.code.is_some() &&
-                    read_account.map_or(true, |account| account.code_hash.is_none());
-                if new_contract {
+                    read_account
+                        .map_or(true, |basic| basic.code_hash != Some(account.info.code_hash));
+                if code_changed {
                     let location = LocationAndType::Code(address.clone());
                     write_set.insert(location.clone());
                     self.mv_memory.entry(location).or_default().insert(
@@ -246,7 +253,7 @@ where
                     );
                 }
 
-                if new_contract ||
+                if code_changed ||
                     read_account.is_none() ||
                     read_account.is_some_and(|basic| {
                         basic.nonce != account.info.nonce || basic.balance != account.info.balance

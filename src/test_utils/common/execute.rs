@@ -79,11 +79,34 @@ pub fn compare_evm_execute<DB>(
     DB: DatabaseRef + Send + Sync + Debug,
     DB::Error: Send + Sync + Clone + Debug + 'static,
 {
+    compare_evm_execute_with_spec(
+        db,
+        txs,
+        with_hints,
+        disable_nonce_check,
+        parallel_metrics,
+        SpecId::SHANGHAI,
+    );
+}
+
+/// Same as [`compare_evm_execute`] but lets the caller pick the [`SpecId`]. Needed for
+/// fork-gated features such as EIP-7702 (active from [`SpecId::PRAGUE`]).
+pub fn compare_evm_execute_with_spec<DB>(
+    db: DB,
+    txs: Vec<TxEnv>,
+    with_hints: bool,
+    disable_nonce_check: bool,
+    parallel_metrics: HashMap<&str, usize>,
+    spec: SpecId,
+) where
+    DB: DatabaseRef + Send + Sync + Debug,
+    DB::Error: Send + Sync + Clone + Debug + 'static,
+{
     // create registry for metrics
     let recorder = DebuggingRecorder::new();
 
     let mut env = BlockEnv::default();
-    let mut cfg = CfgEnv::new_with_spec(SpecId::SHANGHAI);
+    let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.disable_nonce_check = disable_nonce_check;
     env.beneficiary = super::account::MINER_ADDRESS;
     let db = Arc::new(db);
