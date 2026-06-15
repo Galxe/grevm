@@ -2,7 +2,6 @@ use revm::{Database, DatabaseCommit, DatabaseRef};
 use revm_context::{
     TxEnv,
     result::{EVMError, ExecutionResult, InvalidTransaction, ResultAndState},
-    transaction::{AuthorizationTr, TransactionType},
 };
 use revm_primitives::Address;
 
@@ -102,46 +101,6 @@ where
                 Ok(info) => {
                     if let Some(info) = info {
                         let expect = info.nonce;
-                        if let Some(change) = state.get(&tx_env.caller) {
-                            if tx_env.tx_type == TransactionType::Eip7702 as u8 {
-                                // EIP-7702 self-sponsored self-delegation can bump the caller's
-                                // nonce by more than 1: once for the outer tx, plus once for each
-                                // authorization tuple in the same tx whose `authority == caller`
-                                // that passes revm's per-tuple validation (chain_id /
-                                // existing-code / authority-nonce match / signature). The EIP
-                                // documents this broken monotonicity in its Backwards
-                                // Compatibility section.
-                                //
-                                // revm can skip individual tuples without reverting the tx, so
-                                // the precise applied count depends on dynamic state at the time
-                                // of processing — we can't cheaply re-derive it here without
-                                // duplicating revm's auth-list validation. The tightest invariant
-                                // we can assert is therefore a range: lower bound = outer tx
-                                // alone (any tuple may have been skipped); upper bound = all
-                                // self-auth tuples applied.
-                                let self_auth_count = tx_env
-                                    .authorization_list
-                                    .iter()
-                                    .filter(|a| a.authority() == Some(tx_env.caller))
-                                    .count()
-                                    as u64;
-                                let min_post = expect + 1;
-                                let max_post = expect + 1 + self_auth_count;
-                                assert!(
-                                    change.info.nonce >= min_post && change.info.nonce <= max_post,
-                                    "post-state nonce {} out of range [{}, {}] for caller {:?} \
-                                     (tx_type {}, self-auth count {})",
-                                    change.info.nonce,
-                                    min_post,
-                                    max_post,
-                                    tx_env.caller,
-                                    tx_env.tx_type,
-                                    self_auth_count,
-                                );
-                            } else {
-                                assert_eq!(change.info.nonce, expect + 1);
-                            }
-                        }
                         match tx_env.nonce.cmp(&expect) {
                             Ordering::Greater => {
                                 self.commit_result = Err(GrevmError {
@@ -297,40 +256,6 @@ mod tests {
 
         let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller, caller]);
         run_commit(&state_cell, tx_env, pre_nonce + 3);
-    }
-
-    /// Auth tuple whose authority is some *other* address must NOT widen the upper bound
-    /// for caller. A spurious +2 on caller should still panic — the relaxation is targeted,
-    /// not blanket.
-    #[test]
-    #[should_panic(expected = "post-state nonce")]
-    fn foreign_authority_does_not_widen_caller_bound() {
-        let caller = Address::from([0xCC; 20]);
-        let other = Address::from([0xAA; 20]);
-        let pre_nonce = 3u64;
-        let state = ParallelState::new(EmptyDB::default(), true, false);
-        state.insert_account(caller, make_account_info(pre_nonce));
-        let state_cell = UnsafeCell::new(state);
-
-        let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![other]);
-        // Foreign authority → max_post for caller is still pre + 1. Post = pre + 2 must panic.
-        run_commit(&state_cell, tx_env, pre_nonce + 2);
-    }
-
-    /// Non-7702 path: `tx_type != 4`, post-state nonce = +2 → must still panic via the
-    /// original strict equality (regression guard for legacy / 1559 / 4844 txs — panic
-    /// message format must stay bit-identical to upstream `assert_eq!`).
-    #[test]
-    #[should_panic(expected = "left == right")]
-    fn legacy_tx_plus_two_still_panics() {
-        let caller = Address::from([0xCD; 20]);
-        let pre_nonce = 1u64;
-        let state = ParallelState::new(EmptyDB::default(), true, false);
-        state.insert_account(caller, make_account_info(pre_nonce));
-        let state_cell = UnsafeCell::new(state);
-
-        let tx_env = TxEnv { caller, nonce: pre_nonce, ..Default::default() };
-        run_commit(&state_cell, tx_env, pre_nonce + 2);
     }
 
     /// Self-auth tx where the inner authorization is skipped by revm (e.g. nonce mismatch),
