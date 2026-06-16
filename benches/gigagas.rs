@@ -10,11 +10,7 @@ use grevm::{
         uniswap::{self, contract::SingleSwap},
     },
 };
-use metrics::{SharedString, Unit};
-use metrics_util::{
-    CompositeKey, MetricKind,
-    debugging::{DebugValue, DebuggingRecorder},
-};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::Rng;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
 use revm_primitives::{HashMap, HashSet, TxKind, U256, hardfork::SpecId};

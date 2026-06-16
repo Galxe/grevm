@@ -1,140 +1,121 @@
 # Use Grevm with reth
 
-## Import
+## Add the dependency
 
-Add the following line to your Cargo.toml
-
-```rust
+```toml
 [dependencies]
 grevm = { git = "https://github.com/Galxe/grevm.git", branch = "main" }
 ```
 
-## Usage
+## Standalone usage
 
-Using Grevm is straightforward and efficient. You just need to create a `GrevmScheduler` and then call `GrevmScheduler::parallel_execute` to get the results of parallel transaction execution. That’s all there is to it—simple and streamlined, making the process remarkably easy.
+Grevm's public surface is small: build a [`ParallelState`] over any read-only database, hand it to a
+[`Scheduler`] together with the config/block environment and the transactions, then call
+`parallel_execute`. The database only has to implement revm's read-only `DatabaseRef` trait.
 
 ```rust
-grevm::scheduler
-impl<DB> GrevmScheduler<DB>
-where
-  DB: DatabaseRef + Send + Sync + 'static,
-  DB::Error: Send + Sync,
-pub fn new(spec_id: SpecId, env: Env, db: DB, txs: Vec<TxEnv>) -> Self
+use std::sync::Arc;
 
-pub fn parallel_execute(mut self) -> Result<ExecuteOutput, GrevmError<DB::Error>
+use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
+use revm::DatabaseRef;
+use revm_context::{BlockEnv, CfgEnv, TxEnv};
+use revm_database::states::bundle_state::BundleRetention;
+
+fn execute_block<DB>(cfg: CfgEnv, env: BlockEnv, txs: Vec<TxEnv>, db: DB)
+where
+    DB: DatabaseRef + Send + Sync + 'static,
+    DB::Error: Clone + Send + Sync + 'static,
+{
+    let db = Arc::new(db);
+    let txs = Arc::new(txs);
+
+    // with_bundle_update = true  -> track transitions so we can extract a BundleState afterwards
+    // update_db_metrics  = false -> set true to record the `grevm.db_latency_us` metric
+    let state = ParallelState::new(db.clone(), true, false);
+
+    // with_hints = false -> detect dependencies on the fly (pass true to pre-parse static hints)
+    // last arg           -> optional custom precompiles (`None` for stock Ethereum precompiles)
+    let scheduler = Scheduler::new(cfg, env, txs, state, false, None);
+
+    // None -> use `GREVM_CONCURRENT_LEVEL` / available cores; `Some(n)` pins the partition count
+    scheduler.parallel_execute(None).expect("parallel execution failed");
+
+    let (results, mut state) = scheduler.take_result_and_state();
+    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+
+    // `results`: one `ExecutionResult` per transaction, in order.
+    // `bundle`:  the `BundleState` to persist to your database.
+    let _ = (results, bundle);
+}
 ```
 
-In the code above, the generic constraint for `DB` is relatively relaxed; `DB` only needs to implement `DatabaseRef`, a read-only database trait provided by `revm` for Ethereum Virtual Machine interactions. Because this is a read-only interface, it naturally satisfies the `Send` and `Sync` traits. However, the `'static` constraint, which prevents `DB` from containing reference types (`&`), may not be met by all `DB` implementations. This `'static` requirement is introduced by `tokio` in Grevm, as `tokio` requires that objects have lifetimes independent of any references.
-
-Grevm addresses this limitation by ensuring that internal object lifetimes do not exceed its own, offering an `unsafe` alternative method, `new_grevm_scheduler`, for creating `GrevmScheduler`. This method allows developers to bypass the `'static` constraint if they are confident in managing lifetimes safely.
+Key signatures:
 
 ```rust
-pub fn new_grevm_scheduler<DB>(
-    spec_id: SpecId,
-    env: Env,
-    db: DB,
-    txs: Arc<Vec<TxEnv>>,
-    state: Option<Box<State>>,
-) -> GrevmScheduler<DatabaseWrapper<DB::Error>>
+impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync + 'static,
-```
-
-### Introduce Grevm to Reth
-
-Reth provides the `BlockExecutorProvider` trait for creating `Executor` for executing a single block in live sync and `BatchExecutor` for executing a batch of blocks in historical sync. However, the associated type constraints in `BlockExecutorProvider` do not meet the `DB` constraints required for parallel block execution. To avoid imposing constraints on the `DB` satisfying `ParallelDatabase` on all structs that implement the `BlockExecutorProvider` trait in Reth, we have designed the `ParallelExecutorProvider` trait for creating `Executor` and `BatchExecutor` that satisfy the `ParallelDatabase` constraint. We have also extended the `BlockExecutorProvider` trait with a `try_into_parallel_provider` method. If a `BlockExecutorProvider` needs to support parallel execution, the implementation of `try_into_parallel_provider` is required to return a struct that implements the `ParallelExecutorProvider` trait; otherwise, it defaults to return `None`. Through this design, without imposing stronger constraints on the `DB` in the `BlockExecutorProvider` trait, developers are provided with the optional ability to extend `BlockExecutorProvider` to produce parallel block executors. For `EthExecutorProvider`, which provides executors to execute regular ethereum blocks, we have implemented `GrevmExecutorProvider` to extend its capability for parallel execution of ethereum blocks. `GrevmExecutorProvider` can create `GrevmBlockExecutor` and `GrevmBatchExecutor` that execute blocks using Grevm parallel executor.
-
-```rust
-// crates/evm/src/execute.rs
-
-pub trait BlockExecutorProvider: Send + Sync + Clone + Unpin + 'static {
-    ...
-    type ParallelProvider<'a>: ParallelExecutorProvider;
-
-    /// Try to create a parallel provider from this provider.
-    /// Return None if the block provider does not support parallel execution.
-    fn try_into_parallel_provider(&self) -> Option<Self::ParallelProvider<'_>> {
-        None
-    }
-}
-
-/// A type that can create a new parallel executor for block execution.
-pub trait ParallelExecutorProvider {
-    type Executor<DB: ParallelDatabase>: for<'a> Executor<
-        DB,
-        Input<'a> = BlockExecutionInput<'a, BlockWithSenders>,
-        Output = BlockExecutionOutput<Receipt>,
-        Error = BlockExecutionError,
-    >;
-
-    type BatchExecutor<DB: ParallelDatabase>: for<'a> BatchExecutor<
-        DB,
-        Input<'a> = BlockExecutionInput<'a, BlockWithSenders>,
-        Output = ExecutionOutcome,
-        Error = BlockExecutionError,
-    >;
-
-    fn executor<DB>(&self, db: DB) -> Self::Executor<DB>
-    where
-        DB: ParallelDatabase;
-
-    fn batch_executor<DB>(&self, db: DB) -> Self::BatchExecutor<DB>
-    where
-        DB: ParallelDatabase;
-}
-```
-
-When there is a need to execute a block, we expect developers to call `BlockExecutorProvider::try_into_parallel_provider` and decide whether to use the parallel execution solution provided by `BlockExecutorProvider` based on the returned value, or resort to sequential block execution if there is no corresponding parallel execution implementation in `BlockExecutorProvider`. By making such calls, we can also control the return value of `try_into_parallel_provider` by setting the environment variable `EVM_DISABLE_GREVM`, reverting to Reth's native executor based on revm for block execution. This feature is handy for conducting comparative experiments.
-
-```rust
-// crates/blockchain-tree/src/chain.rs
-// AppendableChain::validate_and_execute
-let state = if let Some(parallel_provider) =
-    externals.executor_factory.try_into_parallel_provider()
 {
-    parallel_provider.executor(db).execute((&block, U256::MAX).into())?
-} else {
-    externals.executor_factory.executor(db).execute((&block, U256::MAX).into())?
-};
+    pub fn new(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        with_hints: bool,
+        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+    ) -> Self;
+
+    pub fn parallel_execute(&self, concurrency_level: Option<usize>)
+        -> Result<(), GrevmError<DB::Error>>;
+
+    pub fn take_result_and_state(self) -> (Vec<ExecutionResult>, ParallelState<DB>);
+}
+
+impl<DB> ParallelState<DB> {
+    pub fn new(database: DB, with_bundle_update: bool, update_db_metrics: bool) -> Self;
+}
 ```
 
-```rust
-// crates/blockchain-tree/src/chain.rs
-// ExecutionStage::execute
-let mut executor =
-    if let Some(parallel_provider) = self.executor_provider.try_into_parallel_provider() {
-        EitherBatchExecutor::Parallel(parallel_provider.batch_executor(Arc::new(db)))
-    } else {
-        EitherBatchExecutor::Sequential(self.executor_provider.batch_executor(db))
-    };
-```
+Public items re-exported from the crate root: `Scheduler`, `ParallelState`, `ParallelCacheState`,
+`ParallelBundleState`, `ParallelTakeBundle`, `GrevmError`, `fork_join_util`.
 
-The integration code for connecting Grevm to Reth is already complete. You can check it out here: [Introduce Grevm to Reth](https://github.com/Galxe/grevm-reth/commit/9473670ab3c02e3699af1413f9c7bffc4bbbee45)
+Execution is tuned by a few environment variables (`GREVM_MIN_PARALLEL_TXS`,
+`GREVM_FALLBACK_SEQUENTIAL`, `GREVM_CONCURRENT_LEVEL`, `ASYNC_COMMIT_STATE`). See
+[Testing & Benchmarking](testing.md#environment-variable-knobs) for the full list and a working
+end-to-end harness (`src/test_utils/common/execute.rs`).
+
+## Integration with reth
+
+Grevm is integrated into Gravity's reth fork,
+[gravity-reth](https://github.com/Galxe/gravity-reth): its EVM layer exposes a parallel executor
+(`reth_evm::grevm::ParallelExecutor`) that drives block execution through the `Scheduler` shown
+above, and the pipe execution layer (`reth-pipe-exec-layer-ext-v2`) uses it to execute blocks. Refer
+to gravity-reth for the full node wiring; this crate provides the parallel execution engine itself.
 
 ## Metrics
 
-To monitor and observe execution performance, Grevm uses the `metrics` crate from [crates.io](https://crates.io/crates/metrics). Users can integrate the [Prometheus exporter](https://crates.io/crates/metrics-exporter-prometheus) within their code to expose metrics data, which can then be configured in Grafana for real-time monitoring and visualization. Below is a table that provides the names and descriptions of various metric indicators:
+Grevm reports execution metrics via the [`metrics`](https://crates.io/crates/metrics) crate (scope
+`grevm`). Integrate the [Prometheus exporter](https://crates.io/crates/metrics-exporter-prometheus)
+to scrape them. All entries below are histograms.
 
-| Metric Name | Description |
+| Metric | Description |
 | --- | --- |
-| grevm.parallel_round_calls | Number of times parallel execution is called. |
-| grevm.sequential_execute_calls | Number of times sequential execution is called. |
-| grevm.total_tx_cnt | Total number of transactions. |
-| grevm.parallel_tx_cnt | Number of transactions executed in parallel. |
-| grevm.sequential_tx_cnt | Number of transactions executed sequentially. |
-| grevm.finality_tx_cnt | Number of transactions that encountered conflicts. |
-| grevm.conflict_tx_cnt | Number of transactions that reached finality. |
-| grevm.unconfirmed_tx_cnt | Number of transactions that are unconfirmed. |
-| grevm.reusable_tx_cnt | Number of reusable transactions. |
-| grevm.skip_validation_cnt | Number of transactions that skip validation |
-| grevm.concurrent_partition_num | Number of concurrent partitions. |
-| grevm.partition_execution_time_diff | Execution time difference between partitions(in nanoseconds). |
-| grevm.partition_num_tx_diff | Number of transactions difference between partitions. |
-| grevm.parse_hints_time | Time taken to parse execution hints(in nanoseconds). |
-| grevm.partition_tx_time | Time taken to partition transactions(in nanoseconds). |
-| grevm.parallel_execute_time | Time taken to validate transactions(in nanoseconds). |
-| grevm.validate_time | Time taken to execute(in nanoseconds). |
-| grevm.merge_write_set_time | Time taken to merge write set(in nanoseconds). |
-| grevm.commit_transition_time | Time taken to commit transition(in nanoseconds). |
-| grevm.build_output_time | Time taken to build output(in nanoseconds). |
+| `grevm.total_tx_cnt` | Total number of transactions. |
+| `grevm.execution_cnt` | Number of execution incarnations. |
+| `grevm.validation_cnt` | Number of validation incarnations. |
+| `grevm.conflict_cnt` | Number of conflict incarnations. |
+| `grevm.reset_validation_idx_cnt` | Number of validation resets. |
+| `grevm.useless_dependent_update` | Number of useless dependency updates. |
+| `grevm.conflict_by_miner` | Conflicts caused by miner reward / self-destruct. |
+| `grevm.conflict_by_error` | Conflicts caused by an EVM error. |
+| `grevm.conflict_by_estimate` | Conflicts caused by an estimate (speculative read). |
+| `grevm.conflict_by_version` | Conflicts caused by a version mismatch. |
+| `grevm.no_dependency_txs` | Transactions executed with no dependency. |
+| `grevm.one_attempt_with_dependency` | Dependent transactions finalized on the first incarnation. |
+| `grevm.more_attempts_with_dependency` | Dependent transactions needing more than two incarnations. |
+| `grevm.conflict_txs` | Number of conflicting transactions. |
+| `grevm.execution_time` | Execution time (nanoseconds). |
+| `grevm.commit_time` | Commit time (nanoseconds). |
+| `grevm.total_time` | Total time (nanoseconds). |
+| `grevm.db_latency_us` | Database read latency (microseconds); recorded only when `ParallelState` is created with `update_db_metrics = true`. |

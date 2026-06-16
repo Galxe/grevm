@@ -39,6 +39,12 @@ lazy_static! {
         thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     static ref FALLBACK_SEQUENTIAL: bool =
         std::env::var("GREVM_FALLBACK_SEQUENTIAL").map_or(false, |s| s.parse().unwrap_or(false));
+    /// Minimum number of transactions in a block to run the parallel scheduler; smaller blocks
+    /// fall back to sequential execution. Defaults to 64 but can be overridden via the
+    /// `GREVM_MIN_PARALLEL_TXS` environment variable. Set it to `0` to force the parallel path
+    /// even for tiny blocks (useful when replaying small mainnet blocks to validate parallelism).
+    static ref MIN_PARALLEL_TXS: usize =
+        std::env::var("GREVM_MIN_PARALLEL_TXS").map_or(64, |s| s.parse().unwrap_or(64));
 }
 
 type TxId = usize;

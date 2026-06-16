@@ -102,16 +102,76 @@ pub fn compare_evm_execute_with_spec<DB>(
     DB: DatabaseRef + Send + Sync + Debug,
     DB::Error: Send + Sync + Clone + Debug + 'static,
 {
-    // create registry for metrics
-    let recorder = DebuggingRecorder::new();
-
     let mut env = BlockEnv::default();
+    env.beneficiary = super::account::MINER_ADDRESS;
     let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.disable_nonce_check = disable_nonce_check;
-    env.beneficiary = super::account::MINER_ADDRESS;
+    // Synthetic blocks are constructed to always execute, so a sequential failure is itself a bug.
+    match compare_evm_execute_with_env(db, txs, with_hints, cfg, env, parallel_metrics) {
+        ReplayOutcome::Ok => {}
+        ReplayOutcome::SequentialFailed(e) => panic!("sequential reference execution failed: {e}"),
+    }
+}
+
+/// Outcome of a parallel-vs-sequential comparison.
+#[derive(Debug)]
+pub enum ReplayOutcome {
+    /// Grevm parallel execution matched the sequential revm reference (per-tx results + bundle
+    /// state asserted equal).
+    Ok,
+    /// The **sequential** reference itself errored, so the inputs can't be executed at all (e.g. an
+    /// incomplete fixture). This is *not* a grevm divergence — callers replaying real blocks should
+    /// skip the block rather than blame the parallel scheduler. Carries the error description.
+    SequentialFailed(String),
+}
+
+/// Same as [`compare_evm_execute_with_spec`] but takes a fully-specified [`CfgEnv`] and
+/// [`BlockEnv`] (e.g. a real mainnet block).
+///
+/// The sequential revm reference runs **first**: if it can't execute the block the inputs are
+/// unreplayable and [`ReplayOutcome::SequentialFailed`] is returned without touching grevm. Only
+/// when the reference succeeds does grevm's parallel scheduler run; any error or divergence there
+/// is a genuine grevm bug and panics.
+pub fn compare_evm_execute_with_env<DB>(
+    db: DB,
+    txs: Vec<TxEnv>,
+    with_hints: bool,
+    cfg: CfgEnv,
+    env: BlockEnv,
+    parallel_metrics: HashMap<&str, usize>,
+) -> ReplayOutcome
+where
+    DB: DatabaseRef + Send + Sync + Debug,
+    DB::Error: Send + Sync + Clone + Debug + 'static,
+{
     let db = Arc::new(db);
     let txs = Arc::new(txs);
 
+    // 1) Sequential reference FIRST — if it errors, the inputs are unreplayable (not a grevm
+    //    issue).
+    let start = Instant::now();
+    let reth_result = match execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &*txs) {
+        Ok(result) => result,
+        Err(e) => return ReplayOutcome::SequentialFailed(format!("{e:?}")),
+    };
+    println!("Origin sequential execute time: {}ms", start.elapsed().as_millis());
+
+    // Informational only. Real mainnet blocks legitimately contain reverted/halted transactions
+    // (failed swaps, out-of-gas, etc.); those are still valid included txs, so we don't require
+    // success here — the per-tx result comparison below catches any parallel/sequential divergence
+    // regardless of the outcome variant.
+    let mut max_gas_spent = 0;
+    let mut max_gas_used = 0;
+    for result in reth_result.0.iter() {
+        if let ExecutionResult::Success { gas_used, gas_refunded, .. } = result {
+            max_gas_spent = max_gas_spent.max(gas_used + gas_refunded);
+            max_gas_used = max_gas_used.max(*gas_used);
+        }
+    }
+    println!("max_gas_spent: {}, max_gas_used: {}", max_gas_spent, max_gas_used);
+
+    // 2) Grevm parallel. The reference already succeeded, so an error here is a real grevm bug.
+    let recorder = DebuggingRecorder::new();
     let parallel_result = metrics::with_local_recorder(&recorder, || {
         let start = Instant::now();
         let state = ParallelState::new(db.clone(), true, true);
@@ -137,24 +197,9 @@ pub fn compare_evm_execute_with_spec<DB>(
         (results, state.parallel_take_bundle(BundleRetention::Reverts))
     });
 
-    let start = Instant::now();
-    let reth_result = execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &*txs).unwrap();
-    println!("Origin sequential execute time: {}ms", start.elapsed().as_millis());
-
-    let mut max_gas_spent = 0;
-    let mut max_gas_used = 0;
-    for result in reth_result.0.iter() {
-        match result {
-            ExecutionResult::Success { gas_used, gas_refunded, .. } => {
-                max_gas_spent = max_gas_spent.max(gas_used + gas_refunded);
-                max_gas_used = max_gas_used.max(*gas_used);
-            }
-            _ => panic!("result is not success"),
-        }
-    }
-    println!("max_gas_spent: {}, max_gas_used: {}", max_gas_spent, max_gas_used);
     compare_execution_result(&reth_result.0, &parallel_result.0);
     compare_bundle_state(&reth_result.1, &parallel_result.1);
+    ReplayOutcome::Ok
 }
 
 /// Simulate the sequential execution of transactions in reth
@@ -186,4 +231,53 @@ where
     evm.db_mut().merge_transitions(BundleRetention::Reverts);
 
     Ok((results, evm.db_mut().take_bundle()))
+}
+
+/// Sequentially execute `txs` against `db` under `cfg`/`env`, returning the indices of the
+/// transactions that *can* execute, in order, stopping once cumulative gas reaches `gas_cap`
+/// (pass `u64::MAX` for no cap).
+///
+/// A transaction that executes (whether it succeeds or reverts) is committed and kept; one that
+/// errors — i.e. is invalid under this environment (wrong nonce, insufficient funds, fee below
+/// basefee, …) — is skipped. This is used to turn a naive concatenation of many blocks'
+/// transactions into a single "big block" grevm can run end-to-end: merging blocks under one
+/// block environment inevitably invalidates some transactions, which must be filtered out (grevm
+/// aborts the whole block on the first transaction error).
+pub fn filter_successful_txs<DB>(
+    db: DB,
+    cfg: CfgEnv,
+    env: BlockEnv,
+    txs: &[TxEnv],
+    gas_cap: u64,
+) -> Vec<usize>
+where
+    DB: DatabaseRef + Debug,
+    DB::Error: Send + Sync + Debug + 'static,
+{
+    let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
+    let evm = Context::mainnet()
+        .with_db(db)
+        .with_cfg(cfg)
+        .with_block(env)
+        .build_mainnet_with_inspector(NoOpInspector {})
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
+    let mut evm = EthEvm::new(evm, false);
+
+    let mut kept = Vec::new();
+    let mut total_gas: u64 = 0;
+    for (i, tx) in txs.iter().enumerate() {
+        match evm.transact_raw(tx.clone()) {
+            Ok(result_and_state) => {
+                total_gas = total_gas.saturating_add(result_and_state.result.gas_used());
+                evm.db_mut().commit(result_and_state.state);
+                kept.push(i);
+                if total_gas >= gas_cap {
+                    break;
+                }
+            }
+            // Invalid under the merged environment — drop it.
+            Err(_) => continue,
+        }
+    }
+    kept
 }
