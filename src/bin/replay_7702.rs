@@ -26,6 +26,7 @@
 mod rpc;
 
 use std::{
+    collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -34,12 +35,25 @@ use std::{
 
 use grevm::test_utils::common::{
     execute,
-    mainnet::{self, BlockFixture, MainnetBlock, PreState, TxFixture, spec_for_timestamp},
+    mainnet::{
+        self, AccountFixture, BlockFixture, MainnetBlock, PreState, TxFixture, spec_for_timestamp,
+    },
 };
+use revm_primitives::{Address, B256};
 use rpc::{Rpc, parse_block_number};
 use serde_json::{Value, json};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Per-run caches reused across the (sequentially scanned) blocks to avoid re-fetching state that
+/// barely changes between adjacent blocks.
+#[derive(Default)]
+struct Caches {
+    /// Block number -> hash, for the `BLOCKHASH` opcode (256-block windows overlap across blocks).
+    hashes: BTreeMap<u64, B256>,
+    /// EIP-7702 delegation target -> account (or `None` if not a contract); targets recur.
+    delegates: BTreeMap<Address, Option<AccountFixture>>,
+}
 
 /// Mainnet block at which EIP-7702 (the Pectra hardfork) activated, 2025-05-07 — the default start
 /// block. Hardcoded for Ethereum mainnet; pass an explicit `start_block` for other chains.
@@ -85,13 +99,15 @@ fn main() -> Result<(), Error> {
     let fetcher = thread::spawn(move || -> Result<(), Error> {
         let rpc = Rpc::new(rpc_url);
         let chain_id = rpc.chain_id()?;
+        // Reused across blocks to keep per-block RPC volume low (block hashes + delegate targets).
+        let mut caches = Caches::default();
         let mut from = start;
         let mut produced = 0usize;
         loop {
             if count.is_some_and(|c| produced >= c) {
                 break;
             }
-            match next_7702(&rpc, from, head, chain_id, save_dir.as_deref())? {
+            match next_7702(&rpc, from, head, chain_id, save_dir.as_deref(), &mut caches)? {
                 Some(block) => {
                     let next = block.number + 1;
                     if tx.send(block).is_err() {
@@ -159,13 +175,14 @@ fn next_7702(
     head: u64,
     chain_id: u64,
     save_dir: Option<&Path>,
+    caches: &mut Caches,
 ) -> Result<Option<MainnetBlock>, Error> {
     let mut bn = from;
     while bn <= head {
         let hex = format!("0x{bn:x}");
         let block = rpc.call("eth_getBlockByNumber", json!([hex, true]))?;
         if !block.is_null() && has_eip7702(&block) {
-            return Ok(Some(build_block(rpc, bn, chain_id, &block, save_dir)?));
+            return Ok(Some(build_block(rpc, bn, chain_id, &block, save_dir, caches)?));
         }
         bn += 1;
     }
@@ -187,14 +204,18 @@ fn build_block(
     chain_id: u64,
     block: &Value,
     save_dir: Option<&Path>,
+    caches: &mut Caches,
 ) -> Result<MainnetBlock, Error> {
     let ts = block.get("timestamp").and_then(Value::as_str).unwrap_or("0x0");
     let spec =
         spec_for_timestamp(u64::from_str_radix(ts.trim_start_matches("0x"), 16).unwrap_or(0))
             .to_string();
     let mut bf = BlockFixture::from_rpc(number, chain_id, spec, block)?;
-    bf.block_hashes =
-        rpc.fetch_block_hashes(number.saturating_sub(256), number.saturating_sub(1))?;
+    // Block hashes for BLOCKHASH, reusing the cross-block cache (fetches only the few new entries).
+    let (lo, hi) = (number.saturating_sub(256), number.saturating_sub(1));
+    rpc.fetch_block_hashes_into(&mut caches.hashes, lo, hi)?;
+    bf.block_hashes = caches.hashes.range(lo..=hi).map(|(k, v)| (*k, *v)).collect();
+    caches.hashes.retain(|&k, _| k >= lo); // bound memory to the sliding window
     let txs: Vec<TxFixture> = block
         .get("transactions")
         .and_then(Value::as_array)
@@ -207,9 +228,9 @@ fn build_block(
     )?;
     let mut pre_state = PreState::new();
     mainnet::accumulate_prestate(&mut pre_state, &trace)?;
-    // prestateTracer omits EIP-7702 delegation targets' code; fetch them at the parent block.
+    // prestateTracer omits EIP-7702 delegation targets' code; fetch them (cached across blocks).
     let parent = format!("0x{:x}", number.saturating_sub(1));
-    rpc.supplement_delegations(&txs, &mut pre_state, &parent)?;
+    rpc.supplement_delegations_cached(&txs, &mut pre_state, &parent, &mut caches.delegates)?;
     if let Some(dir) = save_dir {
         mainnet::write_mainnet_block(dir, &bf, &txs, &pre_state)?;
     }
