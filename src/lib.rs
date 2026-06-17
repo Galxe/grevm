@@ -98,7 +98,10 @@ struct AccountBasic {
 #[derive(Debug, Clone)]
 enum MemoryValue {
     Basic(AccountInfo),
-    Code(Bytecode),
+    /// An account's code set by a transaction, plus whether that transaction *created* the account
+    /// (`CREATE`/`CREATE2`), which clears its storage. `false` for an EIP-7702 (re)delegation,
+    /// which only re-points code and preserves the account's pre-existing storage.
+    Code(Bytecode, bool),
     Storage(U256),
     SelfDestructed,
 }

@@ -28,7 +28,7 @@ This builds and runs:
 | `tests/erc20.rs` | ERC-20 transfer workloads |
 | `tests/native_transfers.rs` | raw value-transfer workloads (independent / chained / hybrid) |
 | `tests/uniswap.rs` | Uniswap swap workloads |
-| `tests/eip-7702.rs` | synthetic EIP-7702 scenarios (delegate, re-delegate, reset, multi-authority) |
+| `tests/eip-7702.rs` | synthetic EIP-7702 scenarios: delegate / re-delegate / reset / multi-authority; storage preservation when an already-delegated EOA with storage is re-delegated (the block-22546209 bug); and interaction with `CREATE`/`CREATE2` and `SELFDESTRUCT` |
 | `tests/mainnet.rs` | replays real mainnet blocks from fixtures (skips if none present) |
 
 Every integration test compares **Grevm parallel execution against a sequential revm reference**

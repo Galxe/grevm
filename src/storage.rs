@@ -178,6 +178,25 @@ where
         }
     }
 
+    /// Whether `address` had its storage cleared earlier in this block by being (re)created
+    /// (`CREATE`/`CREATE2`), in which case an unwritten slot reads as zero rather than from the
+    /// base database.
+    ///
+    /// This is recorded on the in-block `Code` write (see [`MemoryValue::Code`]). It deliberately
+    /// excludes an account whose code was merely re-pointed in-block — notably an EIP-7702 EOA
+    /// being (re)delegated — which keeps its pre-existing storage and must be read from the
+    /// database. (Self-destruct, which also clears storage, publishes its own
+    /// [`MemoryValue::SelfDestructed`] marker and any subsequent `CREATE2` re-creation sets this
+    /// flag again.)
+    fn storage_cleared_in_block(&self, address: Address) -> bool {
+        self.mv_memory.get(&LocationAndType::Code(address)).is_some_and(|entries| {
+            matches!(
+                entries.range(..self.current_tx.txid).next_back(),
+                Some((_, MemoryEntry { data: MemoryValue::Code(_, true), .. }))
+            )
+        })
+    }
+
     pub(crate) fn reset_state(&mut self, tx_version: TxVersion) {
         self.current_tx = tx_version;
         self.read_set.clear();
@@ -241,13 +260,21 @@ where
                     read_account
                         .map_or(true, |basic| basic.code_hash != Some(account.info.code_hash));
                 if code_changed {
+                    // Record whether this code write *created* the account (`CREATE`/`CREATE2`),
+                    // which clears its storage, versus merely re-pointing it (an EIP-7702
+                    // (re)delegation), which preserves the account's pre-existing storage. Later
+                    // txs use this to decide whether an unwritten slot reads as zero or from the
+                    // base database (see `storage_cleared_in_block`).
                     let location = LocationAndType::Code(address.clone());
                     write_set.insert(location.clone());
                     self.mv_memory.entry(location).or_default().insert(
                         self.current_tx.txid,
                         MemoryEntry::new(
                             self.current_tx.incarnation,
-                            MemoryValue::Code(account.info.code.clone().unwrap()),
+                            MemoryValue::Code(
+                                account.info.code.clone().unwrap(),
+                                account.is_created(),
+                            ),
                             estimate,
                         ),
                     );
@@ -303,7 +330,7 @@ where
                 written_transactions.range(..self.current_tx.txid).next_back()
             {
                 match &entry.data {
-                    MemoryValue::Code(code) => {
+                    MemoryValue::Code(code, _) => {
                         result = Some(code.clone());
                         if entry.estimate {
                             self.estimate_txs.insert(txid);
@@ -449,14 +476,11 @@ where
         }
         // 2. read from database
         if result.is_none() {
-            let mut new_ca = false;
-            if let Some(ReadVersion::MvMemory(_)) =
-                self.read_set.get(&LocationAndType::Code(address.clone()))
-            {
-                new_ca = true;
-            }
-            let slot =
-                if new_ca { U256::default() } else { self.db.storage_ref(address, index)? };
+            let slot = if self.storage_cleared_in_block(address) {
+                U256::default()
+            } else {
+                self.db.storage_ref(address, index)?
+            };
             result = Some(slot);
         }
 
