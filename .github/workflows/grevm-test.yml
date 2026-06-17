@@ -12,9 +12,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # check out
+      # check out (with the `test_data` submodule, which the mainnet replay test reads)
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
 
       # install rust tools
       - name: Set up Rust
@@ -23,5 +25,9 @@ jobs:
           toolchain: stable
           override: true
 
+      # GREVM_MIN_PARALLEL_TXS=0 forces the parallel path for the (often small) replayed mainnet
+      # blocks so the parallel-vs-sequential comparison is actually exercised.
       - name: Run tests
-        run: cargo test --features test-utils -- --skip ethereum
+        env:
+          GREVM_MIN_PARALLEL_TXS: "0"
+        run: cargo test --features test-utils

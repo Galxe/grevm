@@ -41,17 +41,32 @@ Grevm 2.1 is composed of three main modules:
   Provides an asynchronous commit mechanism with multi-version memory to reduce latency and manage miner rewards and
   self-destruct opcodes efficiently.
 
+## Testing
+
+All tests and benchmarks require the `test-utils` feature:
+
+```bash
+cargo test --features test-utils
+```
+
+This runs the library unit tests plus the integration suites (`erc20`, `native_transfers`,
+`uniswap`, `eip-7702`, and the mainnet replay test). See
+[Testing & Benchmarking](docs/testing.md) for the full guide, including how to replay real mainnet
+blocks (EIP-7702 included) and the available environment-variable knobs.
+
 ## Running the Benchmark
 
-To reproduce the benchmark:
+To reproduce the synthetic gigagas benchmark:
 
 ```bash
 JEMALLOC_SYS_WITH_MALLOC_CONF="thp:always,metadata_thp:always" \
 NUM_EOA=<num_accounts> HOT_RATIO=<hot_ratio> DB_LATENCY_US=<latency_in_us> \
-cargo bench --bench gigagas
+cargo bench --features test-utils --bench gigagas
 ```
 
-Replace `<num_accounts>`, `<hot_ratio>`, and `<latency_in_us>` with your desired parameters.
+Replace `<num_accounts>`, `<hot_ratio>`, and `<latency_in_us>` with your desired parameters. There
+is also a `continuous` benchmark that runs merged real-mainnet "big blocks"; see
+[Testing & Benchmarking](docs/testing.md).
 
 ## Further Details
 
