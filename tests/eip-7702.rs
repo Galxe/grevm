@@ -18,6 +18,13 @@
 //! - [`reset_then_redelegate_within_block`]     — A → X → 0x0 → Y chained in one block
 //! - [`multiple_authorities_single_tx`]         — one tx delegating two distinct authorities
 //! - [`repeated_authority_single_tx`]           — one tx with two tuples for the same authority
+//! - [`redelegate_preserves_existing_storage`]  — re-delegating an EOA that already has storage
+//!   must preserve it (the block-22546209 `new_ca` storage bug)
+//! - [`reset_then_redelegate_preserves_existing_storage`] — same, across a reset-to-EOA step
+//! - [`selfdestruct_then_recreate_clears_storage`] — self-destruct + CREATE re-create *clears*
+//!   storage (Shanghai; the original `new_ca` purpose — the create side of the same coin)
+//! - [`create2_target_redelegate_and_selfdestruct`] — CREATE2 + EIP-7702 re-delegation +
+//!   self-destruct composed in one Prague block
 
 use grevm::test_utils::{
     TRANSFER_GAS_LIMIT,
@@ -30,7 +37,8 @@ use revm_context::{
 };
 use revm_database::PlainAccount;
 use revm_primitives::{
-    Address, HashMap, KECCAK_EMPTY, TxKind, U256, alloy_primitives::U160, hardfork::SpecId,
+    Address, B256, HashMap, KECCAK_EMPTY, TxKind, U256, alloy_primitives::U160, hardfork::SpecId,
+    keccak256,
 };
 use revm_state::{AccountInfo, Bytecode};
 
@@ -165,11 +173,15 @@ fn call_tx(caller_idx: usize, to: Address) -> TxEnv {
 }
 
 fn run(txs: Vec<TxEnv>) {
+    run_with_db(build_db(), txs);
+}
+
+fn run_with_db(db: InMemoryDB, txs: Vec<TxEnv>) {
     // Prague enables EIP-7702. `disable_nonce_check = true` only relaxes the tx-sender nonce
     // (every sponsor/caller is distinct here anyway); the authorization-nonce check, which
     // orders the delegations on a shared authority, is independent and still enforced.
     execute::compare_evm_execute_with_spec(
-        build_db(),
+        db,
         txs,
         false,
         true,
@@ -252,4 +264,226 @@ fn repeated_authority_single_tx() {
     txs[10] = delegate_tx(10, &[(authority_a(), target_x(), 0), (authority_a(), target_y(), 1)]);
     txs[30] = call_tx(30, authority_a()); // must run Y → slot0 == 2
     run(txs);
+}
+
+/// Runtime that copies the executing account's storage slot 0 into slot 1:
+/// `PUSH1 0x00; SLOAD; PUSH1 0x01; SSTORE; STOP`. Used as a delegate target so that a
+/// delegated EOA's *pre-existing* slot-0 value becomes observable (as slot 1) after a CALL.
+fn copy_slot0_to_slot1_code() -> Bytecode {
+    Bytecode::new_raw(vec![0x60, 0x00, 0x54, 0x60, 0x01, 0x55, 0x00].into())
+}
+
+/// Base DB where authority `A` is **already delegated** (to X, from an earlier block) and
+/// carries storage `slot0 = stored`. Used to exercise the re-delegation storage-preservation
+/// path. `A`'s nonce starts at `nonce`.
+fn db_with_predelegated_a(nonce: u64, stored: u64) -> InMemoryDB {
+    let mut accounts = account::mock_block_accounts(BLOCK_SIZE);
+
+    let base_designator = Bytecode::new_eip7702(target_x());
+    let a = PlainAccount {
+        info: AccountInfo {
+            balance: U256::from(ONE_ETHER),
+            nonce,
+            code_hash: base_designator.hash_slow(),
+            code: Some(base_designator.clone()),
+        },
+        storage: [(U256::from(0), U256::from(stored))].into_iter().collect(),
+    };
+    accounts.insert(authority_a(), a);
+
+    // The re-delegation target copies slot0 -> slot1, making the preserved value observable.
+    let reader = copy_slot0_to_slot1_code();
+    accounts.insert(target_y(), contract_account(&reader));
+
+    let mut bytecodes = HashMap::default();
+    bytecodes.insert(base_designator.hash_slow(), base_designator);
+    bytecodes.insert(reader.hash_slow(), reader);
+    InMemoryDB::new(accounts, bytecodes, Default::default())
+}
+
+/// Regression for the EIP-7702 **storage-preservation** bug (mainnet block 22546209): an EOA
+/// that is *already* delegated and carries storage is re-delegated within the block, then
+/// CALLed. Its pre-existing storage must survive the in-block code change.
+///
+/// `A` (slot0 = 42) is re-delegated X -> Y (tx 10); the CALL (tx 30) runs Y, which copies
+/// slot0 into slot1, so slot1 must end up 42. Before the fix, grevm's `new_ca` shortcut
+/// mistook the in-block code change for a freshly created contract and returned 0 for the
+/// unwritten slot0, so slot1 became 0 — diverging from the sequential reference.
+#[test]
+fn redelegate_preserves_existing_storage() {
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_tx(10, &[(authority_a(), target_y(), 5)]); // re-delegate A: X -> Y (nonce 5 -> 6)
+    txs[30] = call_tx(30, authority_a()); // runs Y: slot1 := slot0 (must be 42, not 0)
+    run_with_db(db_with_predelegated_a(5, 42), txs);
+}
+
+/// Same storage-preservation guarantee across a reset: `A` (slot0 = 42, already delegated) is
+/// reset to a plain EOA (tx 10) and then delegated to Y (tx 20). Neither a reset nor a
+/// (re)delegation clears storage, so the CALL (tx 30) running Y must still observe slot0 == 42.
+#[test]
+fn reset_then_redelegate_preserves_existing_storage() {
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_tx(10, &[(authority_a(), Address::ZERO, 5)]); // A -> EOA  (nonce 5 -> 6)
+    txs[20] = delegate_tx(20, &[(authority_a(), target_y(), 6)]); // A -> Y    (nonce 6 -> 7)
+    txs[30] = call_tx(30, authority_a()); // runs Y: slot1 := slot0 (must be 42)
+    run_with_db(db_with_predelegated_a(5, 42), txs);
+}
+
+/// A CREATE transaction whose calldata is `init_code`.
+fn create_tx(caller_idx: usize, init_code: Vec<u8>) -> TxEnv {
+    TxEnv {
+        caller: account::mock_eoa_address(caller_idx),
+        kind: TxKind::Create,
+        data: init_code.into(),
+        value: U256::ZERO,
+        gas_limit: 300_000,
+        gas_price: 1,
+        nonce: 1,
+        ..TxEnv::default()
+    }
+}
+
+/// The counterpart of [`redelegate_preserves_existing_storage`]: the *other* in-block way an
+/// account's `code_hash` changes is a genuine (re)creation, which **does** clear storage. This is
+/// the scenario the `new_ca` shortcut was originally added for; the fix must keep it working, since
+/// `storage_cleared_in_block` still returns `true` for created accounts (`is_created == true`).
+///
+/// Under a pre-Cancun spec (Shanghai), `SELFDESTRUCT` fully deletes a pre-existing contract — its
+/// storage included — so a `CREATE` landing on the same address produces a fresh contract whose
+/// old storage is gone. Here a victim contract (slot0 = 99) self-destructs (tx 10); a CREATE then
+/// redeploys a "copy slot0 -> slot1" runtime at the very same address (tx 50); a later CALL (tx
+/// 80) must observe the *cleared* slot0 (slot1 == 0), not the stale base-DB 99. Asserts grevm's
+/// parallel result matches sequential for the full self-destruct → recreate → read lifecycle.
+#[test]
+fn selfdestruct_then_recreate_clears_storage() {
+    let creator_idx = 50;
+    let creator = account::mock_eoa_address(creator_idx);
+    // Address the CREATE in tx `creator_idx` (creator nonce 1) will deploy to.
+    let victim = creator.create(1);
+
+    let selfdestruct_code = Bytecode::new_raw(vec![0x33, 0xff].into()); // CALLER; SELFDESTRUCT
+    let runtime = vec![0x60, 0x00, 0x54, 0x60, 0x01, 0x55, 0x00]; // copy slot0 -> slot1
+    let recreated = Bytecode::new_raw(runtime.clone().into());
+    // Init code: CODECOPY the 7-byte runtime (at offset 12) to memory and RETURN it.
+    let mut init_code =
+        vec![0x60, 0x07, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x07, 0x60, 0x00, 0xf3];
+    init_code.extend_from_slice(&runtime);
+
+    let mut accounts = account::mock_block_accounts(BLOCK_SIZE);
+    let v = PlainAccount {
+        info: AccountInfo {
+            balance: U256::ZERO,
+            nonce: 1,
+            code_hash: selfdestruct_code.hash_slow(),
+            code: Some(selfdestruct_code.clone()),
+        },
+        storage: [(U256::from(0), U256::from(99))].into_iter().collect(),
+    };
+    accounts.insert(victim, v);
+
+    let mut bytecodes = HashMap::default();
+    bytecodes.insert(selfdestruct_code.hash_slow(), selfdestruct_code);
+    bytecodes.insert(recreated.hash_slow(), recreated);
+    let db = InMemoryDB::new(accounts, bytecodes, Default::default());
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = call_tx(10, victim); // self-destruct the victim (Shanghai => deleted)
+    txs[creator_idx] = create_tx(creator_idx, init_code); // redeploy "copy slot0->slot1" at victim
+    txs[80] = call_tx(80, victim); // runs recreated: slot1 := slot0, which must be 0 (cleared)
+
+    execute::compare_evm_execute_with_spec(
+        db,
+        txs,
+        false,
+        true,
+        Default::default(),
+        SpecId::SHANGHAI,
+    );
+}
+
+/// Init code that, when run, deploys `runtime` as the new account's code
+/// (`CODECOPY` the trailing runtime to memory and `RETURN` it). Assumes `runtime.len() < 256`.
+fn deploy_initcode(runtime: &[u8]) -> Vec<u8> {
+    let l = runtime.len() as u8;
+    let mut c = vec![0x60, l, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, l, 0x60, 0x00, 0xf3];
+    c.extend_from_slice(runtime);
+    c
+}
+
+/// A factory contract whose body `CREATE2`s `init_code` with salt 0 when called.
+fn create2_factory(init_code: &[u8]) -> Bytecode {
+    let m = init_code.len() as u8;
+    let mut c = vec![
+        0x60, m, 0x60, 0x11, 0x60, 0x00, 0x39, // CODECOPY init_code -> mem[0]
+        0x60, 0x00, 0x60, m, 0x60, 0x00, 0x60, 0x00,
+        0xf5, // CREATE2(value=0,off=0,size=m,salt=0)
+        0x00, // STOP
+    ];
+    c.extend_from_slice(init_code);
+    Bytecode::new_raw(c.into())
+}
+
+/// All three mechanisms in one Prague block: a fresh delegate target is **CREATE2**-deployed, a
+/// stored EOA is **EIP-7702** re-delegated to it, and a contract **self-destructs** — verifying
+/// they compose under grevm's parallel scheduler.
+///
+/// NB: a *single* block where SELFDESTRUCT actually **clears** storage AND EIP-7702 is active is
+/// impossible — EIP-6780 (Cancun) restricts self-destruct clearing to same-tx-created accounts, so
+/// cross-tx "self-destruct → CREATE2 recreate" only clears pre-Cancun, while EIP-7702 is Prague.
+/// (The clearing half is covered by [`selfdestruct_then_recreate_clears_storage`] under Shanghai.)
+/// Here, under Prague, the self-destruct of a pre-existing `V` is balance-only.
+///
+/// Flow: tx 10 CREATE2-deploys `T` ("copy slot0 -> slot1", `is_created == true`); tx 20
+/// re-delegates the stored EOA `A` (slot0 = 42) to `T` (`is_created == false` — storage must be
+/// preserved); tx 30 self-destructs `V`, forwarding its balance to `A`; tx 40 CALLs `A`, running
+/// `T`, which must read `A`'s preserved slot0 (so slot1 == 42, not 0). `A`'s slot0 read flows
+/// through grevm's `storage_cleared_in_block` gate, so this also fails under the pre-fix `new_ca`
+/// logic.
+#[test]
+fn create2_target_redelegate_and_selfdestruct() {
+    let factory = Address::from(U160::from(920_000));
+    let victim = Address::from(U160::from(920_001));
+
+    let runtime = vec![0x60, 0x00, 0x54, 0x60, 0x01, 0x55, 0x00]; // copy slot0 -> slot1
+    let init_code = deploy_initcode(&runtime);
+    let target = factory.create2(B256::ZERO, keccak256(&init_code)); // where CREATE2 deploys T
+
+    let factory_code = create2_factory(&init_code);
+    let base_designator = Bytecode::new_eip7702(target_x()); // A starts delegated elsewhere
+    let mut selfdestruct = vec![0x73]; // PUSH20 A; SELFDESTRUCT (forward balance to A)
+    selfdestruct.extend_from_slice(authority_a().as_slice());
+    selfdestruct.push(0xff);
+    let victim_code = Bytecode::new_raw(selfdestruct.into());
+
+    let mut accounts = account::mock_block_accounts(BLOCK_SIZE);
+    // A: already delegated (to X) and carrying storage slot0 = 42.
+    accounts.insert(
+        authority_a(),
+        PlainAccount {
+            info: AccountInfo {
+                balance: U256::from(ONE_ETHER),
+                nonce: 5,
+                code_hash: base_designator.hash_slow(),
+                code: Some(base_designator.clone()),
+            },
+            storage: [(U256::from(0), U256::from(42))].into_iter().collect(),
+        },
+    );
+    accounts.insert(factory, contract_account(&factory_code));
+    let mut victim_account = contract_account(&victim_code);
+    victim_account.info.balance = U256::from(500u128);
+    accounts.insert(victim, victim_account);
+
+    let mut bytecodes = HashMap::default();
+    for c in [&base_designator, &factory_code, &victim_code] {
+        bytecodes.insert(c.hash_slow(), c.clone());
+    }
+    let db = InMemoryDB::new(accounts, bytecodes, Default::default());
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = call_tx(10, factory); // CREATE2-deploy T
+    txs[20] = delegate_tx(20, &[(authority_a(), target, 5)]); // re-delegate A -> T (nonce 5 -> 6)
+    txs[30] = call_tx(30, victim); // V self-destructs, balance -> A
+    txs[40] = call_tx(40, authority_a()); // run T: slot1 := slot0 (must be 42, preserved)
+    run_with_db(db, txs);
 }
