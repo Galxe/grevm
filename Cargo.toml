@@ -89,11 +89,11 @@ name = "fetch_continuous"
 path = "src/bin/fetch_continuous.rs"
 required-features = ["tools"]
 
-# Pipelined replay: discover EIP-7702 blocks over RPC and replay each (parallel vs sequential),
-# prefetching the next block while replaying the current one. All in one process.
+# Pipelined replay: discover mainnet blocks over RPC (filtered, e.g. `all` or `eip-7702`) and
+# replay each (parallel vs sequential), prefetching the next block while replaying the current one.
 [[bin]]
-name = "replay_7702"
-path = "src/bin/replay_7702.rs"
+name = "replay_mainnet"
+path = "src/bin/replay_mainnet.rs"
 required-features = ["tools"]
 
 [profile.release]

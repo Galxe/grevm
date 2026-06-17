@@ -1,27 +1,30 @@
-//! Discover EIP-7702 (type-4) mainnet blocks over JSON-RPC and replay each one through grevm's
-//! parallel-vs-sequential check — all in a single process.
+//! Discover mainnet blocks over JSON-RPC and replay each through grevm's parallel-vs-sequential
+//! check — all in a single process.
 //!
-//! Blocks are scanned **upward** from `start_block` toward the chain head. A background thread
-//! discovers and fetches the *next* 7702 block while the main thread replays the *current* one
-//! (`sync_channel(1)` keeps the fetcher exactly one block ahead), so network I/O overlaps with
-//! execution without spawning a new process per block.
+//! Blocks are scanned **upward** from `start_block` toward the chain head, keeping only those that
+//! match a `filter`. A background thread discovers and fetches the *next* matching block while the
+//! main thread replays the *current* one (`sync_channel(1)` keeps the fetcher exactly one block
+//! ahead), so network I/O overlaps with execution without spawning a process per block.
 //!
 //! Discovery scans the chain directly via the RPC (no etherscan scraping / API key needed); a
 //! `debug`-namespace endpoint (for `prestateTracer`) is required.
 //!
 //! Usage:
 //! ```text
-//! cargo run --bin replay_7702 --features tools -- <rpc_url> [start_block] [count] [out_dir]
+//! cargo run --bin replay_mainnet --features tools -- <rpc_url> [filter] [start_block] [count] [out_dir]
 //! ```
+//! - `filter`      — which blocks to replay: `all` (default) every non-empty block, or `eip-7702`
+//!   only blocks containing a type-4 transaction. More filters can be added later.
 //! - `start_block` — block to start scanning upward from. Default: the mainnet EIP-7702 activation
 //!   block ([`PECTRA_BLOCK`]).
-//! - `count`       — how many 7702 blocks to replay. Default: all of them up to the chain head.
+//! - `count`       — how many matching blocks to replay. Default: all of them up to the chain head.
 //! - `out_dir`     — optional. If given, each replayed block's fixture is written to
-//!   `<out_dir>/<number>/` (same format as `fetch_block`). Omitted ⇒ fetched in memory only,
-//!   nothing is written to disk.
+//!   `<out_dir>/<number>/` (same format as `fetch_block`). Omitted ⇒ fetched in memory only.
 //!
-//! Blocks are validated as they arrive. On the first divergence (grevm parallel result !=
-//! sequential) the offending block is reported and the process exits non-zero.
+//! Each block is validated as it arrives and its parallel/sequential **execution-only** times
+//! (no I/O) are accumulated; a final line reports the aggregate speedup. On the first divergence
+//! (grevm parallel result != sequential) the offending block is reported and the process exits
+//! non-zero.
 
 mod rpc;
 
@@ -31,6 +34,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
+    time::Duration,
 };
 
 use grevm::test_utils::common::{
@@ -44,6 +48,43 @@ use rpc::{Rpc, parse_block_number};
 use serde_json::{Value, json};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Which blocks to replay. New variants can be added without touching the pipeline.
+#[derive(Clone, Copy)]
+enum Filter {
+    /// Every block with at least one transaction.
+    All,
+    /// Only blocks containing an EIP-7702 (type-4) transaction.
+    Eip7702,
+}
+
+impl Filter {
+    fn parse(s: &str) -> Result<Self, Error> {
+        match s.to_ascii_lowercase().as_str() {
+            "all" => Ok(Filter::All),
+            "eip-7702" | "eip7702" | "7702" => Ok(Filter::Eip7702),
+            other => Err(format!("unknown filter {other:?} (expected `all` or `eip-7702`)").into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Filter::All => "all",
+            Filter::Eip7702 => "EIP-7702",
+        }
+    }
+
+    /// Whether a block (an `eth_getBlockByNumber` result with full txs) should be replayed.
+    fn matches(self, block: &Value) -> bool {
+        let txs = block.get("transactions").and_then(Value::as_array);
+        match self {
+            Filter::All => txs.is_some_and(|t| !t.is_empty()),
+            Filter::Eip7702 => txs.is_some_and(|t| {
+                t.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("0x4"))
+            }),
+        }
+    }
+}
 
 /// Per-run caches reused across the (sequentially scanned) blocks to avoid re-fetching state that
 /// barely changes between adjacent blocks.
@@ -63,20 +104,28 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: cargo run --bin replay_7702 --features tools -- \
-             <rpc_url> [start_block] [count] [out_dir]"
+            "usage: cargo run --bin replay_mainnet --features tools -- \
+             <rpc_url> [all|eip-7702] [start_block] [count] [out_dir]"
         );
         std::process::exit(1);
     }
     let rpc_url = args[1].clone();
-    let start_arg = args.get(2).cloned();
-    let count: Option<usize> = args.get(3).map(|s| s.parse()).transpose()?;
-    let save_dir: Option<PathBuf> = args.get(4).map(PathBuf::from);
+    let filter = match args.get(2) {
+        Some(s) => Filter::parse(s)?,
+        None => Filter::All,
+    };
+    let start_arg = args.get(3).cloned();
+    let count: Option<usize> = args.get(4).map(|s| s.parse()).transpose()?;
+    let save_dir: Option<PathBuf> = args.get(5).map(PathBuf::from);
 
-    // Force the parallel path even for small blocks. SAFETY: set before any thread is spawned and
-    // before any execution reads it, so there is no concurrent getenv/setenv.
+    // Force the parallel path even for small blocks, and print grevm's per-block metrics. SAFETY:
+    // set before any thread is spawned and before any execution reads them — no concurrent
+    // getenv/setenv.
     if std::env::var_os("GREVM_MIN_PARALLEL_TXS").is_none() {
         unsafe { std::env::set_var("GREVM_MIN_PARALLEL_TXS", "0") };
+    }
+    if std::env::var_os("GREVM_PRINT_METRICS").is_none() {
+        unsafe { std::env::set_var("GREVM_PRINT_METRICS", "1") };
     }
 
     let rpc = Rpc::new(rpc_url.clone());
@@ -85,15 +134,18 @@ fn main() -> Result<(), Error> {
         Some(s) => parse_block_number(&s)?,
         None => PECTRA_BLOCK,
     };
+    let what = filter.label();
     match count {
-        Some(c) => println!("Replaying up to {c} EIP-7702 block(s) from {start} (head {head})"),
-        None => println!("Replaying ALL EIP-7702 blocks from {start} up to head {head}"),
+        Some(c) => {
+            println!("Replaying up to {c} block(s) [filter: {what}] from {start} (head {head})")
+        }
+        None => println!("Replaying every block [filter: {what}] from {start} up to head {head}"),
     }
     if let Some(dir) = &save_dir {
         println!("Persisting each block's fixture under {}", dir.display());
     }
 
-    // Prefetch thread: discover + fetch the next 7702 block while the main thread replays the
+    // Prefetch thread: discover + fetch the next matching block while the main thread replays the
     // current one. `sync_channel(1)` keeps it exactly one block ahead.
     let (tx, rx) = mpsc::sync_channel::<MainnetBlock>(1);
     let fetcher = thread::spawn(move || -> Result<(), Error> {
@@ -107,7 +159,8 @@ fn main() -> Result<(), Error> {
             if count.is_some_and(|c| produced >= c) {
                 break;
             }
-            match next_7702(&rpc, from, head, chain_id, save_dir.as_deref(), &mut caches)? {
+            match next_match(&rpc, filter, from, head, chain_id, save_dir.as_deref(), &mut caches)?
+            {
                 Some(block) => {
                     let next = block.number + 1;
                     if tx.send(block).is_err() {
@@ -116,7 +169,7 @@ fn main() -> Result<(), Error> {
                     from = next;
                     produced += 1;
                 }
-                None => break, // reached head, no more 7702 blocks
+                None => break, // reached head, no more matching blocks
             }
         }
         Ok(())
@@ -124,6 +177,7 @@ fn main() -> Result<(), Error> {
 
     let mut replayed = 0usize;
     let mut skipped = 0usize;
+    let (mut total_seq, mut total_par) = (Duration::ZERO, Duration::ZERO);
     for block in rx {
         let (label, ntx, spec) = (block.label.clone(), block.txs.len(), block.spec);
         println!("===== replay block {label} ({ntx} txs, spec {spec:?}) =====");
@@ -142,9 +196,14 @@ fn main() -> Result<(), Error> {
             )
         }));
         match outcome {
-            Ok(execute::ReplayOutcome::Ok) => {
+            Ok(execute::ReplayOutcome::Ok { sequential, parallel }) => {
                 replayed += 1;
-                println!("  block {label}: OK");
+                total_seq += sequential;
+                total_par += parallel;
+                println!(
+                    "  block {label}: OK (execution only: sequential {sequential:?}, \
+                     parallel {parallel:?})"
+                );
             }
             Ok(execute::ReplayOutcome::SequentialFailed(e)) => {
                 skipped += 1;
@@ -163,14 +222,21 @@ fn main() -> Result<(), Error> {
     fetcher.join().map_err(|_| "prefetch thread panicked")??;
 
     println!("Done: {replayed} blocks passed, {skipped} skipped (unreplayable fixtures)");
+    if replayed > 0 && total_par > Duration::ZERO {
+        let speedup = total_seq.as_secs_f64() / total_par.as_secs_f64();
+        println!(
+            "Aggregate execution time (no I/O) over {replayed} blocks: sequential {total_seq:?}, \
+             parallel {total_par:?}  →  {speedup:.2}x"
+        );
+    }
     Ok(())
 }
 
 /// Scan upward from `from` to `head` (inclusive), returning the first block (built in memory) that
-/// contains at least one EIP-7702 (type-4) transaction, or `None` if none remain. If `save_dir` is
-/// set, the block's fixture is also written there.
-fn next_7702(
+/// satisfies `filter`, or `None` if none remain. If `save_dir` is set, the fixture is also written.
+fn next_match(
     rpc: &Rpc,
+    filter: Filter,
     from: u64,
     head: u64,
     chain_id: u64,
@@ -181,19 +247,12 @@ fn next_7702(
     while bn <= head {
         let hex = format!("0x{bn:x}");
         let block = rpc.call("eth_getBlockByNumber", json!([hex, true]))?;
-        if !block.is_null() && has_eip7702(&block) {
+        if !block.is_null() && filter.matches(&block) {
             return Ok(Some(build_block(rpc, bn, chain_id, &block, save_dir, caches)?));
         }
         bn += 1;
     }
     Ok(None)
-}
-
-fn has_eip7702(block: &Value) -> bool {
-    block
-        .get("transactions")
-        .and_then(Value::as_array)
-        .is_some_and(|txs| txs.iter().any(|t| t.get("type").and_then(Value::as_str) == Some("0x4")))
 }
 
 /// Build a [`MainnetBlock`] in memory from an already-fetched `eth_getBlockByNumber` result plus a

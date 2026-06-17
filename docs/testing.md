@@ -90,38 +90,46 @@ GREVM_MIN_PARALLEL_TXS=0 GREVM_MAINNET_BLOCK=25323281 \
 than 64 transactions. Without `GREVM_MAINNET_BLOCK` the test loads every fixture under
 `GREVM_MAINNET_BLOCKS` and asserts parallel == sequential for each.
 
-### 3. Pipelined discover-and-replay (`replay_7702`)
+### 3. Pipelined discover-and-replay (`replay_mainnet`)
 
-To validate many real 7702 blocks without committing fixtures, the `replay_7702` binary discovers
-type-4 blocks over RPC and replays each in-process, prefetching the next block while replaying the
-current one (a background thread fetches block N+1 while the main thread replays block N):
+To validate many real blocks without committing fixtures, the `replay_mainnet` binary discovers
+blocks over RPC and replays each in-process, prefetching the next block while replaying the current
+one (a background thread fetches block N+1 while the main thread replays block N):
 
 ```bash
-cargo run --bin replay_7702 --features tools -- <rpc_url> [start_block] [count] [out_dir]
+cargo run --bin replay_mainnet --features tools -- <rpc_url> [filter] [start_block] [count] [out_dir]
 ```
 
 Blocks are scanned **upward** toward the chain head.
 
+- `filter`      — which blocks to replay: `all` (default; every non-empty block) or `eip-7702`
+  (only blocks with a type-4 transaction). Extensible — more filters can be added later.
 - `start_block` — where to start scanning. Default: the mainnet EIP-7702 activation block
   (`22431084`, Pectra, 2025-05-07).
-- `count`       — how many 7702 blocks to replay. Default: **all** of them up to the chain head.
+- `count`       — how many matching blocks to replay. Default: **all** of them up to the chain head.
 - `out_dir`     — optional. If given, each replayed block's fixture is written to
   `<out_dir>/<number>/`. Omitted ⇒ fetched in memory only, **nothing is written to disk** (so the
   "all" mode doesn't fill the disk with millions of fixtures).
 
 ```bash
-# Replay ALL 7702 blocks since activation (large job — dominated by one debug_traceBlockByNumber
-# per block; interrupt any time), in memory only:
-cargo run --bin replay_7702 --features tools -- <rpc_url>
+# Replay every EIP-7702 block since activation (large job — dominated by one
+# debug_traceBlockByNumber per block; interrupt any time), in memory only:
+cargo run --bin replay_mainnet --features tools -- <rpc_url> eip-7702
 
-# Replay 20 blocks from a height AND persist them under test_data/mainnet_blocks/:
-cargo run --bin replay_7702 --features tools -- <rpc_url> 25323281 20 test_data/mainnet_blocks
+# Replay 20 (any) blocks from a height AND persist them under test_data/mainnet_blocks/:
+cargo run --bin replay_mainnet --features tools -- <rpc_url> all 25323281 20 test_data/mainnet_blocks
 ```
 
-Blocks are validated as they arrive. On the **first** divergence (grevm parallel result !=
+Each block is validated as it arrives, and its **execution-only** times (the inputs are already in
+memory, so neither figure includes RPC/file I/O) are printed per block and accumulated into a final
+aggregate parallel-vs-sequential speedup. On the **first** divergence (grevm parallel result !=
 sequential) it prints the offending block (the assertion above it shows the diverging
 account/value) and exits non-zero. Without `out_dir` nothing is written to disk — use `fetch_block`
 or pass `out_dir` to persist a fixture.
+
+> Note: with an in-memory fixture the database has ~zero read latency, so the measured speedup is
+> compute-bound and understates the win on a real node, where parallel execution also hides storage
+> I/O latency.
 
 ### Oracle & scope
 
