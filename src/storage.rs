@@ -227,6 +227,13 @@ where
             if *address == self.coinbase {
                 continue;
             }
+            // Storage-clearing account change (self-destruct, or EIP-161 empty). We mirror revm's
+            // spec-aware result instead of re-deriving it: revm flags `is_selfdestructed()` only
+            // when the fork truly deletes the account — pre-Cancun for any contract, post-Cancun
+            // (EIP-6780) only one created in the same tx. A post-Cancun self-destruct of a
+            // pre-existing account is a mere balance transfer (not flagged), so it keeps its
+            // storage via the path below. Both fork semantics thus work with no
+            // branching of our own.
             if account.is_selfdestructed() || account.state_clear_aware_is_empty(self.spec) {
                 let memory_entry = MemoryEntry::new(
                     self.current_tx.incarnation,

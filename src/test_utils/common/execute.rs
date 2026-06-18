@@ -1,5 +1,5 @@
 use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
-use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
 use crate::{ParallelState, ParallelTakeBundle, Scheduler};
 use revm::{
@@ -16,7 +16,33 @@ use revm_database::{
 use revm_inspector::NoOpInspector;
 use revm_primitives::{Address, HashMap, U256, hardfork::SpecId};
 
-use std::{collections::BTreeMap, fmt::Debug, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fmt::Debug,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
+
+/// Lazily install a **process-wide** debugging recorder (once) and return its snapshotter.
+///
+/// We deliberately avoid a fresh per-call `metrics::with_local_recorder`: that recorder is
+/// thread-local and scoped to one call, so grevm's worker-thread metrics and every block after the
+/// first are silently dropped (only the first block printed a full set). One stable global recorder
+/// instead captures metrics from all threads and all blocks; [`Snapshotter::snapshot`] drains the
+/// histograms, so each call returns just that block's values and memory stays bounded.
+///
+/// Returns `None` if metric capture isn't requested or another global recorder is already
+/// installed.
+fn metrics_snapshotter() -> Option<&'static Snapshotter> {
+    static SNAPSHOTTER: OnceLock<Option<Snapshotter>> = OnceLock::new();
+    SNAPSHOTTER
+        .get_or_init(|| {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            recorder.install().ok().map(|()| snapshotter)
+        })
+        .as_ref()
+}
 
 pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert!(
@@ -108,7 +134,7 @@ pub fn compare_evm_execute_with_spec<DB>(
     cfg.disable_nonce_check = disable_nonce_check;
     // Synthetic blocks are constructed to always execute, so a sequential failure is itself a bug.
     match compare_evm_execute_with_env(db, txs, with_hints, cfg, env, parallel_metrics) {
-        ReplayOutcome::Ok => {}
+        ReplayOutcome::Ok { .. } => {}
         ReplayOutcome::SequentialFailed(e) => panic!("sequential reference execution failed: {e}"),
     }
 }
@@ -117,8 +143,10 @@ pub fn compare_evm_execute_with_spec<DB>(
 #[derive(Debug)]
 pub enum ReplayOutcome {
     /// Grevm parallel execution matched the sequential revm reference (per-tx results + bundle
-    /// state asserted equal).
-    Ok,
+    /// state asserted equal). Carries the **execution-only** wall-clock time of each path (the
+    /// inputs are already in memory, so neither figure includes any file/RPC I/O) — useful for
+    /// comparing parallel vs sequential throughput.
+    Ok { sequential: Duration, parallel: Duration },
     /// The **sequential** reference itself errored, so the inputs can't be executed at all (e.g. an
     /// incomplete fixture). This is *not* a grevm divergence — callers replaying real blocks should
     /// skip the block rather than blame the parallel scheduler. Carries the error description.
@@ -148,41 +176,33 @@ where
     let txs = Arc::new(txs);
 
     // 1) Sequential reference FIRST — if it errors, the inputs are unreplayable (not a grevm
-    //    issue).
+    //    issue). Timed: the DB is already in memory, so this is pure execution, no I/O.
     let start = Instant::now();
     let reth_result = match execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &*txs) {
         Ok(result) => result,
         Err(e) => return ReplayOutcome::SequentialFailed(format!("{e:?}")),
     };
-    println!("Origin sequential execute time: {}ms", start.elapsed().as_millis());
-
-    // Informational only. Real mainnet blocks legitimately contain reverted/halted transactions
-    // (failed swaps, out-of-gas, etc.); those are still valid included txs, so we don't require
-    // success here — the per-tx result comparison below catches any parallel/sequential divergence
-    // regardless of the outcome variant.
-    let mut max_gas_spent = 0;
-    let mut max_gas_used = 0;
-    for result in reth_result.0.iter() {
-        if let ExecutionResult::Success { gas_used, gas_refunded, .. } = result {
-            max_gas_spent = max_gas_spent.max(gas_used + gas_refunded);
-            max_gas_used = max_gas_used.max(*gas_used);
-        }
-    }
-    println!("max_gas_spent: {}, max_gas_used: {}", max_gas_spent, max_gas_used);
+    let sequential = start.elapsed();
 
     // 2) Grevm parallel. The reference already succeeded, so an error here is a real grevm bug.
-    let recorder = DebuggingRecorder::new();
-    let parallel_result = metrics::with_local_recorder(&recorder, || {
-        let start = Instant::now();
-        let state = ParallelState::new(db.clone(), true, true);
-        let executor =
-            Scheduler::new(cfg.clone(), env.clone(), txs.clone(), state, with_hints, None);
-        // set determined partitions
-        executor.parallel_execute(Some(23)).expect("parallel execute failed");
-        println!("Grevm parallel execute time: {}ms", start.elapsed().as_millis());
+    // Capture metrics when requested (`GREVM_PRINT_METRICS`, set by `replay_mainnet`) or when the
+    // caller asserts on them. The recorder is installed before execution so all of grevm's metrics
+    // land in it, then snapshotted right after so we read *this* block's values.
+    let want_metrics =
+        std::env::var_os("GREVM_PRINT_METRICS").is_some() || !parallel_metrics.is_empty();
+    let snapshotter = want_metrics.then(metrics_snapshotter).flatten();
 
-        let snapshot = recorder.snapshotter().snapshot();
-        for (key, _, _, value) in snapshot.into_vec() {
+    let start = Instant::now();
+    let state = ParallelState::new(db.clone(), true, true);
+    let executor = Scheduler::new(cfg.clone(), env.clone(), txs.clone(), state, with_hints, None);
+    // set determined partitions
+    executor.parallel_execute(Some(23)).expect("parallel execute failed");
+    let parallel = start.elapsed();
+    let (results, mut state) = executor.take_result_and_state();
+    let parallel_result = (results, state.parallel_take_bundle(BundleRetention::Reverts));
+
+    if let Some(snapshotter) = snapshotter {
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
             let value = match value {
                 DebugValue::Counter(v) => v as usize,
                 DebugValue::Gauge(v) => v.0 as usize,
@@ -193,13 +213,11 @@ where
                 assert_eq!(*metric, value);
             }
         }
-        let (results, mut state) = executor.take_result_and_state();
-        (results, state.parallel_take_bundle(BundleRetention::Reverts))
-    });
+    }
 
     compare_execution_result(&reth_result.0, &parallel_result.0);
     compare_bundle_state(&reth_result.1, &parallel_result.1);
-    ReplayOutcome::Ok
+    ReplayOutcome::Ok { sequential, parallel }
 }
 
 /// Simulate the sequential execution of transactions in reth

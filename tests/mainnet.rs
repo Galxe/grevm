@@ -76,7 +76,7 @@ fn replay(blocks: Vec<mainnet::MainnetBlock>, root: &Path) {
             block.block_env,
             Default::default(),
         ) {
-            execute::ReplayOutcome::Ok => {}
+            execute::ReplayOutcome::Ok { .. } => {}
             // The sequential reference itself couldn't execute the block (unreplayable fixture) —
             // not a grevm divergence, so skip rather than fail the test.
             execute::ReplayOutcome::SequentialFailed(e) => {
