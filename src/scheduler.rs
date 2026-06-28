@@ -18,15 +18,21 @@ use metrics::histogram;
 use metrics_derive::Metrics;
 use parking_lot::Mutex;
 use revm::{
-    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext,
+    Context, DatabaseCommit, DatabaseRef, ExecuteEvm, MainBuilder, MainContext,
+    context::Evm as RevmEvm,
+    handler::{
+        EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, instructions::EthInstructions,
+    },
+    interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit},
     precompile::{PrecompileSpecId, Precompiles},
 };
 use revm_context::{
-    BlockEnv, CfgEnv, TxEnv,
-    result::{EVMError, ExecutionResult},
+    BlockEnv, CfgEnv, ContextSetters, ContextTr, JournalTr, TxEnv,
+    result::{EVMError, ExecutionResult, HaltReason, ResultAndState},
 };
 use revm_inspector::NoOpInspector;
 use revm_primitives::Address;
+use revm_state::EvmState;
 
 use std::{
     cell::UnsafeCell,
@@ -42,6 +48,55 @@ use std::{
 };
 
 pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
+
+/// The mainnet EVM context grevm executes against on the parallel path (an `EthEvm`-shaped stack).
+type GrevmCtx<'a, DB> = Context<BlockEnv, TxEnv, CfgEnv, CacheDB<'a, ParallelState<DB>>>;
+
+/// The raw revm EVM, unwrapped from alloy's `EthEvm`, so we can drive a custom [`Handler`] that
+/// skips the miner reward during execution.
+type GrevmEvm<'a, DB> = RevmEvm<
+    GrevmCtx<'a, DB>,
+    NoOpInspector,
+    EthInstructions<EthInterpreter, GrevmCtx<'a, DB>>,
+    PrecompilesMap,
+    EthFrame,
+>;
+
+/// A mainnet [`Handler`] that suppresses the beneficiary (miner) reward. Instead of crediting the
+/// coinbase inside transaction execution — which would make every transaction read & write the
+/// coinbase account and thus conflict — grevm defers the reward and applies it at commit time (see
+/// [`crate::async_commit::StateAsyncCommit::compute_reward`]). This mirrors revm's `MainnetHandler`
+/// with only `reward_beneficiary` overridden to a no-op, and replaces the old `Galxe/revm` fork's
+/// `cfg.lazy_reward` flag so grevm can build against upstream revm.
+struct NoRewardHandler<EVM, ERROR, FRAME> {
+    _phantom: core::marker::PhantomData<(EVM, ERROR, FRAME)>,
+}
+
+impl<EVM, ERROR, FRAME> Default for NoRewardHandler<EVM, ERROR, FRAME> {
+    fn default() -> Self {
+        Self { _phantom: core::marker::PhantomData }
+    }
+}
+
+impl<EVM, ERROR, FRAME> Handler for NoRewardHandler<EVM, ERROR, FRAME>
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState>>, Frame = FRAME>,
+    ERROR: EvmTrError<EVM>,
+    FRAME: FrameTr<FrameResult = FrameResult, FrameInit = FrameInit>,
+{
+    type Evm = EVM;
+    type Error = ERROR;
+    type HaltReason = HaltReason;
+
+    /// Skip the miner reward; grevm applies it lazily at commit time.
+    fn reward_beneficiary(
+        &self,
+        _evm: &mut Self::Evm,
+        _exec_result: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 #[derive(Metrics)]
 #[metrics(scope = "grevm")]
@@ -365,12 +420,6 @@ where
                 }
                 let mut tx_state = self.tx_states[finality_idx].lock();
                 if tx_state.status != TransactionStatus::Unconfirmed {
-                    tracing::warn!(target: "grevm::scheduler",
-                        block_number = %self.env.number,
-                        finality_idx = finality_idx,
-                        tx_status = ?tx_state.status,
-                        "transaction shoud by marked as finality, but with wrong status"
-                    );
                     break;
                 }
                 tx_state.status = TransactionStatus::Finality;
@@ -456,6 +505,8 @@ where
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
             self.env.beneficiary,
+            self.cfg.spec,
+            self.env.basefee,
             CommitGuard::new(&self.state),
             self.cfg.disable_nonce_check,
         ));
@@ -482,11 +533,13 @@ where
                         &self.scheduler_ctx.commit_idx,
                     );
                     let mut cfg = self.cfg.clone();
-                    // Disable noce check to bypass the EVM's strict sequential
-                    // nonce verification, but the nonce will be checked when transaction commit
+                    // Disable nonce check to bypass the EVM's strict sequential nonce verification;
+                    // the nonce is re-checked when the transaction commits.
                     cfg.disable_nonce_check = true;
-                    cfg.lazy_reward = true;
-                    let evm = Context::mainnet()
+                    // Build the raw revm EVM (not wrapped in `EthEvm`) so we can drive a custom
+                    // `Handler` that skips the miner reward — the reward is deferred and applied at
+                    // commit time (see `async_commit`).
+                    let mut evm = Context::mainnet()
                         .with_db(cache_db)
                         .with_cfg(cfg)
                         .with_block(self.env.clone())
@@ -494,12 +547,10 @@ where
                         .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
                             PrecompileSpecId::from_spec_id(self.cfg.spec),
                         )));
-                    let mut evm = EthEvm::new(evm, false);
                     // Apply additional precompiles if provided
                     for (address, precompile) in self.custom_precompiles.iter() {
                         let precompile_clone = precompile.clone();
-                        evm.precompiles_mut()
-                            .apply_precompile(&address, move |_| Some(precompile_clone));
+                        evm.precompiles.apply_precompile(&address, move |_| Some(precompile_clone));
                     }
 
                     let mut task = self.next();
@@ -617,11 +668,7 @@ where
     /// - ​Unconfirmed Miner/Self-Destruct Accounts: The transaction interacts with miner rewards or
     ///   self-destructed accounts before their committing transaction is finalized (txid ≠
     ///   commit_idx)
-    fn execute(
-        &self,
-        evm: &mut EthEvm<CacheDB<ParallelState<DB>>, NoOpInspector, PrecompilesMap>,
-        tx_version: TxVersion,
-    ) -> Option<Task> {
+    fn execute(&self, evm: &mut GrevmEvm<'_, DB>, tx_version: TxVersion) -> Option<Task> {
         let TxVersion { txid, incarnation } = tx_version;
         let mut tx_state = self.tx_states[txid].lock();
         if tx_state.status != TransactionStatus::Executing {
@@ -635,7 +682,18 @@ where
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         let tx_env = self.txs[txid].clone();
         let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
-        let result = evm.transact_raw(tx_env);
+        // Execute with the miner reward suppressed (see `NoRewardHandler`); the reward is applied
+        // later in `async_commit`. This replicates revm's `ExecuteEvm::transact` (set tx → run
+        // handler → finalize) but with our handler instead of the default `MainnetHandler`.
+        //
+        // `finalize` clears the journal and MUST run even when execution errors: this EVM is reused
+        // for the next transaction on the same thread, so a dirty journal left by a failed
+        // (optimistic) tx would corrupt the following one. revm's `transact` finalizes
+        // unconditionally and only then propagates the error — we do the same.
+        evm.ctx.set_tx(tx_env);
+        let output_or_error = NoRewardHandler::default().run(evm);
+        let state = evm.finalize();
+        let result = output_or_error.map(|result| ResultAndState { result, state });
 
         // The `​write_new_locations` mechanism optimizes validation by intelligently reducing
         // redundant verification tasks. Under standard validation logic, when a conflicted

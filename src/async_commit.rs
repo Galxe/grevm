@@ -1,9 +1,9 @@
 use revm::{Database, DatabaseCommit, DatabaseRef};
 use revm_context::{
-    TxEnv,
+    Transaction, TxEnv,
     result::{EVMError, ExecutionResult, InvalidTransaction, ResultAndState},
 };
-use revm_primitives::Address;
+use revm_primitives::{Address, hardfork::SpecId};
 
 use crate::{GrevmError, ParallelState, TxId};
 use std::{cell::UnsafeCell, cmp::Ordering};
@@ -37,6 +37,11 @@ where
     DB: DatabaseRef,
 {
     coinbase: Address,
+    /// Active hardfork — needed to self-compute the coinbase reward (EIP-1559 basefee burn from
+    /// LONDON onward).
+    spec: SpecId,
+    /// Block base fee per gas — the burned portion that does not reach the coinbase post-LONDON.
+    basefee: u64,
     results: Vec<ExecutionResult>,
     guard: CommitGuard<'a, DB>,
     commit_result: Result<(), GrevmError<DB::Error>>,
@@ -53,10 +58,37 @@ where
 {
     pub(crate) fn new(
         coinbase: Address,
+        spec: SpecId,
+        basefee: u64,
         guard: CommitGuard<'a, DB>,
         disable_nonce_check: bool,
     ) -> Self {
-        Self { coinbase, results: vec![], guard, commit_result: Ok(()), disable_nonce_check }
+        Self {
+            coinbase,
+            spec,
+            basefee,
+            results: vec![],
+            guard,
+            commit_result: Ok(()),
+            disable_nonce_check,
+        }
+    }
+
+    /// Self-compute the miner reward for one transaction, mirroring revm's
+    /// `post_execution::reward_beneficiary`: from LONDON the basefee is burned and only the
+    /// remainder of the effective gas price reaches the coinbase (EIP-1559).
+    ///
+    /// `result.gas_used()` is exactly the `gas.used()` (post-refund) that revm bills the reward on,
+    /// so this reproduces the forked revm's `lazy_reward` without relying on it.
+    fn compute_reward(&self, tx_env: &TxEnv, result: &ExecutionResult) -> u128 {
+        let basefee = self.basefee as u128;
+        let effective_gas_price = tx_env.effective_gas_price(basefee);
+        let coinbase_gas_price = if self.spec.is_enabled_in(SpecId::LONDON) {
+            effective_gas_price.saturating_sub(basefee)
+        } else {
+            effective_gas_price
+        };
+        coinbase_gas_price.saturating_mul(result.gas_used() as u128)
     }
 
     pub(crate) fn state_mut(&mut self) -> &mut ParallelState<DB> {
@@ -95,7 +127,12 @@ where
         // processing without immediate validation failures. However, during the final commitment
         // phase, the system enforces strict nonce monotonicity checks to guarantee transaction
         // integrity and prevent double-spending attacks.
-        let ResultAndState { result, state, lazy_reward } = result_and_state;
+        let ResultAndState { result, state } = result_and_state;
+        // Self-compute the miner reward: upstream revm credits the coinbase inside execution, which
+        // grevm suppresses with a custom `Handler` (see `scheduler::NoRewardHandler`) and applies
+        // here instead. This reproduces what the dropped `Galxe/revm` fork returned via
+        // `ResultAndState.lazy_reward`.
+        let reward = self.compute_reward(tx_env, &result);
         if !self.disable_nonce_check {
             match self.state_ref().basic_ref(tx_env.caller) {
                 Ok(info) => {
@@ -145,7 +182,7 @@ where
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
         let coinbase = self.coinbase;
-        assert!(self.state_mut().increment_balances(vec![(coinbase, lazy_reward)]).is_ok());
+        assert!(self.state_mut().increment_balances(vec![(coinbase, reward)]).is_ok());
     }
 }
 
@@ -190,7 +227,6 @@ mod tests {
                 output: Output::Call(Bytes::new()),
             },
             state,
-            lazy_reward: 0,
         }
     }
 
@@ -215,6 +251,8 @@ mod tests {
     fn run_commit(state: &UnsafeCell<ParallelState<EmptyDB>>, tx_env: TxEnv, post_nonce: u64) {
         let mut commit = StateAsyncCommit::new(
             Address::ZERO,
+            SpecId::PRAGUE,
+            0, // basefee: with the tests' zero gas price the reward is 0 regardless
             CommitGuard::new(state),
             false, // disable_nonce_check = false: exercise the assertion path
         );
@@ -270,5 +308,47 @@ mod tests {
 
         let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller]);
         run_commit(&state_cell, tx_env, pre_nonce + 1);
+    }
+
+    /// `compute_reward` must mirror revm's `post_execution::reward_beneficiary`: pre-LONDON the
+    /// full effective gas price reaches the coinbase; from LONDON the basefee is burned (EIP-1559).
+    /// The mainnet replay harness clamps every pre-Shanghai block to `Merge`, so it never exercises
+    /// the pre-LONDON branch — this test pins both branches deterministically.
+    #[test]
+    fn compute_reward_matches_eip1559_basefee_burn() {
+        let state = ParallelState::new(EmptyDB::default(), true, false);
+        let state_cell = UnsafeCell::new(state);
+
+        let gas_used = 21_000u64;
+        let result = ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas_used,
+            gas_refunded: 0,
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        };
+        // Legacy tx: effective_gas_price == gas_price regardless of basefee.
+        let tx_env = TxEnv { gas_price: 100, gas_limit: gas_used, ..Default::default() };
+        let basefee = 10u64;
+
+        // Pre-LONDON: full price to coinbase, basefee NOT subtracted.
+        let pre = StateAsyncCommit::new(
+            Address::ZERO,
+            SpecId::BERLIN,
+            basefee,
+            CommitGuard::new(&state_cell),
+            true,
+        );
+        assert_eq!(pre.compute_reward(&tx_env, &result), 100u128 * gas_used as u128);
+
+        // LONDON+: basefee burned, only the priority portion reaches the coinbase.
+        let post = StateAsyncCommit::new(
+            Address::ZERO,
+            SpecId::LONDON,
+            basefee,
+            CommitGuard::new(&state_cell),
+            true,
+        );
+        assert_eq!(post.compute_reward(&tx_env, &result), (100u128 - 10) * gas_used as u128);
     }
 }
