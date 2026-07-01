@@ -88,7 +88,7 @@ where
         } else {
             effective_gas_price
         };
-        coinbase_gas_price.saturating_mul(result.gas_used() as u128)
+        coinbase_gas_price.saturating_mul(result.tx_gas_used() as u128)
     }
 
     pub(crate) fn state_mut(&mut self) -> &mut ParallelState<DB> {
@@ -191,12 +191,12 @@ mod tests {
     use super::*;
     use revm_context::{
         either::Either,
-        result::{Output, SuccessReason},
+        result::{Output, ResultGas, SuccessReason},
         transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization},
     };
     use revm_database::EmptyDB;
-    use revm_primitives::{Address, B256, Bytes, HashMap, U256};
-    use revm_state::{Account, AccountInfo, AccountStatus, EvmStorage};
+    use revm_primitives::{Address, B256, Bytes, U256};
+    use revm_state::{Account, AccountInfo, AccountStatus};
 
     fn make_account_info(nonce: u64) -> AccountInfo {
         AccountInfo {
@@ -204,25 +204,26 @@ mod tests {
             nonce,
             code_hash: B256::ZERO,
             code: None,
+            ..Default::default()
         }
     }
 
+    fn make_account(info: AccountInfo) -> Account {
+        // `Account` has private `original_info`; build via Default and set the public fields.
+        let mut account = Account::default();
+        account.info = info;
+        account.status = AccountStatus::Touched;
+        account
+    }
+
     fn make_result_and_state(caller: Address, post_nonce: u64) -> ResultAndState {
-        let mut state: HashMap<Address, Account> = HashMap::default();
-        state.insert(
-            caller,
-            Account {
-                info: make_account_info(post_nonce),
-                transaction_id: 0,
-                storage: EvmStorage::default(),
-                status: AccountStatus::Touched,
-            },
-        );
+        let mut state: revm_primitives::AddressMap<Account> =
+            revm_primitives::AddressMap::default();
+        state.insert(caller, make_account(make_account_info(post_nonce)));
         ResultAndState {
             result: ExecutionResult::Success {
                 reason: SuccessReason::Stop,
-                gas_used: 21_000,
-                gas_refunded: 0,
+                gas: ResultGas::default().with_total_gas_spent(21_000),
                 logs: Vec::new(),
                 output: Output::Call(Bytes::new()),
             },
@@ -322,8 +323,7 @@ mod tests {
         let gas_used = 21_000u64;
         let result = ExecutionResult::Success {
             reason: SuccessReason::Stop,
-            gas_used,
-            gas_refunded: 0,
+            gas: ResultGas::default().with_total_gas_spent(gas_used),
             logs: Vec::new(),
             output: Output::Call(Bytes::new()),
         };

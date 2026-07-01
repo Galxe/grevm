@@ -105,6 +105,7 @@ impl ERC20Token {
                 nonce: 1,
                 code_hash: bytecode.hash_slow(),
                 code: Some(bytecode),
+                ..Default::default()
             },
             storage: store.build().into_iter().collect(),
         }
