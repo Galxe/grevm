@@ -110,6 +110,8 @@ impl BlockFixture {
             difficulty: self.difficulty,
             prevrandao: self.prevrandao,
             blob_excess_gas_and_price: None,
+            // Amsterdam (EIP-7843) is not modeled in the test fixtures; leave slot_num at zero.
+            slot_num: 0,
         };
         if let Some(excess) = self.excess_blob_gas {
             // Record the real `excess_blob_gas` but pin the blob gas price to the protocol minimum
@@ -273,7 +275,13 @@ pub fn pre_state_to_db(pre_state: &PreState) -> InMemoryDB {
             }
             _ => (KECCAK_EMPTY, None),
         };
-        let info = AccountInfo { balance: acc.balance, nonce: acc.nonce, code_hash, code };
+        let info = AccountInfo {
+            balance: acc.balance,
+            nonce: acc.nonce,
+            code_hash,
+            code,
+            ..Default::default()
+        };
         let storage = acc.storage.iter().map(|(k, v)| (*k, *v)).collect();
         accounts.insert(*addr, PlainAccount { info, storage });
     }

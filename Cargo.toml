@@ -9,16 +9,16 @@ license = "MIT OR Apache-2.0"
 autobins = false
 
 [dependencies]
-# Upstream revm v29.0.1 (no fork). The miner reward is skipped during parallel execution via a
+# Upstream revm v40 (no fork). The miner reward is skipped during parallel execution via a
 # custom `Handler` (see `scheduler::NoRewardHandler`) and self-computed at commit time, so the
 # previous `Galxe/revm` fork (which only added a `lazy_reward` cfg flag + `ResultAndState` field)
 # is no longer needed.
-revm = { version = "29.0.1", default-features = false }
-revm-database = { version = "7.0.5", default-features = false }
-revm-state = { version = "7.0.5", default-features = false }
-revm-primitives = { version = "20.2.1", default-features = false }
-revm-inspector = { version = "10.0.1", default-features = false }
-revm-context = { version = "9.1.0", default-features = false }
+revm = { version = "40.0.3", default-features = false }
+revm-database = { version = "15.0.0", default-features = false }
+revm-state = { version = "12.0.0", default-features = false }
+revm-primitives = { version = "24.0.0", default-features = false }
+revm-inspector = { version = "21.0.3", default-features = false }
+revm-context = { version = "18.0.3", default-features = false }
 
 ahash = "0.8"
 rayon = "1.10.0"
@@ -27,7 +27,7 @@ parking_lot = "0.12"
 
 # Alloy — upstream (the `Galxe/alloy-evm` fork only repointed revm to the gravity fork and added a
 # `..` to one `ResultAndState` destructure; both are unnecessary against upstream revm).
-alloy-evm = { version = "0.21.3", default-features = false }
+alloy-evm = { version = "0.36.0", default-features = false }
 
 # async
 futures = "0.3"
