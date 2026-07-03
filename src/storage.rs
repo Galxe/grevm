@@ -72,6 +72,7 @@ impl ParallelBundleState for BundleState {
         let reverts = DisjointVec::new(vec![None; reverts_capacity]);
         let bundle_state = DisjointVec::new(vec![None; transitions.len()]);
         let state_size = AtomicUsize::new(0);
+        let reverts_size = AtomicUsize::new(0);
         let contracts = Mutex::new(revm_primitives::HashMap::default());
 
         fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
@@ -88,12 +89,14 @@ impl ParallelBundleState for BundleState {
                     state_size.fetch_add(present_bundle.size_hint(), Ordering::Relaxed);
                     unsafe { bundle_state.set(pos, Some((address, present_bundle))) };
                     if include_reverts {
+                        reverts_size.fetch_add(revert.size_hint(), Ordering::Relaxed);
                         unsafe { reverts.set(pos, Some((address, revert))) };
                     }
                 }
             }
         });
         self.state_size = state_size.load(Ordering::Acquire);
+        self.reverts_size = reverts_size.load(Ordering::Acquire);
 
         // much faster than bundle_state.into_iter().filter_map(|r| r).collect()
         self.state.reserve(transitions.len());
