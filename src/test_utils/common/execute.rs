@@ -86,6 +86,12 @@ pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
             assert_eq!(revert, *right.get(addr).unwrap(), "Address: {:?}", addr);
         }
     }
+
+    // The cached size accounting must match the sequential revm path. The parallel bundle path
+    // computes these independently, so a divergence means it miscounted (e.g. recording reverts
+    // without incrementing `reverts_size`).
+    assert_eq!(left.state_size, right.state_size, "state_size mismatch");
+    assert_eq!(left.reverts_size, right.reverts_size, "reverts_size mismatch");
 }
 
 pub fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<ExecutionResult>) {
