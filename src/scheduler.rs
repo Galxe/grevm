@@ -28,7 +28,7 @@ use revm::{
 };
 use revm_context::{
     BlockEnv, CfgEnv, ContextSetters, ContextTr, JournalTr, TxEnv,
-    result::{EVMError, ExecutionResult, HaltReason, ResultAndState},
+    result::{EVMError, ExecutionResult, HaltReason, ResultAndState, ResultGas},
 };
 use revm_inspector::NoOpInspector;
 use revm_primitives::Address;
@@ -334,6 +334,13 @@ where
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason>,
     metrics: ExecuteMetricsCollector,
+
+    /// When true, a transaction that fails revm's tx-level validation
+    /// (`EVMError::Transaction`, e.g. `NonceTooLow`) is deterministically SKIPPED
+    /// (no state change; a phantom 0-gas revert result keeps `results` aligned 1:1 with
+    /// `txs`) instead of aborting the whole block. Off by default — existing callers are
+    /// unaffected. Opt in via [`Scheduler::with_skip_invalid_txn`]. gravity-audit#823.
+    skip_invalid_txn: bool,
 }
 
 // SAFETY: Scheduler is shared across threads via `thread::scope`. The `UnsafeCell<ParallelState>`
@@ -392,7 +399,16 @@ where
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
+            skip_invalid_txn: false,
         }
+    }
+
+    /// Enable deterministic skipping of tx-level-invalid transactions (see the
+    /// [`Scheduler`] `skip_invalid_txn` field). Intended for order-then-execute chains
+    /// whose executor must not halt on a per-tx `InvalidTransaction`. gravity-audit#823.
+    pub fn with_skip_invalid_txn(mut self, skip: bool) -> Self {
+        self.skip_invalid_txn = skip;
+        self
     }
 
     fn async_finality(&self) {
@@ -569,8 +585,29 @@ where
         {
             let mut commiter = commiter.lock();
             // Return error if commit failed(check nonce failed)
-            if let Err(e) = commiter.commit_result() {
-                return Err(e.clone());
+            let commit_result = commiter.commit_result().clone();
+            if let Err(e) = commit_result {
+                // gravity-audit#838/#823: grevm workers run with `disable_nonce_check=true`, so a
+                // tx-level `InvalidTransaction` (e.g. `NonceTooLow` from an EIP-7702
+                // delegate-then-CREATE nonce bump) is only detected HERE at commit — the finality
+                // loop set `AbortReason::EvmError`, but this short-circuit returns before
+                // `post_execute()`'s skip path. When skipping is enabled, route it to the same
+                // deterministic sequential fallback instead of returning `Err` (which the caller
+                // turns into `panic!` → halt). Without this, the parallel path
+                // (`block_size >= MIN_PARALLEL_TXS`) bypasses the skip entirely.
+                //
+                // `commit()` applied state only for the prefix `[0, txid)` but still pushed the
+                // failing tx's result (async_commit.rs), so truncate results to `txid` to keep
+                // `self.results` aligned with committed state; `fallback_sequential` then resumes
+                // from `txid`, re-executes it against the final pre-state, and skips it.
+                if self.skip_invalid_txn && matches!(e.error, EVMError::Transaction(_)) {
+                    let mut committed = commiter.take_result();
+                    committed.truncate(e.txid);
+                    self.results.lock().extend(committed);
+                    drop(commiter);
+                    return self.fallback_sequential();
+                }
+                return Err(e);
             }
             self.results.lock().extend(commiter.take_result());
         }
@@ -590,6 +627,15 @@ where
             if let Some(abort_reason) = self.abort_reason.get() {
                 match abort_reason {
                     AbortReason::EvmError => {
+                        // gravity-audit#823: if skipping is enabled, resume sequential execution
+                        // from the finalized prefix — it deterministically SKIPS tx-level-invalid
+                        // txs (see `fallback_sequential`) and, running against the final pre-state,
+                        // also corrects any speculative false-positive (a tx that only looked
+                        // invalid against a stale read). With the flag off, keep the original
+                        // abort.
+                        if self.skip_invalid_txn {
+                            return self.fallback_sequential();
+                        }
                         let txid = self.scheduler_ctx.finality_idx();
                         let result = self.tx_results[txid].lock();
                         if let Some(result) = result.as_ref() {
@@ -646,10 +692,32 @@ where
             }
             for txid in num_commit..self.block_size {
                 let tx_env = self.txs[txid].clone();
-                let result_and_state =
-                    evm.transact_raw(tx_env).map_err(|e| GrevmError { txid, error: e.clone() })?;
-                evm.db_mut().commit(result_and_state.state);
-                sequential_results.push(result_and_state.result);
+                match evm.transact_raw(tx_env) {
+                    Ok(result_and_state) => {
+                        evm.db_mut().commit(result_and_state.state);
+                        sequential_results.push(result_and_state.result);
+                    }
+                    // gravity-audit#823: when enabled, a tx-level `InvalidTransaction` is
+                    // deterministically SKIPPED instead of halting the block. No state commit
+                    // (no nonce/balance side effect); a phantom 0-gas Revert keeps `results`
+                    // aligned 1:1 with the block's txs. Non-tx-level errors (Header/Database)
+                    // stay fatal; with the flag off this falls through to the `Err(e)` arm and
+                    // preserves the original abort behaviour.
+                    Err(EVMError::Transaction(err)) if self.skip_invalid_txn => {
+                        tracing::error!(
+                            target: "grevm",
+                            txid,
+                            ?err,
+                            "skipping tx-level-invalid tx (deterministic sequential skip)"
+                        );
+                        sequential_results.push(ExecutionResult::Revert {
+                            gas: ResultGas::new(0, 0, 0),
+                            logs: Vec::new(),
+                            output: revm_primitives::Bytes::new(),
+                        });
+                    }
+                    Err(e) => return Err(GrevmError { txid, error: e }),
+                }
                 self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
             }
         }
