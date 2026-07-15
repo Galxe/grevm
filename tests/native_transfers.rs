@@ -1,13 +1,93 @@
 #![allow(missing_docs)]
 
-use grevm::test_utils::{
-    TRANSFER_GAS_LIMIT,
-    common::{account, execute, storage::InMemoryDB},
+use grevm::{
+    SkipReason, TxExecutionOutcome,
+    test_utils::{
+        TRANSFER_GAS_LIMIT,
+        common::{account, execute, storage::InMemoryDB},
+    },
 };
 use revm_context::TxEnv;
-use revm_primitives::{HashMap, TxKind, U256};
+use revm_primitives::{HashMap, TxKind, U256, hardfork::SpecId};
 
 const GIGA_GAS: u64 = 1_000_000_000;
+const MIN_PARALLEL_BLOCK_SIZE: usize = 64;
+
+fn execute_outcomes(txs: Vec<TxEnv>) -> Vec<TxExecutionOutcome> {
+    let accounts = account::mock_block_accounts(MIN_PARALLEL_BLOCK_SIZE + 1);
+    let db = InMemoryDB::new(accounts, Default::default(), Default::default());
+    execute::compare_evm_execute_skipping_invalid_with_spec(db, txs, false, SpecId::SHANGHAI)
+}
+
+fn independent_transfer(index: usize) -> TxEnv {
+    let sender = account::mock_eoa_address(index);
+    TxEnv {
+        caller: sender,
+        kind: TxKind::Call(sender),
+        value: U256::from(1),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce: 1,
+        ..TxEnv::default()
+    }
+}
+
+#[test]
+fn nonce_error_falls_back_and_skips_without_incrementing_nonce() {
+    let sender = account::mock_eoa_address(0);
+    let mut txs = vec![
+        independent_transfer(0),
+        TxEnv {
+            caller: sender,
+            kind: TxKind::Call(sender),
+            value: U256::from(1),
+            gas_limit: TRANSFER_GAS_LIMIT,
+            gas_price: 1,
+            nonce: 1,
+            ..TxEnv::default()
+        },
+        TxEnv {
+            caller: sender,
+            kind: TxKind::Call(sender),
+            value: U256::from(1),
+            gas_limit: TRANSFER_GAS_LIMIT,
+            gas_price: 1,
+            nonce: 2,
+            ..TxEnv::default()
+        },
+    ];
+    txs.extend((3..MIN_PARALLEL_BLOCK_SIZE).map(independent_transfer));
+
+    let outcomes = execute_outcomes(txs);
+    assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
+    assert!(matches!(outcomes[0], TxExecutionOutcome::Executed(_)));
+    assert_eq!(outcomes[1], TxExecutionOutcome::Skipped(SkipReason::NonceTooLow));
+    assert!(matches!(outcomes[2], TxExecutionOutcome::Executed(_)));
+}
+
+#[test]
+fn insufficient_funds_falls_back_and_continues_suffix() {
+    let sender = account::mock_eoa_address(1);
+    let mut txs = vec![
+        independent_transfer(0),
+        TxEnv {
+            caller: sender,
+            kind: TxKind::Call(sender),
+            value: U256::from(1_000_000_000_000_000_000u128),
+            gas_limit: TRANSFER_GAS_LIMIT,
+            gas_price: 1,
+            nonce: 1,
+            ..TxEnv::default()
+        },
+        independent_transfer(2),
+    ];
+    txs.extend((3..MIN_PARALLEL_BLOCK_SIZE).map(independent_transfer));
+
+    let outcomes = execute_outcomes(txs);
+    assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
+    assert_eq!(outcomes[1], TxExecutionOutcome::Skipped(SkipReason::InsufficientFunds));
+    assert!(matches!(outcomes[2], TxExecutionOutcome::Executed(_)));
+}
 
 #[test]
 fn native_gigagas() {

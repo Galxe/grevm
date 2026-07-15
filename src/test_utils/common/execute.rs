@@ -1,7 +1,7 @@
 use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
-use crate::{ParallelState, ParallelTakeBundle, Scheduler};
+use crate::{ParallelState, ParallelTakeBundle, Scheduler, SkipReason, TxExecutionOutcome};
 use revm::{
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
 };
@@ -94,8 +94,11 @@ pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert_eq!(left.reverts_size, right.reverts_size, "reverts_size mismatch");
 }
 
-pub fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<ExecutionResult>) {
+pub fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<TxExecutionOutcome>) {
     for (i, (left_res, right_res)) in left.iter().zip(right.iter()).enumerate() {
+        let TxExecutionOutcome::Executed(right_res) = right_res else {
+            panic!("valid reference transaction {i} was unexpectedly skipped: {right_res:?}");
+        };
         assert_eq!(left_res, right_res, "Tx {}", i);
     }
     assert_eq!(left.len(), right.len());
@@ -143,6 +146,43 @@ pub fn compare_evm_execute_with_spec<DB>(
         ReplayOutcome::Ok { .. } => {}
         ReplayOutcome::SequentialFailed(e) => panic!("sequential reference execution failed: {e}"),
     }
+}
+
+/// Compare Grevm against an independent, strictly ordered revm execution that skips only the
+/// explicitly supported recoverable transaction errors.
+///
+/// Both per-transaction outcomes and the complete post-block bundle state are compared. This is
+/// the reference path for testing Grevm's sequential fallback with blocks that intentionally
+/// contain invalid transactions.
+pub fn compare_evm_execute_skipping_invalid_with_spec<DB>(
+    db: DB,
+    txs: Vec<TxEnv>,
+    with_hints: bool,
+    spec: SpecId,
+) -> Vec<TxExecutionOutcome>
+where
+    DB: DatabaseRef + Send + Sync + Debug,
+    DB::Error: Send + Sync + Clone + Debug + 'static,
+{
+    let db = Arc::new(db);
+    let txs = Arc::new(txs);
+    let cfg = CfgEnv::new_with_spec(spec);
+    let mut env = BlockEnv::default();
+    env.beneficiary = super::account::MINER_ADDRESS;
+
+    let (expected_outcomes, expected_bundle) =
+        execute_revm_sequential_skipping_invalid(db.clone(), cfg.clone(), env.clone(), &txs)
+            .unwrap_or_else(|error| panic!("sequential skip reference failed: {error:?}"));
+
+    let state = ParallelState::new(db, true, true);
+    let scheduler = Scheduler::new(cfg, env, txs, state, with_hints, None);
+    scheduler.parallel_execute(Some(23)).expect("parallel execute failed");
+    let (actual_outcomes, mut state) = scheduler.take_result_and_state();
+    let actual_bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+
+    assert_eq!(expected_outcomes, actual_outcomes, "transaction outcomes differ");
+    compare_bundle_state(&expected_bundle, &actual_bundle);
+    actual_outcomes
 }
 
 /// Outcome of a parallel-vs-sequential comparison.
@@ -264,6 +304,49 @@ where
     evm.db_mut().merge_transitions(BundleRetention::Reverts);
 
     Ok((results, evm.db_mut().take_bundle()))
+}
+
+/// Execute every transaction strictly in block order, committing successful EVM executions and
+/// treating only known recoverable transaction-validation errors as state-free skips.
+///
+/// Unknown transaction errors, database errors, custom errors, and header errors remain fatal so
+/// this reference cannot accidentally hide a consensus or database failure.
+pub fn execute_revm_sequential_skipping_invalid<DB>(
+    db: DB,
+    cfg: CfgEnv,
+    env: BlockEnv,
+    txs: &[TxEnv],
+) -> Result<(Vec<TxExecutionOutcome>, BundleState), EVMError<DB::Error>>
+where
+    DB: DatabaseRef + Debug,
+    DB::Error: Send + Sync + Debug + 'static,
+{
+    let spec = cfg.spec;
+    let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
+    let evm = Context::mainnet()
+        .with_db(db)
+        .with_cfg(cfg)
+        .with_block(env)
+        .build_mainnet_with_inspector(NoOpInspector {})
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles));
+    let mut evm = EthEvm::new(evm, false);
+
+    let mut outcomes = Vec::with_capacity(txs.len());
+    for tx in txs {
+        match evm.transact_raw(tx.clone()) {
+            Ok(result_and_state) => {
+                evm.db_mut().commit(result_and_state.state);
+                outcomes.push(TxExecutionOutcome::Executed(result_and_state.result));
+            }
+            Err(error) => match SkipReason::from_evm_error(&error) {
+                Some(reason) => outcomes.push(TxExecutionOutcome::Skipped(reason)),
+                None => return Err(error.map_db_err(|inner| inner.into_external_error())),
+            },
+        }
+    }
+    evm.db_mut().merge_transitions(BundleRetention::Reverts);
+
+    Ok((outcomes, evm.db_mut().take_bundle()))
 }
 
 /// Sequentially execute `txs` against `db` under `cfg`/`env`, returning the indices of the

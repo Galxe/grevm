@@ -29,7 +29,7 @@ mod utils;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use lazy_static::lazy_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use revm_context::result::{EVMError, ResultAndState};
+use revm_context::result::{EVMError, ExecutionResult, InvalidTransaction, ResultAndState};
 use revm_primitives::{Address, B256, U256};
 use revm_state::{AccountInfo, Bytecode};
 use std::{cmp::min, thread};
@@ -146,12 +146,62 @@ impl Default for Task {
     }
 }
 
-enum AbortReason {
-    EvmError,
+enum AbortReason<DBError> {
+    /// A fatal EVM error produced while executing this transaction. The error itself remains in
+    /// `Scheduler::tx_results`.
+    FatalEvmError(TxId),
+    /// A commit error is not stored in `Scheduler::tx_results`, so the abort reason carries the
+    /// complete error instead of trying to recover it from an execution result.
+    CommitError(GrevmError<DBError>),
+    /// An invariant of the parallel scheduler was violated before the current transaction was
+    /// committed. The committed prefix is still valid, so execution can resume sequentially.
+    ParallelError {
+        txid: TxId,
+        message: &'static str,
+    },
     #[allow(dead_code)]
     SelfDestructed,
-    #[allow(dead_code)]
     FallbackSequential,
+}
+
+/// Stable reason recorded when a transaction is skipped without changing state.
+///
+/// The numeric values are part of the consumer-facing protocol and must not be reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u16)]
+pub enum SkipReason {
+    /// The transaction nonce is lower than the committed sender nonce.
+    NonceTooLow = 1,
+    /// The transaction nonce is higher than the committed sender nonce.
+    NonceTooHigh = 2,
+    /// The sender cannot cover the transaction's maximum upfront cost.
+    InsufficientFunds = 3,
+    /// The sender is rejected by EIP-3607 because it has non-delegated code.
+    SenderNotEoa = 4,
+}
+
+impl SkipReason {
+    /// Classifies the small, explicit set of transaction errors that are safe to treat as a
+    /// state-free skip. Unknown transaction errors and all non-transaction errors remain fatal.
+    pub fn from_evm_error<DBError>(error: &EVMError<DBError>) -> Option<Self> {
+        let EVMError::Transaction(error) = error else { return None };
+        match error {
+            InvalidTransaction::NonceTooLow { .. } => Some(Self::NonceTooLow),
+            InvalidTransaction::NonceTooHigh { .. } => Some(Self::NonceTooHigh),
+            InvalidTransaction::LackOfFundForMaxFee { .. } => Some(Self::InsufficientFunds),
+            InvalidTransaction::RejectCallerWithCode => Some(Self::SenderNotEoa),
+            _ => None,
+        }
+    }
+}
+
+/// Final outcome for one transaction in block order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxExecutionOutcome {
+    /// The transaction executed normally, including EVM reverts and halts.
+    Executed(ExecutionResult),
+    /// The transaction was invalid at the committed state and was applied as a no-op.
+    Skipped(SkipReason),
 }
 
 /// Grevm error type.
