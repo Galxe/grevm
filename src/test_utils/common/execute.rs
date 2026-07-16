@@ -277,27 +277,18 @@ where
     DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + Debug + 'static,
 {
-    let spec = cfg.spec;
     let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
     let evm = Context::mainnet()
         .with_db(db)
         .with_cfg(cfg)
         .with_block(env)
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles));
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
     let mut evm = EthEvm::new(evm, false);
 
     let mut results = Vec::with_capacity(txs.len());
     for tx in txs {
-        // v40 wraps DB errors in `EvmDatabaseError`; the outer signature keeps the historical
-        // `EVMError<DB::Error>` shape so unwrap the wrapper here.
-        let result_and_state = evm.transact_raw(tx.clone()).map_err(|e| match e {
-            EVMError::Transaction(t) => EVMError::Transaction(t),
-            EVMError::Header(h) => EVMError::Header(h),
-            EVMError::Database(inner) => EVMError::Database(inner.into_external_error()),
-            EVMError::Custom(s) => EVMError::Custom(s),
-            EVMError::CustomAny(a) => EVMError::CustomAny(a),
-        })?;
+        let result_and_state = evm.transact_raw(tx.clone())?;
         evm.db_mut().commit(result_and_state.state);
         results.push(result_and_state.result);
     }
@@ -321,14 +312,13 @@ where
     DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + Debug + 'static,
 {
-    let spec = cfg.spec;
     let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
     let evm = Context::mainnet()
         .with_db(db)
         .with_cfg(cfg)
         .with_block(env)
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles));
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
     let mut evm = EthEvm::new(evm, false);
 
     let mut outcomes = Vec::with_capacity(txs.len());
@@ -340,7 +330,7 @@ where
             }
             Err(error) => match SkipReason::from_evm_error(&error) {
                 Some(reason) => outcomes.push(TxExecutionOutcome::Skipped(reason)),
-                None => return Err(error.map_db_err(|inner| inner.into_external_error())),
+                None => return Err(error),
             },
         }
     }
@@ -370,14 +360,13 @@ where
     DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + Debug + 'static,
 {
-    let spec = cfg.spec;
     let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
     let evm = Context::mainnet()
         .with_db(db)
         .with_cfg(cfg)
         .with_block(env)
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles));
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::default().precompiles));
     let mut evm = EthEvm::new(evm, false);
 
     let mut kept = Vec::new();
@@ -385,7 +374,7 @@ where
     for (i, tx) in txs.iter().enumerate() {
         match evm.transact_raw(tx.clone()) {
             Ok(result_and_state) => {
-                total_gas = total_gas.saturating_add(result_and_state.result.tx_gas_used());
+                total_gas = total_gas.saturating_add(result_and_state.result.gas_used());
                 evm.db_mut().commit(result_and_state.state);
                 kept.push(i);
                 if total_gas >= gas_cap {
