@@ -17,6 +17,7 @@
 //! transaction ID and the underlying EVM error. This allows for precise debugging and error
 //! reporting.
 mod async_commit;
+mod delegated_safety;
 mod hint;
 mod parallel_state;
 mod scheduler;
@@ -254,6 +255,7 @@ where
     });
 }
 
+pub use delegated_safety::DelegatedSafetyConfig;
 pub use parallel_state::{ParallelCacheState, ParallelState};
 pub use scheduler::Scheduler;
 pub use storage::{ParallelBundleState, ParallelTakeBundle};

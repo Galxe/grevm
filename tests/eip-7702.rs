@@ -31,23 +31,26 @@
 //!   authority balance; its otherwise valid follow-up transaction is skipped
 
 use grevm::{
-    SkipReason, TxExecutionOutcome,
+    DelegatedSafetyConfig, ParallelState, ParallelTakeBundle, Scheduler, SkipReason,
+    TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
     },
 };
 use revm_context::{
-    TxEnv,
+    BlockEnv, CfgEnv, TxEnv,
     either::Either,
+    result::ExecutionResult,
     transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization},
 };
-use revm_database::PlainAccount;
+use revm_database::{PlainAccount, states::bundle_state::BundleRetention};
 use revm_primitives::{
     Address, B256, HashMap, KECCAK_EMPTY, TxKind, U256, alloy_primitives::U160, hardfork::SpecId,
     keccak256,
 };
 use revm_state::{AccountInfo, Bytecode};
+use std::sync::Arc;
 
 /// Keep the block comfortably above `MIN_PARALLEL_TXS` so grevm runs in parallel.
 const BLOCK_SIZE: usize = 100;
@@ -218,6 +221,85 @@ fn db_with_delegate_target(target: Address, code: Bytecode) -> InMemoryDB {
     db
 }
 
+fn drain_to_code(target: Address) -> Bytecode {
+    let mut code = vec![
+        0x60, 0x00, // ret size
+        0x60, 0x00, // ret offset
+        0x60, 0x00, // args size
+        0x60, 0x00, // args offset
+        0x47, // SELFBALANCE
+        0x73, // PUSH20 target
+    ];
+    code.extend_from_slice(target.as_slice());
+    code.extend_from_slice(&[
+        0x62, 0x0f, 0x42, 0x40, // gas = 1_000_000
+        0xf1, // CALL
+        0x50, // POP
+        0x00, // STOP
+    ]);
+    Bytecode::new_raw(code.into())
+}
+
+fn call_zero_value_code(target: Address) -> Bytecode {
+    let mut code = vec![
+        0x60, 0x00, // ret size
+        0x60, 0x00, // ret offset
+        0x60, 0x00, // args size
+        0x60, 0x00, // args offset
+        0x60, 0x00, // value
+        0x73, // PUSH20 target
+    ];
+    code.extend_from_slice(target.as_slice());
+    code.extend_from_slice(&[
+        0x62, 0x0f, 0x42, 0x40, // gas = 1_000_000
+        0xf1, // CALL
+        0x50, // POP
+        0x00, // STOP
+    ]);
+    Bytecode::new_raw(code.into())
+}
+
+fn execute_with_delegated_safety(
+    db: InMemoryDB,
+    txs: Vec<TxEnv>,
+    force_sequential_fallback: bool,
+) -> (Vec<TxExecutionOutcome>, revm_database::BundleState) {
+    let txs = Arc::new(txs);
+    let mut env = BlockEnv::default();
+    env.beneficiary = account::MINER_ADDRESS;
+    let cfg = CfgEnv::new_with_spec(SpecId::PRAGUE);
+    let state = ParallelState::new(Arc::new(db), true, true);
+    let scheduler = Scheduler::new_with_delegated_safety(
+        cfg,
+        env,
+        txs,
+        state,
+        false,
+        None,
+        DelegatedSafetyConfig::enabled(U256::from(1_000_000_000_000_000u128)),
+    );
+    if force_sequential_fallback {
+        scheduler.fallback_sequential().expect("sequential fallback failed");
+    } else {
+        scheduler.parallel_execute(Some(23)).expect("parallel execute failed");
+    }
+    let (outcomes, mut state) = scheduler.take_result_and_state();
+    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    (outcomes, bundle)
+}
+
+fn final_info<'a>(
+    db: &'a InMemoryDB,
+    bundle: &'a revm_database::BundleState,
+    address: Address,
+) -> &'a AccountInfo {
+    bundle
+        .state
+        .get(&address)
+        .and_then(|account| account.info.as_ref())
+        .unwrap_or_else(|| &db.accounts.get(&address).unwrap().info)
+}
+
 fn run(txs: Vec<TxEnv>) {
     run_with_db(build_db(), txs);
 }
@@ -257,6 +339,138 @@ fn delegated_create_makes_following_nonce_invalid() {
     assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(_)));
     assert_eq!(outcomes[11], TxExecutionOutcome::Skipped(SkipReason::NonceTooLow));
     assert!(matches!(outcomes[12], TxExecutionOutcome::Executed(_)));
+}
+
+#[test]
+fn delegated_create_is_blocked_by_safety_and_following_nonces_execute() {
+    let create_target = target_x();
+    let create_code =
+        Bytecode::new_raw(vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x50, 0x00].into());
+    let db = db_with_delegate_target(create_target, create_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), create_target, 0);
+    txs[11] = authority_tx(authority_a(), 1, authority_b());
+    txs[12] = authority_tx(authority_a(), 2, authority_b());
+
+    let (outcomes, bundle) = execute_with_delegated_safety(db.clone(), txs, false);
+    assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(ExecutionResult::Halt { .. })));
+    assert!(matches!(outcomes[11], TxExecutionOutcome::Executed(_)));
+    assert!(matches!(outcomes[12], TxExecutionOutcome::Executed(_)));
+    assert_eq!(final_info(&db, &bundle, authority_a()).nonce, 3);
+}
+
+#[test]
+fn delegated_create2_is_blocked_by_safety() {
+    let create_target = target_x();
+    let create2_code = Bytecode::new_raw(
+        vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf5, 0x50, 0x00].into(),
+    );
+    let db = db_with_delegate_target(create_target, create2_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), create_target, 0);
+    txs[11] = authority_tx(authority_a(), 1, authority_b());
+
+    let (outcomes, bundle) = execute_with_delegated_safety(db.clone(), txs, false);
+    assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(ExecutionResult::Halt { .. })));
+    assert!(matches!(outcomes[11], TxExecutionOutcome::Executed(_)));
+    assert_eq!(final_info(&db, &bundle, authority_a()).nonce, 2);
+}
+
+#[test]
+fn delegated_call_to_contract_create_is_allowed() {
+    let delegated_target = target_x();
+    let creating_contract = target_y();
+    let delegated_code = call_zero_value_code(creating_contract);
+    let create_code =
+        Bytecode::new_raw(vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x50, 0x00].into());
+    let mut db = db_with_delegate_target(delegated_target, delegated_code);
+    db.accounts.insert(creating_contract, contract_account(&create_code));
+    db.bytecodes.insert(create_code.hash_slow(), create_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), delegated_target, 0);
+
+    let (outcomes, bundle) = execute_with_delegated_safety(db.clone(), txs, false);
+    assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(ExecutionResult::Success { .. })));
+    assert_eq!(final_info(&db, &bundle, creating_contract).nonce, 2);
+}
+
+#[test]
+fn reserve_violation_reverts_and_preserves_authorization_in_parallel() {
+    let drain_target = target_x();
+    let drain_code = drain_to_code(authority_b());
+    let db = db_with_delegate_target(drain_target, drain_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), drain_target, 0);
+    txs[11] = authority_tx(authority_a(), 1, authority_b());
+
+    let (outcomes, bundle) = execute_with_delegated_safety(db.clone(), txs, false);
+    assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(ExecutionResult::Revert { .. })));
+    assert!(matches!(outcomes[11], TxExecutionOutcome::Executed(_)));
+
+    let authority = final_info(&db, &bundle, authority_a());
+    assert_eq!(authority.nonce, 2);
+    assert!(authority.balance > U256::from(ONE_ETHER - 1_000_000u128));
+    assert_eq!(final_info(&db, &bundle, authority_b()).balance, U256::from(ONE_ETHER));
+}
+
+#[test]
+fn reserve_violation_uses_same_semantics_in_sequential_fallback() {
+    let drain_target = target_x();
+    let drain_code = drain_to_code(authority_b());
+    let db = db_with_delegate_target(drain_target, drain_code);
+    let txs = vec![
+        delegate_and_call_tx(0, authority_a(), drain_target, 0),
+        authority_tx(authority_a(), 1, authority_b()),
+    ];
+
+    let (outcomes, bundle) = execute_with_delegated_safety(db.clone(), txs, true);
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(outcomes[0], TxExecutionOutcome::Executed(ExecutionResult::Revert { .. })));
+    assert!(matches!(outcomes[1], TxExecutionOutcome::Executed(_)));
+    assert_eq!(final_info(&db, &bundle, authority_a()).nonce, 2);
+    assert_eq!(final_info(&db, &bundle, authority_b()).balance, U256::from(ONE_ETHER));
+}
+
+#[test]
+fn reserve_violation_parallel_and_fallback_bundles_match() {
+    let drain_target = target_x();
+    let drain_code = drain_to_code(authority_b());
+    let db = db_with_delegate_target(drain_target, drain_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), drain_target, 0);
+    txs[11] = authority_tx(authority_a(), 1, authority_b());
+
+    let (parallel_outcomes, parallel_bundle) =
+        execute_with_delegated_safety(db.clone(), txs.clone(), false);
+    let (fallback_outcomes, fallback_bundle) = execute_with_delegated_safety(db, txs, true);
+
+    assert_eq!(parallel_outcomes, fallback_outcomes);
+    execute::compare_bundle_state(&fallback_bundle, &parallel_bundle);
+}
+
+#[test]
+fn selfdestruct_reserve_violation_reverts_under_safety() {
+    let drain_target = target_x();
+    let mut raw_code = vec![0x73];
+    raw_code.extend_from_slice(authority_b().as_slice());
+    raw_code.push(0xff);
+    let drain_code = Bytecode::new_raw(raw_code.into());
+    let db = db_with_delegate_target(drain_target, drain_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), drain_target, 0);
+    txs[11] = authority_tx(authority_a(), 1, authority_b());
+
+    let (outcomes, bundle) = execute_with_delegated_safety(db.clone(), txs, false);
+    assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(ExecutionResult::Revert { .. })));
+    assert!(matches!(outcomes[11], TxExecutionOutcome::Executed(_)));
+    assert_eq!(final_info(&db, &bundle, authority_a()).nonce, 2);
+    assert_eq!(final_info(&db, &bundle, authority_b()).balance, U256::from(ONE_ETHER));
 }
 
 /// The sponsored type-4 transaction installs A's delegation and immediately executes it in A's

@@ -3,6 +3,10 @@ use crate::{
     MIN_PARALLEL_TXS, MemoryEntry, ParallelState, ReadVersion, SkipReason, Task, TransactionResult,
     TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
     async_commit::{CommitGuard, StateAsyncCommit},
+    delegated_safety::{
+        DelegatedSafetyConfig, GravityHandler, ReservePlan, ReservePlanError, RewardMode,
+        TrackingJournal, TrackingPrecompilesMap, gravity_instructions,
+    },
     hint::ParallelExecutionHints,
     storage::CacheDB,
     tx_dependency::TxDependency,
@@ -10,7 +14,7 @@ use crate::{
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use alloy_evm::{
-    EthEvm, Evm,
+    Database as AlloyDatabase, EthEvm, Evm,
     precompiles::{DynPrecompile, PrecompilesMap},
 };
 use dashmap::DashMap;
@@ -27,7 +31,7 @@ use revm::{
     precompile::{PrecompileSpecId, Precompiles},
 };
 use revm_context::{
-    BlockEnv, CfgEnv, ContextSetters, ContextTr, JournalTr, TxEnv,
+    BlockEnv, CfgEnv, ContextSetters, ContextTr, Journal, JournalTr, TxEnv,
     result::{EVMError, HaltReason, ResultAndState},
 };
 use revm_inspector::NoOpInspector;
@@ -61,6 +65,44 @@ type GrevmEvm<'a, DB> = RevmEvm<
     PrecompilesMap,
     EthFrame,
 >;
+
+type SafetyGrevmCtx<DB> = Context<BlockEnv, TxEnv, CfgEnv, DB, TrackingJournal<Journal<DB>>>;
+
+type SafetyGrevmEvm<DB> = RevmEvm<
+    SafetyGrevmCtx<DB>,
+    NoOpInspector,
+    EthInstructions<EthInterpreter, SafetyGrevmCtx<DB>>,
+    TrackingPrecompilesMap,
+    EthFrame,
+>;
+
+fn build_safety_evm<DB>(
+    db: DB,
+    cfg: CfgEnv,
+    block: BlockEnv,
+    custom_precompiles: &[(Address, DynPrecompile)],
+) -> SafetyGrevmEvm<DB>
+where
+    DB: AlloyDatabase,
+{
+    let spec = cfg.spec;
+    let mut evm =
+        Context::<BlockEnv, TxEnv, CfgEnv, DB, TrackingJournal<Journal<DB>>>::new(db, spec)
+            .with_cfg(cfg)
+            .with_block(block)
+            .build_mainnet_with_inspector(NoOpInspector {})
+            .with_precompiles(TrackingPrecompilesMap::from_static(Precompiles::new(
+                PrecompileSpecId::from_spec_id(spec),
+            )));
+    evm.instruction = gravity_instructions();
+
+    for (address, precompile) in custom_precompiles {
+        let precompile = precompile.clone();
+        evm.precompiles.apply_precompile(address, move |_| Some(precompile));
+    }
+
+    evm
+}
 
 /// A mainnet [`Handler`] that suppresses the beneficiary (miner) reward. Instead of crediting the
 /// coinbase inside transaction execution — which would make every transaction read & write the
@@ -330,6 +372,8 @@ where
     mv_memory: MVMemory,
     scheduler_ctx: SchedulerContext,
     custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>,
+    delegated_safety: DelegatedSafetyConfig,
+    reserve_plan: Arc<OnceLock<Result<ReservePlan, ReservePlanError>>>,
 
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason<DB::Error>>,
@@ -370,6 +414,29 @@ where
         with_hints: bool,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
     ) -> Self {
+        Self::new_with_delegated_safety(
+            cfg,
+            env,
+            txs,
+            state,
+            with_hints,
+            custom_precompiles,
+            DelegatedSafetyConfig::default(),
+        )
+    }
+
+    /// Create a Scheduler with explicit EIP-7702 delegated safety semantics.
+    ///
+    /// Keep this disabled until the caller wires it to Gravity's chain activation and reserve cap.
+    pub fn new_with_delegated_safety(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        with_hints: bool,
+        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        delegated_safety: DelegatedSafetyConfig,
+    ) -> Self {
         let num_txs = txs.len();
         let tx_dependency = if with_hints {
             ParallelExecutionHints::new(txs.clone()).parse_hints()
@@ -389,6 +456,8 @@ where
             mv_memory: MVMemory::new(),
             scheduler_ctx: SchedulerContext::new(num_txs),
             custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
+            delegated_safety,
+            reserve_plan: Arc::new(OnceLock::new()),
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
@@ -560,6 +629,28 @@ where
                     // Disable nonce check to bypass the EVM's strict sequential nonce verification;
                     // the nonce is re-checked when the transaction commits.
                     cfg.disable_nonce_check = true;
+                    if self.delegated_safety.enabled {
+                        let mut evm = build_safety_evm(
+                            cache_db,
+                            cfg,
+                            self.env.clone(),
+                            self.custom_precompiles.as_ref(),
+                        );
+
+                        let mut task = self.next();
+                        while let Some(current_task) = task {
+                            task = match current_task {
+                                Task::Execution(tx_version) => {
+                                    self.execute_with_safety(&mut evm, tx_version)
+                                }
+                                Task::Validation(tx_version) => self.validate(tx_version),
+                            };
+                            if task.is_none() && !self.abort.load(Ordering::Acquire) {
+                                task = self.next();
+                            }
+                        }
+                        return;
+                    }
                     // Build the raw revm EVM (not wrapped in `EthEvm`) so we can drive a custom
                     // `Handler` that skips the miner reward — the reward is deferred and applied at
                     // commit time (see `async_commit`).
@@ -688,43 +779,88 @@ where
         let mut commit_guard = CommitGuard::new(&self.state);
         let state_mut = commit_guard.state_mut();
         {
-            let evm = Context::mainnet()
-                .with_db(state_mut)
-                .with_cfg(self.cfg.clone())
-                .with_block(self.env.clone())
-                .build_mainnet_with_inspector(NoOpInspector {})
-                .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-                    PrecompileSpecId::from_spec_id(self.cfg.spec),
-                )));
-            let mut evm = EthEvm::new(evm, false);
-            // Apply additional precompiles if provided
-            for (address, precompile) in self.custom_precompiles.iter() {
-                let precompile_clone = precompile.clone();
-                evm.precompiles_mut().apply_precompile(&address, move |_| Some(precompile_clone));
-            }
-            for txid in num_commit..self.block_size {
-                let result_and_state = match evm.transact_raw(self.txs[txid].clone()) {
-                    Ok(result_and_state) => result_and_state,
-                    Err(error) => {
-                        if let Some(reason) = SkipReason::from_evm_error(&error) {
-                            sequential_results.push(TxExecutionOutcome::Skipped(reason));
-                            tracing::error!(
-                                target: "grevm::scheduler",
-                                block_number = %self.env.number,
-                                txid,
-                                ?reason,
-                                "skipping invalid transaction during sequential fallback",
-                            );
-                            self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-                            continue;
+            if self.delegated_safety.enabled {
+                let mut evm = build_safety_evm(
+                    state_mut,
+                    self.cfg.clone(),
+                    self.env.clone(),
+                    self.custom_precompiles.as_ref(),
+                );
+                for txid in num_commit..self.block_size {
+                    evm.ctx.set_tx(self.txs[txid].clone());
+                    let output_or_error = GravityHandler::new(
+                        txid,
+                        self.delegated_safety.clone(),
+                        self.txs.as_slice(),
+                        &self.env,
+                        &self.reserve_plan,
+                        RewardMode::Immediate,
+                    )
+                    .run(&mut evm);
+                    let state = evm.finalize();
+                    let result_and_state = match output_or_error {
+                        Ok(result) => ResultAndState { result, state },
+                        Err(error) => {
+                            if let Some(reason) = SkipReason::from_evm_error(&error) {
+                                sequential_results.push(TxExecutionOutcome::Skipped(reason));
+                                tracing::error!(
+                                    target: "grevm::scheduler",
+                                    block_number = %self.env.number,
+                                    txid,
+                                    ?reason,
+                                    "skipping invalid transaction during sequential fallback",
+                                );
+                                self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            return Err(GrevmError { txid, error: error.clone() });
                         }
-                        return Err(GrevmError { txid, error: error.clone() });
-                    }
-                };
+                    };
 
-                evm.db_mut().commit(result_and_state.state);
-                sequential_results.push(TxExecutionOutcome::Executed(result_and_state.result));
-                self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+                    evm.db_mut().commit(result_and_state.state);
+                    sequential_results.push(TxExecutionOutcome::Executed(result_and_state.result));
+                    self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                let evm = Context::mainnet()
+                    .with_db(state_mut)
+                    .with_cfg(self.cfg.clone())
+                    .with_block(self.env.clone())
+                    .build_mainnet_with_inspector(NoOpInspector {})
+                    .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
+                        PrecompileSpecId::from_spec_id(self.cfg.spec),
+                    )));
+                let mut evm = EthEvm::new(evm, false);
+                // Apply additional precompiles if provided
+                for (address, precompile) in self.custom_precompiles.iter() {
+                    let precompile_clone = precompile.clone();
+                    evm.precompiles_mut()
+                        .apply_precompile(&address, move |_| Some(precompile_clone));
+                }
+                for txid in num_commit..self.block_size {
+                    let result_and_state = match evm.transact_raw(self.txs[txid].clone()) {
+                        Ok(result_and_state) => result_and_state,
+                        Err(error) => {
+                            if let Some(reason) = SkipReason::from_evm_error(&error) {
+                                sequential_results.push(TxExecutionOutcome::Skipped(reason));
+                                tracing::error!(
+                                    target: "grevm::scheduler",
+                                    block_number = %self.env.number,
+                                    txid,
+                                    ?reason,
+                                    "skipping invalid transaction during sequential fallback",
+                                );
+                                self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            return Err(GrevmError { txid, error: error.clone() });
+                        }
+                    };
+
+                    evm.db_mut().commit(result_and_state.state);
+                    sequential_results.push(TxExecutionOutcome::Executed(result_and_state.result));
+                    self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         results.extend(sequential_results);
@@ -897,6 +1033,139 @@ where
                 tx_state.status = TransactionStatus::Validating;
                 return Some(Task::Validation(TxVersion::new(txid, incarnation)));
             }
+        }
+        None
+    }
+
+    fn execute_with_safety(
+        &self,
+        evm: &mut SafetyGrevmEvm<CacheDB<'_, ParallelState<DB>>>,
+        tx_version: TxVersion,
+    ) -> Option<Task> {
+        let TxVersion { txid, incarnation } = tx_version;
+        let mut tx_state = self.tx_states[txid].lock();
+        if tx_state.status != TransactionStatus::Executing {
+            return None;
+        }
+        if tx_state.incarnation != incarnation {
+            self.abort(AbortReason::ParallelError {
+                txid,
+                message: "inconsistent incarnation during execution",
+            });
+            return None;
+        }
+        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+
+        evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
+        let tx_env = self.txs[txid].clone();
+        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
+        evm.ctx.set_tx(tx_env);
+        let output_or_error = GravityHandler::new(
+            txid,
+            self.delegated_safety.clone(),
+            self.txs.as_slice(),
+            &self.env,
+            &self.reserve_plan,
+            RewardMode::Deferred,
+        )
+        .run(evm);
+        let state = evm.finalize();
+        let result = output_or_error.map(|result| ResultAndState { result, state });
+
+        let mut write_new_locations = false;
+        let conflict;
+        let mut next = None;
+        match result {
+            Ok(result_and_state) => {
+                let read_accurate_origin = evm.db_mut().read_accurate_origin();
+
+                let blocking_txs = evm.db_mut().take_estimate_txs();
+                conflict = !read_accurate_origin || !blocking_txs.is_empty();
+                let read_set = evm.db_mut().take_read_set();
+                let write_set = evm.db_mut().update_mv_memory(&result_and_state.state, conflict);
+
+                let mut last_result = self.tx_results[txid].lock();
+                if let Some(last_result) = last_result.as_ref() {
+                    for location in write_set.iter() {
+                        if !last_result.write_set.contains(location) {
+                            write_new_locations = true;
+                            break;
+                        }
+                    }
+                    for location in &last_result.write_set {
+                        if !write_set.contains(location) {
+                            if let Some(mut written_transactions) = self.mv_memory.get_mut(location)
+                            {
+                                written_transactions.remove(&txid);
+                            }
+                        }
+                    }
+                } else {
+                    write_new_locations = true;
+                }
+
+                if conflict {
+                    self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
+                    if !read_accurate_origin {
+                        self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
+                        self.tx_dependency.key_tx(txid, &self.scheduler_ctx.commit_idx);
+                    } else {
+                        self.metrics.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
+                        self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
+                    }
+                } else {
+                    next = self.tx_dependency.remove(txid, true);
+                }
+                *last_result = Some(TransactionResult {
+                    read_set,
+                    write_set,
+                    execute_result: Ok(result_and_state),
+                });
+            }
+            Err(e) => {
+                let recoverable = SkipReason::from_evm_error(&e).is_some();
+                conflict = true;
+                self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
+                self.metrics.conflict_by_error.fetch_add(1, Ordering::Relaxed);
+                let mut write_set = HashSet::new();
+
+                let mut last_result = self.tx_results[txid].lock();
+                if let Some(last_result) = last_result.as_mut() {
+                    write_set = std::mem::take(&mut last_result.write_set);
+                    self.mark_estimate(txid, &write_set);
+                }
+                *last_result = Some(TransactionResult {
+                    read_set: Default::default(),
+                    write_set,
+                    execute_result: Err(e),
+                });
+                if commit_idx == txid {
+                    if recoverable {
+                        self.abort(AbortReason::FallbackSequential);
+                    } else {
+                        self.abort(AbortReason::FatalEvmError(txid));
+                    }
+                }
+                self.tx_dependency.key_tx(txid, &self.scheduler_ctx.commit_idx);
+            }
+        }
+
+        tx_state.status =
+            if conflict { TransactionStatus::Conflict } else { TransactionStatus::Executed };
+        self.scheduler_ctx.executed(txid);
+
+        if let Some(next) = next {
+            self.scheduler_ctx.reset_validation_idx(txid);
+            drop(tx_state);
+            return self.execution_task(next);
+        }
+        if conflict {
+            self.scheduler_ctx.reset_validation_idx(txid + 1);
+        } else if write_new_locations {
+            self.scheduler_ctx.reset_validation_idx(txid);
+        } else {
+            tx_state.status = TransactionStatus::Validating;
+            return Some(Task::Validation(TxVersion::new(txid, incarnation)));
         }
         None
     }
