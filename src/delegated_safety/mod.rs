@@ -14,5 +14,5 @@ pub(crate) use handler::{GravityHandler, RewardMode};
 pub(crate) use instructions::gravity_instructions;
 pub(crate) use journal::{TrackingJournal, TrackingJournalExt};
 pub use policy::DelegatedSafetyConfig;
-pub(crate) use policy::{ReservePlan, ReservePlanError};
+pub(crate) use policy::{ReservePlan, ReservePlanError, SharedReservePlan};
 pub(crate) use precompiles::TrackingPrecompilesMap;

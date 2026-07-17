@@ -144,8 +144,7 @@ mod tests {
     fn reserve_plan_uses_max_headroom_without_double_counting_refunds() {
         let caller = address!("00000000000000000000000000000000000000aa");
         let other = address!("00000000000000000000000000000000000000bb");
-        let mut block = BlockEnv::default();
-        block.basefee = 10;
+        let block = BlockEnv { basefee: 10, ..Default::default() };
 
         let tx0 = TxEnv {
             tx_type: TransactionType::Eip1559 as u8,
@@ -177,5 +176,47 @@ mod tests {
         // Before tx0, the real suffix after tx0 is tx1's need plus tx0's effective spend:
         // max(10*20+100, 10*(10+1)+100 + 107) = 317.
         assert_eq!(schedule.need_before[0], U256::from(317));
+    }
+
+    #[test]
+    fn required_balance_combines_floor_and_future_sender_budget() {
+        let caller = address!("00000000000000000000000000000000000000aa");
+        let receiver = address!("00000000000000000000000000000000000000bb");
+        let block = BlockEnv::default();
+        let txs = [TxEnv {
+            caller,
+            kind: TxKind::Call(receiver),
+            value: U256::from(50),
+            gas_limit: 21_000,
+            gas_price: 2,
+            ..TxEnv::default()
+        }];
+        let plan = ReservePlan::build(&txs, &block).unwrap();
+        let config = DelegatedSafetyConfig::enabled(U256::from(1_000));
+
+        assert_eq!(
+            required_balance(
+                &config,
+                &plan,
+                usize::MAX,
+                caller,
+                U256::from(10_000),
+                true,
+                U256::from(100),
+            ),
+            U256::from(900)
+        );
+        assert_eq!(
+            required_balance(
+                &config,
+                &plan,
+                usize::MAX,
+                receiver,
+                U256::from(400),
+                false,
+                U256::ZERO,
+            ),
+            U256::from(400)
+        );
     }
 }

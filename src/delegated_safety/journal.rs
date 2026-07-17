@@ -521,3 +521,56 @@ impl<J> TrackingJournalExt for TrackingJournal<J> {
         &mut self.tracker
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm_primitives::address;
+
+    const SENDER: Address = address!("00000000000000000000000000000000000000aa");
+    const AUTHORITY: Address = address!("00000000000000000000000000000000000000bb");
+
+    #[test]
+    fn reverted_frame_discards_only_frame_local_tracking() {
+        let mut tracker = ReserveTracker::default();
+        tracker.begin_transaction(SENDER, false);
+        tracker.start_execution();
+        tracker.insert_authorization_sensitive(AUTHORITY);
+        tracker.checkpoint();
+        tracker.save_original_balance(AUTHORITY, U256::from(10));
+        tracker.record_debit(AUTHORITY);
+
+        assert_eq!(tracker.protected_debits(), vec![AUTHORITY]);
+        tracker.checkpoint_revert();
+
+        assert!(tracker.protected_debits().is_empty());
+        assert_eq!(tracker.original_balance(AUTHORITY), None);
+        assert!(tracker.authorization_sensitive.contains(&AUTHORITY));
+    }
+
+    #[test]
+    fn committed_frame_retains_protected_debit() {
+        let mut tracker = ReserveTracker::default();
+        tracker.begin_transaction(SENDER, false);
+        tracker.start_execution();
+        tracker.insert_delegated_subject(AUTHORITY);
+        tracker.checkpoint();
+        tracker.save_original_balance(AUTHORITY, U256::from(10));
+        tracker.record_debit(AUTHORITY);
+        tracker.checkpoint_commit();
+
+        assert_eq!(tracker.protected_debits(), vec![AUTHORITY]);
+        assert_eq!(tracker.original_balance(AUTHORITY), Some(U256::from(10)));
+    }
+
+    #[test]
+    fn ordinary_account_debits_are_not_reserve_candidates() {
+        let mut tracker = ReserveTracker::default();
+        tracker.begin_transaction(SENDER, false);
+        tracker.start_execution();
+        tracker.save_original_balance(AUTHORITY, U256::from(10));
+        tracker.record_debit(AUTHORITY);
+
+        assert!(tracker.protected_debits().is_empty());
+    }
+}

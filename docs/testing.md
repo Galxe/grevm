@@ -29,6 +29,7 @@ This builds and runs:
 | `tests/native_transfers.rs` | raw value-transfer workloads (independent / chained / hybrid) |
 | `tests/uniswap.rs` | Uniswap swap workloads |
 | `tests/eip-7702.rs` | synthetic EIP-7702 scenarios: delegate / re-delegate / reset / multi-authority; storage preservation when an already-delegated EOA with storage is re-delegated (the block-22546209 bug); and interaction with `CREATE`/`CREATE2` and `SELFDESTRUCT` |
+| `tests/delegated_safety.rs` | opt-in delegated CREATE/CREATE2 blocking and reserve-balance enforcement; disabled compatibility, exact reserve boundary, nested-frame rollback, SELFDESTRUCT, and parallel/sequential equivalence |
 | `tests/mainnet.rs` | replays real mainnet blocks from fixtures (skips if none present) |
 
 Every integration test compares **Grevm parallel execution against a sequential revm reference**
@@ -44,13 +45,17 @@ and asserts both the per-transaction results and the final bundle state match.
 | `GREVM_MIN_PARALLEL_TXS` | `64` | Blocks with fewer transactions fall back to sequential. Set to `0` to force the parallel path even for tiny blocks (needed when replaying small real blocks). |
 | `GREVM_FALLBACK_SEQUENTIAL` | `false` | Force sequential execution for every block. |
 | `GREVM_CONCURRENT_LEVEL` | number of CPU cores | Worker/partition count for parallel execution. |
-| `ASYNC_COMMIT_STATE` | `true` | Asynchronously bundle execution results during parallel execution. |
 | `GREVM_MAINNET_BLOCKS` | `test_data/mainnet_blocks` | Directory the mainnet replay test reads single-block fixtures from. |
 | `GREVM_CONTINUOUS_BLOCKS` | `test_data/con_eth_blocks` | Directory the `continuous` bench reads merged "big block" fixtures from. |
 
 Benchmark-only tuning (read by `benches/gigagas.rs`): `NUM_EOA` (default `100000`), `HOT_RATIO`
 (`0.0`), `DB_LATENCY_US` (`0`), `WITH_HINTS` (`false`), `DEPENDENCY_RATIO` (`0.1`),
 `DEPENDENCY_DISTANCE` (`8`), `FILTER` (substring filter for which sub-benchmarks to run).
+
+These execution knobs are represented by `GrevmConfig` together with
+`DelegatedSafetyConfig`. `Scheduler::new(...)` calls `GrevmConfig::from_env()` for compatibility;
+production integrations can use `Scheduler::new_with_config(...)` and `Scheduler::execute()` to
+avoid process-global environment reads and make the block execution policy explicit.
 
 ## Replaying real mainnet blocks
 

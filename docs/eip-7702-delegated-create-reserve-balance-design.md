@@ -674,10 +674,10 @@ trait ReservePolicy {
 
 实现日期：2026-07-16。
 
-本轮实现仍保持 upstream `revm 29.0.1`，没有 fork revm。新增实现集中在 `src/delegated_safety/`，调度器只增加显式配置入口：
+本轮实现仍保持 upstream `revm 29.0.1`，没有 fork revm。协议实现集中在 `src/delegated_safety/`：
 
 - `DelegatedSafetyConfig`：默认 disabled，避免现有 `Scheduler::new` 调用发生共识语义变化。
-- `Scheduler::new_with_delegated_safety(...)`：由上层在 Gravity 激活高度和 reserve cap 已确定后显式启用。
+- `GrevmConfig::delegated_safety`：由上层在 Gravity 激活高度和 reserve cap 已确定后显式启用。
 - `gravity_instructions()`：替换 `CREATE/CREATE2` opcode。执行顺序为 upstream static/hardfork gate -> delegated recipient 检查 -> upstream create。
 - `TrackingJournal<Journal<DB>>`：包装 upstream journal，记录 execution phase 中的 balance debit、原始余额、delegated subject、authorization-sensitive account、create transaction sender nonce bump，并随 checkpoint commit/revert 同步回滚 tracker sidecar。
 - `GravityHandler`：统一 parallel 和 sequential fallback 的 transaction 生命周期。reserve violation 回滚 pre-execution 之后的 outer checkpoint，输出收费 `Revert`，并保留 sender nonce、EIP-7702 authorization、实际 gas 收费。
@@ -727,7 +727,7 @@ cargo test --features test-utils
 
 - `cargo check` 通过。
 - `cargo test --lib` 通过，包含 `ReservePlan` 逆序公式单测。
-- `cargo test --features test-utils --test eip-7702` 通过，当前 19 个 EIP-7702 端到端/回归测试全部通过。
+- `cargo test --features test-utils --test eip-7702` 与 `--test delegated_safety` 通过，当前分别包含 12 个通用 EIP-7702 回归测试和 8 个 delegated safety 端到端测试。
 - `cargo test --features test-utils` 通过，包含 lib、EIP-7702、ERC20、mainnet fixture、native transfer、Uniswap 和 doctest。
 
 ### 12.3 当前仍需上层接入的内容
@@ -737,3 +737,80 @@ grevm 已提供执行侧能力，但默认不启用。Gravity 上层仍需明确
 1. 激活高度或 chain spec 条件；
 2. 协议级 `max_reserve_balance`；
 3. 若要声明完整跨 block pipeline solvency，需要共识侧 inflight gas budget 或 pipeline liability 输入。当前 grevm 实现只覆盖当前 block suffix + fixed floor mitigation。
+
+## 13. 2026-07-17 抽象与执行路径整改
+
+本轮在不改变上述共识语义的前提下，对配置、调度、EVM 驱动和测试进行了分层整改。
+
+### 13.1 统一配置
+
+新增 `GrevmConfig`，统一承载：
+
+- `concurrency_level`
+- `force_sequential`
+- `min_parallel_txs`
+- `delegated_safety`
+
+`GrevmConfig::from_env()` 只在 scheduler 构造时读取一次兼容环境变量；需要共识稳定配置的上层应显式构造配置并调用 `Scheduler::new_with_config(...)`。`Scheduler::execute()` 完全使用该配置。旧 `Scheduler::new(...)` 和 `parallel_execute(Some(...))` 保留兼容，`new_with_delegated_safety(...)` 标记为 deprecated。
+
+旧 `ASYNC_COMMIT_STATE=false` 会推进 commit cursor 却不提交 state/outcome，并不是合法的“同步提交”模式。本轮安全审计将其移除；parallel execution 现在始终完成有序 state/outcome commit，benchmark 也测量完整执行成本。
+
+### 13.2 单一调度执行状态机
+
+删除原先重复的 `execute_with_safety`。现在：
+
+1. `StandardExecutor` 与 `SafetyExecutor` 只负责 EVM 构造、handler 驱动和 journal finalize；
+2. 两者实现同一个 `ParallelTransactionExecutor` 接口；
+3. scheduler 只有一个 `run_worker` 和一个 `execute_task`，冲突检测、read/write set、MVMemory、dependency、incarnation 和 validation 状态推进只有一份实现；
+4. sequential fallback 也只有一个 `execute_sequential_suffix` 负责 invalid skip、结果排序和 metrics，standard/safety 仅提供不同的 transact closure。
+
+disabled fast path 仍构造原始 upstream journal/EVM，不引入 `TrackingJournal`、自定义 instruction 或逐交易 safety 判断。enabled 判断仅在每个 worker 和 fallback 建立执行器时发生一次。
+
+### 13.3 模块职责
+
+- `src/config.rs`：公开运行配置及环境变量兼容入口。
+- `src/model.rs`：scheduler 与 speculative database 共享的内部状态模型和 MVMemory 类型。
+- `src/outcome.rs`：公开执行结果、skip reason 和错误类型。
+- `src/scheduler/context.rs`：lock-free cursor 与 logical timestamp。
+- `src/scheduler/executor.rs`：standard/safety EVM adapter 与 lazy reward handler。
+- `src/scheduler/fallback.rs`：顺序 suffix replay。
+- `src/scheduler/metrics.rs`：metrics 定义与采集。
+- `src/scheduler.rs`：只保留 block orchestration、并发 finality/commit 和调度状态机。
+- `src/cache_db.rs`：speculative MVMemory database adapter。
+- `src/bundle.rs`：parallel transition/bundle/revert 生成。
+- `src/utils.rs`：无业务语义的 fork-join 分区和连续索引工具；`fork_join_util` 仅在 crate root 保留兼容 re-export。
+- `src/delegated_safety/*`：协议策略、instruction、tracking journal、handler、precompile adapter。
+
+### 13.4 新增测试覆盖
+
+delegate safety 测试从通用 EIP-7702 回归文件中独立到 `tests/delegated_safety.rs`，覆盖：
+
+1. delegated `CREATE` 与 `CREATE2` 均阻止且不产生额外 nonce；
+2. safety disabled 时保持 upstream delegated CREATE 语义；
+3. delegated code 普通 CALL 到非 delegated 合约后，后者 CREATE 仍允许；
+4. reserve violation 回滚 value/state，保留 authorization、nonce 和 sponsor 实际 gas fee；
+5. 最终余额恰好等于 reserve 时允许；
+6. inner frame debit 后 revert 不产生 tracker 假阳性；
+7. `SELFDESTRUCT` 与 CALL debit 使用同一 reserve policy；
+8. parallel 与配置强制 sequential 的 outcomes、bundle 完全一致。
+
+另新增 tracker checkpoint commit/revert、普通账户 debit fast filter、reserve floor/suffix 组合和统一配置的单元测试。
+
+### 13.5 本轮审计结论
+
+- 抽象审计：standard/safety 不再复制 scheduler 状态机；配置不再散落读取；lib、scheduler、fallback、EVM adapter 和公共结果类型职责分离。
+- 安全审计：复核 authorization 位于 outer checkpoint 前、execution effects 位于 checkpoint 内、reserve failure 的 refund/nonce/gas 处理，以及 tracker 子 frame checkpoint 回滚；新增边界和 adversarial frame 测试。
+- 性能审计：disabled 路径无 tracking wrapper；enabled 路径 ReservePlan 仍只在存在 protected debit 时惰性初始化；worker 内不做动态分发，trait 通过泛型静态单态化。
+
+### 13.6 最终验证
+
+```bash
+cargo test --features test-utils
+cargo check --release --all-targets --features test-utils
+cargo fmt --check
+git diff --check
+```
+
+全部通过。全量测试包含 19 个 lib 单测、8 个 delegated safety E2E、12 个通用 EIP-7702 回归测试，以及 ERC20、mainnet fixture、native transfer、Uniswap 和 doctest。
+
+`cargo clippy --lib --features test-utils --no-deps` 可完成检查；仓库既有 `hint.rs`、`parallel_state.rs`、原 CacheDB 实现和 test-utils 仍有历史 clippy warning，因此当前尚未把全仓 `-D warnings` 作为通过条件。本轮新增的 config、scheduler adapter/context/fallback/metrics、bundle 和 delegated-safety 变更未产生新增 clippy warning。

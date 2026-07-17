@@ -1,4 +1,4 @@
-use crate::{LocationAndType, TxId, fork_join_util, tx_dependency::TxDependency};
+use crate::{LocationAndType, TxId, tx_dependency::TxDependency, utils::fork_join_util};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use revm::primitives::{
     Address, B256, Bytes, TxKind, U256, alloy_primitives::U160, keccak256, ruint::UintTryFrom,

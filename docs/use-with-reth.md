@@ -81,7 +81,7 @@ Public items re-exported from the crate root: `Scheduler`, `ParallelState`, `Par
 `ParallelBundleState`, `ParallelTakeBundle`, `GrevmError`, `fork_join_util`.
 
 Execution is tuned by a few environment variables (`GREVM_MIN_PARALLEL_TXS`,
-`GREVM_FALLBACK_SEQUENTIAL`, `GREVM_CONCURRENT_LEVEL`, `ASYNC_COMMIT_STATE`). See
+`GREVM_FALLBACK_SEQUENTIAL`, `GREVM_CONCURRENT_LEVEL`). See
 [Testing & Benchmarking](testing.md#environment-variable-knobs) for the full list and a working
 end-to-end harness (`src/test_utils/common/execute.rs`).
 
