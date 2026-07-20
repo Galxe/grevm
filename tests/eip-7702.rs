@@ -25,10 +25,17 @@
 //!   storage (Shanghai; the original `new_ca` purpose — the create side of the same coin)
 //! - [`create2_target_redelegate_and_selfdestruct`] — CREATE2 + EIP-7702 re-delegation +
 //!   self-destruct composed in one Prague block
+//! - [`delegated_create_makes_following_nonce_invalid`] — an authorization plus delegated CREATE
+//!   advances the authority nonce twice; the stale follow-up nonce is skipped
+//! - [`delegated_balance_drain_makes_following_tx_invalid`] — delegated execution drains the
+//!   authority balance; its otherwise valid follow-up transaction is skipped
 
-use grevm::test_utils::{
-    TRANSFER_GAS_LIMIT,
-    common::{account, execute, storage::InMemoryDB},
+use grevm::{
+    SkipReason, TxExecutionOutcome,
+    test_utils::{
+        TRANSFER_GAS_LIMIT,
+        common::{account, execute, storage::InMemoryDB},
+    },
 };
 use revm_context::{
     TxEnv,
@@ -172,6 +179,45 @@ fn call_tx(caller_idx: usize, to: Address) -> TxEnv {
     }
 }
 
+/// Build a sponsored type-4 transaction that both installs `authority`'s delegation and calls
+/// the authority in the same transaction. The delegated target therefore executes immediately in
+/// the authority's context.
+fn delegate_and_call_tx(
+    sponsor_idx: usize,
+    authority: Address,
+    target: Address,
+    authority_nonce: u64,
+) -> TxEnv {
+    let mut tx = delegate_tx(sponsor_idx, &[(authority, target, authority_nonce)]);
+    tx.kind = TxKind::Call(authority);
+    tx
+}
+
+fn authority_tx(authority: Address, nonce: u64, to: Address) -> TxEnv {
+    TxEnv {
+        caller: authority,
+        kind: TxKind::Call(to),
+        value: U256::ZERO,
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 1,
+        nonce,
+        ..TxEnv::default()
+    }
+}
+
+/// Execute a Prague block with sender nonce validation enabled, compare Grevm's outcomes and final
+/// state against the strictly sequential skip reference, and return the verified outcomes.
+fn execute_skip_outcomes(db: InMemoryDB, txs: Vec<TxEnv>) -> Vec<TxExecutionOutcome> {
+    execute::compare_evm_execute_skipping_invalid_with_spec(db, txs, false, SpecId::PRAGUE)
+}
+
+fn db_with_delegate_target(target: Address, code: Bytecode) -> InMemoryDB {
+    let mut db = build_db();
+    db.accounts.insert(target, contract_account(&code));
+    db.bytecodes.insert(code.hash_slow(), code);
+    db
+}
+
 fn run(txs: Vec<TxEnv>) {
     run_with_db(build_db(), txs);
 }
@@ -188,6 +234,57 @@ fn run_with_db(db: InMemoryDB, txs: Vec<TxEnv>) {
         Default::default(),
         SpecId::PRAGUE,
     );
+}
+
+/// The authorization increments A's nonce from 0 to 1, then the delegated code executes CREATE
+/// in A's context and increments it again to 2. A transaction built with the stale nonce 1 must be
+/// skipped, while the following transaction with nonce 2 must still execute.
+#[test]
+fn delegated_create_makes_following_nonce_invalid() {
+    let create_target = target_x();
+    // PUSH1 0; PUSH1 0; PUSH1 0; CREATE; POP; STOP
+    let create_code =
+        Bytecode::new_raw(vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0xf0, 0x50, 0x00].into());
+    let db = db_with_delegate_target(create_target, create_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), create_target, 0);
+    txs[11] = authority_tx(authority_a(), 1, authority_b());
+    txs[12] = authority_tx(authority_a(), 2, authority_b());
+
+    let outcomes = execute_skip_outcomes(db, txs);
+    assert_eq!(outcomes.len(), BLOCK_SIZE);
+    assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(_)));
+    assert_eq!(outcomes[11], TxExecutionOutcome::Skipped(SkipReason::NonceTooLow));
+    assert!(matches!(outcomes[12], TxExecutionOutcome::Executed(_)));
+}
+
+/// The sponsored type-4 transaction installs A's delegation and immediately executes it in A's
+/// context. SELFDESTRUCT transfers A's entire balance to B under Prague rules. A's next
+/// nonce-correct transaction can no longer pay its intrinsic gas and must be skipped; an
+/// independent suffix transaction must still execute after the sequential fallback.
+#[test]
+fn delegated_balance_drain_makes_following_tx_invalid() {
+    let drain_target = target_x();
+    // PUSH20 B; SELFDESTRUCT
+    let mut raw_code = vec![0x73];
+    raw_code.extend_from_slice(authority_b().as_slice());
+    raw_code.push(0xff);
+    let drain_code = Bytecode::new_raw(raw_code.into());
+    let db = db_with_delegate_target(drain_target, drain_code);
+
+    let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = delegate_and_call_tx(10, authority_a(), drain_target, 0);
+    txs[11] = authority_tx(authority_a(), 1, authority_b());
+    // Keep an independent transaction immediately after the invalid one to prove execution
+    // resumes and the block suffix is retained.
+    txs[12] = padding_tx(12);
+
+    let outcomes = execute_skip_outcomes(db, txs);
+    assert_eq!(outcomes.len(), BLOCK_SIZE);
+    assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(_)));
+    assert_eq!(outcomes[11], TxExecutionOutcome::Skipped(SkipReason::InsufficientFunds));
+    assert!(matches!(outcomes[12], TxExecutionOutcome::Executed(_)));
 }
 
 /// Positive control: a single delegation followed by a CALL. Exercises the whole 7702

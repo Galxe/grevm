@@ -44,7 +44,6 @@ and asserts both the per-transaction results and the final bundle state match.
 | `GREVM_MIN_PARALLEL_TXS` | `64` | Blocks with fewer transactions fall back to sequential. Set to `0` to force the parallel path even for tiny blocks (needed when replaying small real blocks). |
 | `GREVM_FALLBACK_SEQUENTIAL` | `false` | Force sequential execution for every block. |
 | `GREVM_CONCURRENT_LEVEL` | number of CPU cores | Worker/partition count for parallel execution. |
-| `ASYNC_COMMIT_STATE` | `true` | Asynchronously bundle execution results during parallel execution. |
 | `GREVM_MAINNET_BLOCKS` | `test_data/mainnet_blocks` | Directory the mainnet replay test reads single-block fixtures from. |
 | `GREVM_CONTINUOUS_BLOCKS` | `test_data/con_eth_blocks` | Directory the `continuous` bench reads merged "big block" fixtures from. |
 

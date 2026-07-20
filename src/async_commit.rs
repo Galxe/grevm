@@ -5,7 +5,7 @@ use revm_context::{
 };
 use revm_primitives::{Address, hardfork::SpecId};
 
-use crate::{GrevmError, ParallelState, TxId};
+use crate::{GrevmError, ParallelState, TxExecutionOutcome, TxId};
 use std::{cell::UnsafeCell, cmp::Ordering};
 
 /// Only constructible within the commit thread's scope (or sequential fallback).
@@ -42,7 +42,7 @@ where
     spec: SpecId,
     /// Block base fee per gas — the burned portion that does not reach the coinbase post-LONDON.
     basefee: u64,
-    results: Vec<ExecutionResult>,
+    results: Vec<TxExecutionOutcome>,
     guard: CommitGuard<'a, DB>,
     commit_result: Result<(), GrevmError<DB::Error>>,
     disable_nonce_check: bool,
@@ -113,7 +113,7 @@ where
         }
     }
 
-    pub(crate) fn take_result(&mut self) -> Vec<ExecutionResult> {
+    pub(crate) fn take_result(&mut self) -> Vec<TxExecutionOutcome> {
         std::mem::take(&mut self.results)
     }
 
@@ -121,57 +121,58 @@ where
         &self.commit_result
     }
 
-    pub(crate) fn commit(&mut self, txid: TxId, tx_env: &TxEnv, result_and_state: ResultAndState) {
+    pub(crate) fn commit(
+        &mut self,
+        txid: TxId,
+        tx_env: &TxEnv,
+        result_and_state: ResultAndState,
+    ) -> bool {
         // During Grevm's execution, transaction nonces are temporarily set to `None` to bypass the
         // EVM's strict sequential nonce verification. This design enables concurrent transaction
         // processing without immediate validation failures. However, during the final commitment
         // phase, the system enforces strict nonce monotonicity checks to guarantee transaction
         // integrity and prevent double-spending attacks.
         let ResultAndState { result, state } = result_and_state;
+        if !self.disable_nonce_check {
+            match self.state_ref().basic_ref(tx_env.caller) {
+                Ok(info) => {
+                    // A non-existent account has Ethereum's default nonce of zero.
+                    let expect = info.map_or(0, |info| info.nonce);
+                    if tx_env.nonce == u64::MAX && expect == u64::MAX {
+                        self.commit_result = Err(GrevmError {
+                            txid,
+                            error: EVMError::Transaction(
+                                InvalidTransaction::NonceOverflowInTransaction,
+                            ),
+                        });
+                        return false;
+                    }
+                    match tx_env.nonce.cmp(&expect) {
+                        Ordering::Greater => {
+                            // Do not finalize the speculative nonce verdict here. Leave this
+                            // transaction out of `results` so sequential fallback starts at this
+                            // exact transaction and validates it again against committed state.
+                            return true;
+                        }
+                        Ordering::Less => {
+                            // See the nonce-too-high branch above: fallback owns the final outcome.
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    self.commit_result = Err(GrevmError { txid, error: EVMError::Database(e) });
+                    return false;
+                }
+            }
+        }
         // Self-compute the miner reward: upstream revm credits the coinbase inside execution, which
         // grevm suppresses with a custom `Handler` (see `scheduler::NoRewardHandler`) and applies
         // here instead. This reproduces what the dropped `Galxe/revm` fork returned via
         // `ResultAndState.lazy_reward`.
         let reward = self.compute_reward(tx_env, &result);
-        if !self.disable_nonce_check {
-            match self.state_ref().basic_ref(tx_env.caller) {
-                Ok(info) => {
-                    if let Some(info) = info {
-                        let expect = info.nonce;
-                        match tx_env.nonce.cmp(&expect) {
-                            Ordering::Greater => {
-                                self.commit_result = Err(GrevmError {
-                                    txid,
-                                    error: EVMError::Transaction(
-                                        InvalidTransaction::NonceTooHigh {
-                                            tx: tx_env.nonce,
-                                            state: expect,
-                                        },
-                                    ),
-                                });
-                            }
-                            Ordering::Less => {
-                                self.commit_result = Err(GrevmError {
-                                    txid,
-                                    error: EVMError::Transaction(InvalidTransaction::NonceTooLow {
-                                        tx: tx_env.nonce,
-                                        state: expect,
-                                    }),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.commit_result = Err(GrevmError { txid, error: EVMError::Database(e) })
-                }
-            }
-        }
-        self.results.push(result);
-        if self.commit_result.is_err() {
-            return;
-        }
+        self.results.push(TxExecutionOutcome::Executed(result));
         self.state_mut().commit(state);
 
         // In Ethereum, each transaction includes a miner reward, which would introduce write
@@ -182,7 +183,10 @@ where
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
         let coinbase = self.coinbase;
-        assert!(self.state_mut().increment_balances(vec![(coinbase, reward)]).is_ok());
+        if let Err(error) = self.state_mut().increment_balances(vec![(coinbase, reward)]) {
+            self.commit_result = Err(GrevmError { txid, error: EVMError::Database(error) });
+        }
+        false
     }
 }
 
@@ -190,13 +194,50 @@ where
 mod tests {
     use super::*;
     use revm_context::{
+        DBErrorMarker,
         either::Either,
         result::{Output, SuccessReason},
         transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization},
     };
     use revm_database::EmptyDB;
     use revm_primitives::{Address, B256, Bytes, HashMap, U256};
-    use revm_state::{Account, AccountInfo, AccountStatus, EvmStorage};
+    use revm_state::{Account, AccountInfo, AccountStatus, Bytecode, EvmStorage};
+    use std::fmt::{Display, Formatter};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TestDbError;
+
+    impl Display for TestDbError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("test database error")
+        }
+    }
+
+    impl core::error::Error for TestDbError {}
+    impl DBErrorMarker for TestDbError {}
+
+    #[derive(Clone, Debug, Default)]
+    struct FailingDb;
+
+    impl DatabaseRef for FailingDb {
+        type Error = TestDbError;
+
+        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Err(TestDbError)
+        }
+
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Err(TestDbError)
+        }
+
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Err(TestDbError)
+        }
+
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Err(TestDbError)
+        }
+    }
 
     fn make_account_info(nonce: u64) -> AccountInfo {
         AccountInfo {
@@ -350,5 +391,78 @@ mod tests {
             true,
         );
         assert_eq!(post.compute_reward(&tx_env, &result), (100u128 - 10) * gas_used as u128);
+    }
+
+    #[test]
+    fn reward_database_error_is_recorded_as_commit_error() {
+        let caller = Address::from([0xCA; 20]);
+        let coinbase = Address::from([0xCB; 20]);
+        let state = ParallelState::new(FailingDb, true, false);
+        // Committing the transaction itself must not access the failing database. Only the missing
+        // coinbase account should fail when the deferred reward is applied.
+        state.insert_account(caller, make_account_info(0));
+        let state_cell = UnsafeCell::new(state);
+        let mut commit =
+            StateAsyncCommit::new(coinbase, SpecId::PRAGUE, 0, CommitGuard::new(&state_cell), true);
+        let tx_env = TxEnv { caller, gas_price: 1, gas_limit: 21_000, ..Default::default() };
+
+        commit.commit(7, &tx_env, make_result_and_state(caller, 1));
+
+        let error = commit.commit_result().as_ref().expect_err("reward DB error must be returned");
+        assert_eq!(error.txid, 7);
+        assert!(matches!(error.error, EVMError::Database(TestDbError)));
+    }
+
+    #[test]
+    fn nonce_mismatch_is_left_uncommitted_for_sequential_revalidation() {
+        let caller = Address::from([0xCC; 20]);
+        let state = ParallelState::new(EmptyDB::default(), true, false);
+        let state_cell = UnsafeCell::new(state);
+        let mut commit = StateAsyncCommit::new(
+            Address::ZERO,
+            SpecId::PRAGUE,
+            0,
+            CommitGuard::new(&state_cell),
+            false,
+        );
+        commit.init().expect("init");
+        let tx_env = TxEnv { caller, nonce: 1, ..Default::default() };
+
+        let fallback = commit.commit(0, &tx_env, make_result_and_state(caller, 1));
+
+        assert!(fallback, "nonce-too-high sender must request sequential fallback");
+        assert!(commit.commit_result().is_ok());
+        assert!(
+            commit.take_result().is_empty(),
+            "the mismatched transaction must be revalidated by sequential fallback"
+        );
+    }
+
+    #[test]
+    fn max_nonce_is_rejected_as_overflow() {
+        let caller = Address::from([0xCD; 20]);
+        let state = ParallelState::new(EmptyDB::default(), true, false);
+        state.insert_account(caller, make_account_info(u64::MAX));
+        let state_cell = UnsafeCell::new(state);
+        let mut commit = StateAsyncCommit::new(
+            Address::ZERO,
+            SpecId::PRAGUE,
+            0,
+            CommitGuard::new(&state_cell),
+            false,
+        );
+        commit.init().expect("init");
+        let tx_env = TxEnv { caller, nonce: u64::MAX, ..Default::default() };
+
+        let fallback = commit.commit(9, &tx_env, make_result_and_state(caller, u64::MAX));
+
+        assert!(!fallback, "nonce overflow is fatal, not a recoverable skip");
+        let error = commit.commit_result().as_ref().expect_err("nonce overflow must be returned");
+        assert_eq!(error.txid, 9);
+        assert!(matches!(
+            error.error,
+            EVMError::Transaction(InvalidTransaction::NonceOverflowInTransaction)
+        ));
+        assert!(commit.take_result().is_empty(), "overflow transaction must not be committed");
     }
 }
