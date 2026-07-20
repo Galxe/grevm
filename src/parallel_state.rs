@@ -7,7 +7,7 @@ use revm_database::{
     TransitionAccount, TransitionState,
     states::{CacheAccount, bundle_state::BundleRetention, plain_account::PlainStorage},
 };
-use revm_primitives::{Address, B256, U256};
+use revm_primitives::{Address, B256, HashMap, U256};
 use revm_state::{Account, AccountInfo, Bytecode, EvmState};
 use std::{fmt::Formatter, time::Instant, vec::Vec};
 
@@ -152,6 +152,39 @@ impl CacheAccountInfo {
         }
     }
 
+    /// Account got touched and before EIP161 state clear this account is considered created.
+    pub fn touch_create_pre_eip161(
+        &mut self,
+        storage: StorageWithOriginalValues,
+    ) -> (Option<TransitionAccount>, PlainStorage) {
+        let previous_status = self.status.clone();
+
+        let had_no_info = self.account.as_ref().map(|info| info.is_empty()).unwrap_or_default();
+        match self.status.on_touched_created_pre_eip161(had_no_info) {
+            None => return (None, PlainStorage::default()),
+            Some(new_status) => {
+                self.status = new_status;
+            }
+        }
+
+        let plain_storage = storage.iter().map(|(k, v)| (*k, v.present_value)).collect();
+        let previous_info = self.account.take();
+
+        self.account = Some(AccountInfo::default());
+
+        (
+            Some(TransitionAccount {
+                info: Some(AccountInfo::default()),
+                status: self.status.clone(),
+                previous_info,
+                previous_status,
+                storage,
+                storage_was_destroyed: false,
+            }),
+            plain_storage,
+        )
+    }
+
     pub fn change(
         &mut self,
         new: AccountInfo,
@@ -186,7 +219,7 @@ impl CacheAccountInfo {
 /// It loads all accounts from database and applies revm output to it.
 ///
 /// It generates transitions that is used to build BundleState.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ParallelCacheState {
     /// Cached accounts
     pub accounts: DashMap<Address, CacheAccountInfo>,
@@ -194,17 +227,30 @@ pub struct ParallelCacheState {
     pub storage: DashMap<Address, DashMap<U256, U256>>,
     /// Cache contracts
     pub contracts: DashMap<B256, Bytecode>,
+    /// Has EIP-161 state clear enabled (Spurious Dragon hardfork).
+    pub has_state_clear: bool,
+}
+
+impl Default for ParallelCacheState {
+    fn default() -> Self {
+        Self::new(true)
+    }
 }
 
 impl ParallelCacheState {
     /// New default state.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(has_state_clear: bool) -> Self {
+        Self {
+            accounts: Default::default(),
+            storage: Default::default(),
+            contracts: Default::default(),
+            has_state_clear,
+        }
     }
 
     /// Copy the cached data and convert to CacheState
     pub fn as_cache_state(&self) -> CacheState {
-        let mut state = CacheState::new();
+        let mut state = CacheState::new(self.has_state_clear);
         for kv in self.accounts.iter() {
             let info = kv.value();
             state.accounts.insert(
@@ -235,6 +281,11 @@ impl ParallelCacheState {
             }
         }
         state
+    }
+
+    /// Set state clear flag. EIP-161.
+    pub fn set_state_clear_flag(&mut self, has_state_clear: bool) {
+        self.has_state_clear = has_state_clear;
     }
 
     /// Insert not existing account.
@@ -325,12 +376,19 @@ impl ParallelCacheState {
             // Account is touched, but not selfdestructed or newly created.
             // Account can be touched and not changed.
             // And when empty account is touched it needs to be removed from database.
-            // EIP-161 state clear (revm v40+ dropped pre-EIP161 support; Spurious Dragon
-            // is always assumed active).
+            // EIP-161 state clear
             else if is_empty {
                 self.storage.remove(&address);
-                drop(changed_storage);
-                (self.get_account_mut(address).touch_empty_eip161(), None)
+                if self.has_state_clear {
+                    // touch empty account.
+                    (self.get_account_mut(address).touch_empty_eip161(), None)
+                } else {
+                    // if account is empty and state clear is not enabled we should save
+                    // empty account.
+                    let (transition, changed_slots) =
+                        self.get_account_mut(address).touch_create_pre_eip161(changed_storage);
+                    (transition, Some(changed_slots))
+                }
             } else {
                 let (transition, changed_slots) =
                     self.get_account_mut(address).change(account.info, changed_storage);
@@ -533,10 +591,9 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     }
 
     /// State clear EIP-161 is enabled in Spurious Dragon hardfork.
-    ///
-    /// revm v40+ dropped pre-EIP161 support and always assumes Spurious Dragon is active;
-    /// this setter is kept as a no-op for API compatibility with older callers.
-    pub fn set_state_clear_flag(&mut self, _has_state_clear: bool) {}
+    pub fn set_state_clear_flag(&mut self, has_state_clear: bool) {
+        self.cache.set_state_clear_flag(has_state_clear);
+    }
 
     /// Insert non-existent account
     pub fn insert_not_existing(&self, address: Address) {
@@ -738,7 +795,7 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelState<DB> {
 }
 
 impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
-    fn commit(&mut self, evm_state: revm_primitives::AddressMap<Account>) {
+    fn commit(&mut self, evm_state: HashMap<Address, Account>) {
         let transitions = self.cache.apply_evm_state(evm_state);
         self.apply_transition(transitions);
     }
