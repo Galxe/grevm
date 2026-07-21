@@ -1,7 +1,7 @@
 use revm::{Database, DatabaseCommit, DatabaseRef};
 use revm_context::{
     Transaction, TxEnv,
-    result::{EVMError, ExecutionResult, InvalidTransaction, ResultAndState},
+    result::{EVMError, ExecutionResult, ResultAndState},
 };
 use revm_primitives::{Address, hardfork::SpecId};
 
@@ -139,13 +139,9 @@ where
                     // A non-existent account has Ethereum's default nonce of zero.
                     let expect = info.map_or(0, |info| info.nonce);
                     if tx_env.nonce == u64::MAX && expect == u64::MAX {
-                        self.commit_result = Err(GrevmError {
-                            txid,
-                            error: EVMError::Transaction(
-                                InvalidTransaction::NonceOverflowInTransaction,
-                            ),
-                        });
-                        return false;
+                        // Leave the speculative result uncommitted and let sequential execution
+                        // classify the nonce overflow as an invalid transaction skip.
+                        return true;
                     }
                     match tx_env.nonce.cmp(&expect) {
                         Ordering::Greater => {
@@ -439,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn max_nonce_is_rejected_as_overflow() {
+    fn max_nonce_requests_sequential_fallback() {
         let caller = Address::from([0xCD; 20]);
         let state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(u64::MAX));
@@ -456,13 +452,8 @@ mod tests {
 
         let fallback = commit.commit(9, &tx_env, make_result_and_state(caller, u64::MAX));
 
-        assert!(!fallback, "nonce overflow is fatal, not a recoverable skip");
-        let error = commit.commit_result().as_ref().expect_err("nonce overflow must be returned");
-        assert_eq!(error.txid, 9);
-        assert!(matches!(
-            error.error,
-            EVMError::Transaction(InvalidTransaction::NonceOverflowInTransaction)
-        ));
+        assert!(fallback, "nonce overflow must be revalidated by sequential fallback");
+        assert!(commit.commit_result().is_ok());
         assert!(commit.take_result().is_empty(), "overflow transaction must not be committed");
     }
 }

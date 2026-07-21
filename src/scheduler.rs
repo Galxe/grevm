@@ -1,6 +1,6 @@
 use crate::{
     AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType,
-    MIN_PARALLEL_TXS, MemoryEntry, ParallelState, ReadVersion, SkipReason, Task, TransactionResult,
+    MIN_PARALLEL_TXS, MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult,
     TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
     async_commit::{CommitGuard, StateAsyncCommit},
     hint::ParallelExecutionHints,
@@ -590,8 +590,8 @@ where
         });
         {
             let mut commiter = commiter.lock();
-            // Return fatal commit errors. Recoverable nonce errors request sequential fallback
-            // without populating `commit_result`.
+            // Return fatal commit errors. Transaction-validation issues discovered while
+            // committing request sequential fallback without populating `commit_result`.
             if let Err(e) = commiter.commit_result() {
                 return Err(e.clone());
             }
@@ -701,23 +701,43 @@ where
                 evm.precompiles_mut().apply_precompile(&address, move |_| Some(precompile_clone));
             }
             for txid in num_commit..self.block_size {
+                let tx = &self.txs[txid];
+                if !self.cfg.disable_nonce_check && tx.nonce == u64::MAX {
+                    let state_nonce = match evm.db_mut().basic_ref(tx.caller) {
+                        Ok(info) => info.map_or(0, |info| info.nonce),
+                        Err(error) => {
+                            return Err(GrevmError { txid, error: EVMError::Database(error) });
+                        }
+                    };
+                    if state_nonce == u64::MAX {
+                        let error = crate::InvalidTransaction::NonceOverflowInTransaction;
+                        tracing::warn!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "skipping invalid transaction during sequential fallback",
+                        );
+                        sequential_results.push(TxExecutionOutcome::Skipped(error));
+                        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 let result_and_state = match evm.transact_raw(self.txs[txid].clone()) {
                     Ok(result_and_state) => result_and_state,
-                    Err(error) => {
-                        if let Some(reason) = SkipReason::from_evm_error(&error) {
-                            sequential_results.push(TxExecutionOutcome::Skipped(reason));
-                            tracing::warn!(
-                                target: "grevm::scheduler",
-                                block_number = %self.env.number,
-                                txid,
-                                ?reason,
-                                "skipping invalid transaction during sequential fallback",
-                            );
-                            self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        return Err(GrevmError { txid, error: error.clone() });
+                    Err(EVMError::Transaction(error)) => {
+                        tracing::warn!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "skipping invalid transaction during sequential fallback",
+                        );
+                        sequential_results.push(TxExecutionOutcome::Skipped(error));
+                        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
+                    Err(error) => return Err(GrevmError { txid, error }),
                 };
 
                 evm.db_mut().commit(result_and_state.state);
@@ -850,7 +870,7 @@ where
                 });
             }
             Err(e) => {
-                let recoverable = SkipReason::from_evm_error(&e).is_some();
+                let invalid_transaction = matches!(e, EVMError::Transaction(_));
                 conflict = true;
                 self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
                 self.metrics.conflict_by_error.fetch_add(1, Ordering::Relaxed);
@@ -867,7 +887,7 @@ where
                     execute_result: Err(e),
                 });
                 if commit_idx == txid {
-                    if recoverable {
+                    if invalid_transaction {
                         self.abort(AbortReason::FallbackSequential);
                     } else {
                         self.abort(AbortReason::FatalEvmError(txid));
@@ -1145,7 +1165,9 @@ mod tests {
         );
         // Model one already committed transaction. Fallback must preserve this prefix and start
         // from tx 1 against its committed post-state.
-        scheduler.results.lock().push(TxExecutionOutcome::Skipped(SkipReason::NonceTooLow));
+        scheduler.results.lock().push(TxExecutionOutcome::Skipped(
+            crate::InvalidTransaction::NonceTooLow { tx: 0, state: 1 },
+        ));
         scheduler.abort(AbortReason::ParallelError {
             txid: 1,
             message: "test parallel invariant failure",

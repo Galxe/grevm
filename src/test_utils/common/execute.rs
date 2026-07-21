@@ -1,7 +1,7 @@
 use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
-use crate::{ParallelState, ParallelTakeBundle, Scheduler, SkipReason, TxExecutionOutcome};
+use crate::{ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome};
 use revm::{
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext,
     precompile::{PrecompileSpecId, Precompiles},
@@ -149,8 +149,8 @@ pub fn compare_evm_execute_with_spec<DB>(
     }
 }
 
-/// Compare Grevm against an independent, strictly ordered revm execution that skips only the
-/// explicitly supported recoverable transaction errors.
+/// Compare Grevm against an independent, strictly ordered revm execution that skips every
+/// transaction-validation error.
 ///
 /// Both per-transaction outcomes and the complete post-block bundle state are compared. This is
 /// the reference path for testing Grevm's sequential fallback with blocks that intentionally
@@ -302,10 +302,10 @@ where
 }
 
 /// Execute every transaction strictly in block order, committing successful EVM executions and
-/// treating only known recoverable transaction-validation errors as state-free skips.
+/// treating every transaction-validation error as a state-free skip.
 ///
-/// Unknown transaction errors, database errors, custom errors, and header errors remain fatal so
-/// this reference cannot accidentally hide a consensus or database failure.
+/// Database errors, custom errors, and header errors remain fatal so this reference cannot
+/// accidentally hide a consensus or database failure.
 pub fn execute_revm_sequential_skipping_invalid<DB>(
     db: DB,
     cfg: CfgEnv,
@@ -317,6 +317,7 @@ where
     DB::Error: Send + Sync + Debug + 'static,
 {
     let spec = cfg.spec;
+    let disable_nonce_check = cfg.disable_nonce_check;
     let db = StateBuilder::new().with_bundle_update().with_database_ref(db).build();
     let evm = Context::mainnet()
         .with_db(db)
@@ -330,15 +331,27 @@ where
 
     let mut outcomes = Vec::with_capacity(txs.len());
     for tx in txs {
+        if !disable_nonce_check && tx.nonce == u64::MAX {
+            let state_nonce = match evm.db_mut().basic_ref(tx.caller) {
+                Ok(info) => info.map_or(0, |info| info.nonce),
+                Err(error) => return Err(EVMError::Database(error)),
+            };
+            if state_nonce == u64::MAX {
+                outcomes.push(TxExecutionOutcome::Skipped(
+                    crate::InvalidTransaction::NonceOverflowInTransaction,
+                ));
+                continue;
+            }
+        }
         match evm.transact_raw(tx.clone()) {
             Ok(result_and_state) => {
                 evm.db_mut().commit(result_and_state.state);
                 outcomes.push(TxExecutionOutcome::Executed(result_and_state.result));
             }
-            Err(error) => match SkipReason::from_evm_error(&error) {
-                Some(reason) => outcomes.push(TxExecutionOutcome::Skipped(reason)),
-                None => return Err(error),
-            },
+            Err(EVMError::Transaction(error)) => {
+                outcomes.push(TxExecutionOutcome::Skipped(error));
+            }
+            Err(error) => return Err(error),
         }
     }
     evm.db_mut().merge_transitions(BundleRetention::Reverts);

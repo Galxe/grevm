@@ -1,16 +1,13 @@
 #![allow(missing_docs)]
 
 use grevm::{
-    ParallelState, Scheduler, SkipReason, TxExecutionOutcome,
+    InvalidTransaction, ParallelState, Scheduler, TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
     },
 };
-use revm_context::{
-    BlockEnv, CfgEnv, TxEnv,
-    result::{EVMError, InvalidTransaction},
-};
+use revm_context::{BlockEnv, CfgEnv, TxEnv};
 use revm_primitives::{HashMap, TxKind, U256, hardfork::SpecId};
 use revm_state::Bytecode;
 use std::sync::Arc;
@@ -70,7 +67,10 @@ fn nonce_error_falls_back_and_skips_without_incrementing_nonce() {
     let outcomes = execute_outcomes(txs);
     assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
     assert!(matches!(outcomes[0], TxExecutionOutcome::Executed(_)));
-    assert_eq!(outcomes[1], TxExecutionOutcome::Skipped(SkipReason::NonceTooLow));
+    assert!(matches!(
+        outcomes[1],
+        TxExecutionOutcome::Skipped(InvalidTransaction::NonceTooLow { .. })
+    ));
     assert!(matches!(outcomes[2], TxExecutionOutcome::Executed(_)));
 }
 
@@ -91,8 +91,14 @@ fn consecutive_nonce_errors_are_revalidated_and_suffix_executes() {
 
     let outcomes = execute_outcomes(txs);
     assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
-    assert_eq!(outcomes[0], TxExecutionOutcome::Skipped(SkipReason::NonceTooHigh));
-    assert_eq!(outcomes[1], TxExecutionOutcome::Skipped(SkipReason::NonceTooLow));
+    assert!(matches!(
+        outcomes[0],
+        TxExecutionOutcome::Skipped(InvalidTransaction::NonceTooHigh { .. })
+    ));
+    assert!(matches!(
+        outcomes[1],
+        TxExecutionOutcome::Skipped(InvalidTransaction::NonceTooLow { .. })
+    ));
     assert!(matches!(outcomes[2], TxExecutionOutcome::Executed(_)));
 }
 
@@ -114,12 +120,12 @@ fn sender_with_code_is_skipped_and_suffix_executes() {
 
     let outcomes = execute_outcomes_with_db(db, txs);
     assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
-    assert_eq!(outcomes[0], TxExecutionOutcome::Skipped(SkipReason::SenderNotEoa));
+    assert_eq!(outcomes[0], TxExecutionOutcome::Skipped(InvalidTransaction::RejectCallerWithCode));
     assert!(matches!(outcomes[1], TxExecutionOutcome::Executed(_)));
 }
 
 #[test]
-fn nonrecoverable_invalid_transaction_remains_fatal() {
+fn intrinsic_gas_error_falls_back_and_continues_suffix() {
     let accounts = account::mock_block_accounts(MIN_PARALLEL_BLOCK_SIZE + 1);
     let db = Arc::new(InMemoryDB::new(accounts, Default::default(), Default::default()));
     let mut invalid = independent_transfer(0);
@@ -136,15 +142,76 @@ fn nonrecoverable_invalid_transaction_remains_fatal() {
         false,
         None,
     );
-    let error = scheduler
-        .parallel_execute(Some(23))
-        .expect_err("nonrecoverable invalid transaction must abort the block");
+    scheduler.parallel_execute(Some(23)).expect("transaction validation errors must be skipped");
+    let (outcomes, _) = scheduler.take_result_and_state();
 
-    assert_eq!(error.txid, 0);
+    assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
     assert!(matches!(
-        error.error,
-        EVMError::Transaction(InvalidTransaction::CallGasCostMoreThanGasLimit { .. })
+        outcomes[0],
+        TxExecutionOutcome::Skipped(InvalidTransaction::CallGasCostMoreThanGasLimit { .. })
     ));
+    assert!(matches!(outcomes[1], TxExecutionOutcome::Executed(_)));
+}
+
+#[test]
+fn basefee_error_falls_back_and_continues_suffix() {
+    let accounts = account::mock_block_accounts(MIN_PARALLEL_BLOCK_SIZE + 1);
+    let db = Arc::new(InMemoryDB::new(accounts, Default::default(), Default::default()));
+    let mut txs: Vec<_> = (0..MIN_PARALLEL_BLOCK_SIZE).map(independent_transfer).collect();
+    for tx in &mut txs {
+        tx.gas_price = 100;
+    }
+    txs[0].gas_price = 50;
+
+    let state = ParallelState::new(db, true, false);
+    let mut env = BlockEnv::default();
+    env.basefee = 100;
+    let scheduler = Scheduler::new(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        env,
+        Arc::new(txs),
+        state,
+        false,
+        None,
+    );
+    scheduler.parallel_execute(Some(23)).expect("basefee-invalid transaction must be skipped");
+    let (outcomes, _) = scheduler.take_result_and_state();
+
+    assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
+    assert_eq!(
+        outcomes[0],
+        TxExecutionOutcome::Skipped(InvalidTransaction::GasPriceLessThanBasefee)
+    );
+    assert!(matches!(outcomes[1], TxExecutionOutcome::Executed(_)));
+}
+
+#[test]
+fn nonce_overflow_from_parallel_commit_falls_back_and_continues_suffix() {
+    let sender = account::mock_eoa_address(0);
+    let mut accounts = account::mock_block_accounts(MIN_PARALLEL_BLOCK_SIZE + 1);
+    accounts.get_mut(&sender).expect("sender account must exist").info.nonce = u64::MAX;
+    let db = Arc::new(InMemoryDB::new(accounts, Default::default(), Default::default()));
+    let mut txs: Vec<_> = (0..MIN_PARALLEL_BLOCK_SIZE).map(independent_transfer).collect();
+    txs[0].nonce = u64::MAX;
+
+    let state = ParallelState::new(db, true, false);
+    let scheduler = Scheduler::new(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        BlockEnv::default(),
+        Arc::new(txs),
+        state,
+        false,
+        None,
+    );
+    scheduler.parallel_execute(Some(23)).expect("nonce overflow must be skipped");
+    let (outcomes, _) = scheduler.take_result_and_state();
+
+    assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
+    assert_eq!(
+        outcomes[0],
+        TxExecutionOutcome::Skipped(InvalidTransaction::NonceOverflowInTransaction)
+    );
+    assert!(matches!(outcomes[1], TxExecutionOutcome::Executed(_)));
 }
 
 #[test]
@@ -167,7 +234,10 @@ fn insufficient_funds_falls_back_and_continues_suffix() {
 
     let outcomes = execute_outcomes(txs);
     assert_eq!(outcomes.len(), MIN_PARALLEL_BLOCK_SIZE);
-    assert_eq!(outcomes[1], TxExecutionOutcome::Skipped(SkipReason::InsufficientFunds));
+    assert!(matches!(
+        outcomes[1],
+        TxExecutionOutcome::Skipped(InvalidTransaction::LackOfFundForMaxFee { .. })
+    ));
     assert!(matches!(outcomes[2], TxExecutionOutcome::Executed(_)));
 }
 

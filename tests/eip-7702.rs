@@ -31,7 +31,7 @@
 //!   authority balance; its otherwise valid follow-up transaction is skipped
 
 use grevm::{
-    SkipReason, TxExecutionOutcome,
+    InvalidTransaction, TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -255,7 +255,10 @@ fn delegated_create_makes_following_nonce_invalid() {
     let outcomes = execute_skip_outcomes(db, txs);
     assert_eq!(outcomes.len(), BLOCK_SIZE);
     assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(_)));
-    assert_eq!(outcomes[11], TxExecutionOutcome::Skipped(SkipReason::NonceTooLow));
+    assert!(matches!(
+        outcomes[11],
+        TxExecutionOutcome::Skipped(InvalidTransaction::NonceTooLow { .. })
+    ));
     assert!(matches!(outcomes[12], TxExecutionOutcome::Executed(_)));
 }
 
@@ -283,7 +286,10 @@ fn delegated_balance_drain_makes_following_tx_invalid() {
     let outcomes = execute_skip_outcomes(db, txs);
     assert_eq!(outcomes.len(), BLOCK_SIZE);
     assert!(matches!(outcomes[10], TxExecutionOutcome::Executed(_)));
-    assert_eq!(outcomes[11], TxExecutionOutcome::Skipped(SkipReason::InsufficientFunds));
+    assert!(matches!(
+        outcomes[11],
+        TxExecutionOutcome::Skipped(InvalidTransaction::LackOfFundForMaxFee { .. })
+    ));
     assert!(matches!(outcomes[12], TxExecutionOutcome::Executed(_)));
 }
 

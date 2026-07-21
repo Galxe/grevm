@@ -43,8 +43,8 @@ where
     let (results, mut state) = scheduler.take_result_and_state();
     let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
 
-    // `results`: one outcome per transaction, in order. Recoverable invalid transactions are
-    // represented as `Skipped` and do not modify state or consume gas.
+    // `results`: one outcome per transaction, in order. Transaction-validation errors are
+    // returned as `Skipped(InvalidTransaction)` and do not modify state or consume gas.
     for outcome in &results {
         match outcome {
             TxExecutionOutcome::Executed(result) => {
@@ -90,7 +90,7 @@ impl<DB> ParallelState<DB> {
 
 Public items re-exported from the crate root include `Scheduler`, `ParallelState`,
 `ParallelCacheState`, `ParallelBundleState`, `ParallelTakeBundle`, `TxExecutionOutcome`,
-`SkipReason`, `GrevmError`, and `fork_join_util`.
+`InvalidTransaction`, `GrevmError`, and `fork_join_util`.
 
 Execution is tuned by a few environment variables (`GREVM_MIN_PARALLEL_TXS`,
 `GREVM_FALLBACK_SEQUENTIAL`, `GREVM_CONCURRENT_LEVEL`). See
