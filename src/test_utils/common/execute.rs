@@ -1,7 +1,10 @@
 use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
-use crate::{ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome};
+use crate::{
+    DelegatedSafetyConfig, GrevmConfig, ParallelState, ParallelTakeBundle, Scheduler,
+    TxExecutionOutcome,
+};
 use revm::{
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext,
     precompile::{PrecompileSpecId, Precompiles},
@@ -45,6 +48,15 @@ fn metrics_snapshotter() -> Option<&'static Snapshotter> {
         .as_ref()
 }
 
+/// Runtime configuration for revm-compatibility tests.
+///
+/// These tests use upstream revm as their oracle, so grevm-local delegated-account policies must
+/// stay disabled even if their defaults change later. Other scheduler settings still come from
+/// the environment for compatibility with the existing test and benchmark controls.
+fn revm_compatibility_config() -> GrevmConfig {
+    GrevmConfig::from_env().with_delegated_safety(DelegatedSafetyConfig::disabled())
+}
+
 pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert!(
         left.contracts.keys().all(|k| right.contracts.contains_key(k)),
@@ -64,9 +76,7 @@ pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     let right_state: BTreeMap<&Address, &BundleAccount> = right.state.iter().collect();
     assert_eq!(left_state.len(), right_state.len());
 
-    for ((addr1, account1), (addr2, account2)) in
-        left_state.into_iter().zip(right_state.into_iter())
-    {
+    for ((addr1, account1), (addr2, account2)) in left_state.into_iter().zip(right_state) {
         assert_eq!(addr1, addr2);
         assert_eq!(account1.info, account2.info, "Address: {:?}", addr1);
         assert_eq!(account1.original_info, account2.original_info, "Address: {:?}", addr1);
@@ -74,7 +84,7 @@ pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
         assert_eq!(account1.storage.len(), account2.storage.len());
         let left_storage: BTreeMap<&U256, &StorageSlot> = account1.storage.iter().collect();
         let right_storage: BTreeMap<&U256, &StorageSlot> = account2.storage.iter().collect();
-        for (s1, s2) in left_storage.into_iter().zip(right_storage.into_iter()) {
+        for (s1, s2) in left_storage.into_iter().zip(right_storage) {
             assert_eq!(s1, s2, "Address: {:?}", addr1);
         }
     }
@@ -95,7 +105,7 @@ pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
     assert_eq!(left.reverts_size, right.reverts_size, "reverts_size mismatch");
 }
 
-pub fn compare_execution_result(left: &Vec<ExecutionResult>, right: &Vec<TxExecutionOutcome>) {
+pub fn compare_execution_result(left: &[ExecutionResult], right: &[TxExecutionOutcome]) {
     for (i, (left_res, right_res)) in left.iter().zip(right.iter()).enumerate() {
         let TxExecutionOutcome::Executed(right_res) = right_res else {
             panic!("valid reference transaction {i} was unexpectedly skipped: {right_res:?}");
@@ -138,8 +148,7 @@ pub fn compare_evm_execute_with_spec<DB>(
     DB: DatabaseRef + Send + Sync + Debug,
     DB::Error: Send + Sync + Clone + Debug + 'static,
 {
-    let mut env = BlockEnv::default();
-    env.beneficiary = super::account::MINER_ADDRESS;
+    let env = BlockEnv { beneficiary: super::account::MINER_ADDRESS, ..Default::default() };
     let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.disable_nonce_check = disable_nonce_check;
     // Synthetic blocks are constructed to always execute, so a sequential failure is itself a bug.
@@ -168,15 +177,22 @@ where
     let db = Arc::new(db);
     let txs = Arc::new(txs);
     let cfg = CfgEnv::new_with_spec(spec);
-    let mut env = BlockEnv::default();
-    env.beneficiary = super::account::MINER_ADDRESS;
+    let env = BlockEnv { beneficiary: super::account::MINER_ADDRESS, ..Default::default() };
 
     let (expected_outcomes, expected_bundle) =
         execute_revm_sequential_skipping_invalid(db.clone(), cfg.clone(), env.clone(), &txs)
             .unwrap_or_else(|error| panic!("sequential skip reference failed: {error:?}"));
 
     let state = ParallelState::new(db, true, true);
-    let scheduler = Scheduler::new(cfg, env, txs, state, with_hints, None);
+    let scheduler = Scheduler::new_with_config(
+        cfg,
+        env,
+        txs,
+        state,
+        with_hints,
+        None,
+        revm_compatibility_config(),
+    );
     scheduler.parallel_execute(Some(23)).expect("parallel execute failed");
     let (actual_outcomes, mut state) = scheduler.take_result_and_state();
     let actual_bundle = state.parallel_take_bundle(BundleRetention::Reverts);
@@ -225,7 +241,7 @@ where
     // 1) Sequential reference FIRST — if it errors, the inputs are unreplayable (not a grevm
     //    issue). Timed: the DB is already in memory, so this is pure execution, no I/O.
     let start = Instant::now();
-    let reth_result = match execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &*txs) {
+    let reth_result = match execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &txs) {
         Ok(result) => result,
         Err(e) => return ReplayOutcome::SequentialFailed(format!("{e:?}")),
     };
@@ -241,7 +257,15 @@ where
 
     let start = Instant::now();
     let state = ParallelState::new(db.clone(), true, true);
-    let executor = Scheduler::new(cfg.clone(), env.clone(), txs.clone(), state, with_hints, None);
+    let executor = Scheduler::new_with_config(
+        cfg.clone(),
+        env.clone(),
+        txs.clone(),
+        state,
+        with_hints,
+        None,
+        revm_compatibility_config(),
+    );
     // set determined partitions
     executor.parallel_execute(Some(23)).expect("parallel execute failed");
     let parallel = start.elapsed();

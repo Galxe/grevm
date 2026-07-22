@@ -29,10 +29,18 @@ This builds and runs:
 | `tests/native_transfers.rs` | raw value-transfer workloads (independent / chained / hybrid) |
 | `tests/uniswap.rs` | Uniswap swap workloads |
 | `tests/eip-7702.rs` | synthetic EIP-7702 scenarios: delegate / re-delegate / reset / multi-authority; storage preservation when an already-delegated EOA with storage is re-delegated (the block-22546209 bug); and interaction with `CREATE`/`CREATE2` and `SELFDESTRUCT` |
+| `tests/delegated_safety.rs` | opt-in delegated CREATE/CREATE2 and reserve-balance policy matrix; ordinary CREATE/CREATE2 compatibility, ample/exact/insufficient reserve boundaries, first-debit balance protection, authorization-refund preservation, rollback, SELFDESTRUCT, and a coordinated stale speculative read that must be invalidated and re-executed before matching sequential execution |
 | `tests/mainnet.rs` | replays real mainnet blocks from fixtures (skips if none present) |
 
-Every integration test compares **Grevm parallel execution against a sequential revm reference**
-and asserts both the per-transaction results and the final bundle state match.
+Compatibility integration tests compare **Grevm parallel execution against a sequential revm
+reference** and assert both per-transaction results and final bundle state. The grevm-specific
+delegated-safety tests use explicit expected outcomes; their combined policy matrix also compares
+parallel execution against Grevm's forced-sequential path.
+
+The shared revm-compatibility helpers explicitly use `DelegatedSafetyConfig::disabled()`: mainnet
+replay and upstream EIP-7702 regression tests therefore remain pure grevm-vs-revm equivalence
+checks even if the policy defaults change. Policy-enabled behavior is tested separately in
+`tests/delegated_safety.rs`.
 
 > Plain `cargo test` (without `--features test-utils`) only builds the library; the integration
 > tests and benches require the feature.
@@ -50,6 +58,11 @@ and asserts both the per-transaction results and the final bundle state match.
 Benchmark-only tuning (read by `benches/gigagas.rs`): `NUM_EOA` (default `100000`), `HOT_RATIO`
 (`0.0`), `DB_LATENCY_US` (`0`), `WITH_HINTS` (`false`), `DEPENDENCY_RATIO` (`0.1`),
 `DEPENDENCY_DISTANCE` (`8`), `FILTER` (substring filter for which sub-benchmarks to run).
+
+These execution knobs are represented by `GrevmConfig` together with
+`DelegatedSafetyConfig`. `Scheduler::new(...)` calls `GrevmConfig::from_env()` for compatibility;
+production integrations can use `Scheduler::new_with_config(...)` and `Scheduler::execute()` to
+avoid process-global environment reads and make the block execution policy explicit.
 
 ## Replaying real mainnet blocks
 
@@ -79,6 +92,10 @@ This writes `test_data/mainnet_blocks/<block>/{block,txs,pre_state}.json`.
 ```bash
 # Replay every single-block fixture under test_data/mainnet_blocks/
 GREVM_MIN_PARALLEL_TXS=0 cargo test --features test-utils --test mainnet replay_mainnet_blocks
+
+# Replay every hardfork-boundary fixture under test_data/spec_coverage/
+GREVM_MIN_PARALLEL_TXS=0 GREVM_MAINNET_BLOCKS=test_data/spec_coverage \
+  cargo test --features test-utils --test mainnet replay_mainnet_blocks
 
 # Replay just one block
 GREVM_MIN_PARALLEL_TXS=0 GREVM_MAINNET_BLOCK=25323281 \
@@ -204,6 +221,7 @@ gracefully.
 ```
 test_data/
 ├── mainnet_blocks/<block>/{block,txs,pre_state}.json        # single real blocks (fetch_block)
+├── spec_coverage/<block>/{block,txs,pre_state}.json         # hardfork-boundary regression set
 └── con_eth_blocks/<start>_<end>/{block,txs,pre_state}.json   # merged big blocks (fetch_continuous)
 ```
 

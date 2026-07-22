@@ -10,7 +10,7 @@ autobins = false
 
 [dependencies]
 # Upstream revm v29.0.1 (no fork). The miner reward is skipped during parallel execution via a
-# custom `Handler` (see `scheduler::NoRewardHandler`) and self-computed at commit time, so the
+# `GrevmHandler` in deferred-beneficiary mode and self-computed at commit time, so the
 # previous `Galxe/revm` fork (which only added a `lazy_reward` cfg flag + `ResultAndState` field)
 # is no longer needed.
 revm = { version = "29.0.1", default-features = false }

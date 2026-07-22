@@ -1,4 +1,4 @@
-use crate::{LocationAndType, TxId, fork_join_util, tx_dependency::TxDependency};
+use crate::{LocationAndType, TxId, tx_dependency::TxDependency, utils::fork_join_util};
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use revm::primitives::{
     Address, B256, Bytes, TxKind, U256, alloy_primitives::U160, keccak256, ruint::UintTryFrom,
@@ -12,13 +12,13 @@ use std::{cell::UnsafeCell, cmp::max, sync::Arc};
 /// and methods for updating transaction states based on contract interactions.
 #[allow(dead_code)]
 enum ContractType {
-    UNKNOWN,
+    Unknown,
     ERC20,
 }
 
 /// Represents different types of contracts. Currently, only ERC20 is supported.
 enum ERC20Function {
-    UNKNOWN,
+    Unknown,
     Allowance,
     Approve,
     BalanceOf,
@@ -46,7 +46,7 @@ impl From<u32> for ERC20Function {
             0x18160ddd => ERC20Function::TotalSupply,
             0xa9059cbb => ERC20Function::Transfer,
             0x23b872dd => ERC20Function::TransferFrom,
-            _ => ERC20Function::UNKNOWN,
+            _ => ERC20Function::Unknown,
         }
     }
 }
@@ -220,7 +220,7 @@ impl ParallelExecutionHints {
         if code.is_none() && data.is_empty() {
             return false;
         }
-        if data.len() < 4 || (data.len() - 4) % 32 != 0 {
+        if data.len() < 4 || !(data.len() - 4).is_multiple_of(32) {
             // Invalid tx, or tx that triggers fallback CALL
             return false;
         }
@@ -277,7 +277,7 @@ impl ParallelExecutionHints {
                     return false;
                 }
             },
-            ContractType::UNKNOWN => {
+            ContractType::Unknown => {
                 return false;
             }
         }
@@ -291,11 +291,11 @@ impl ParallelExecutionHints {
         if data.len() >= 4 {
             let func_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
             match ERC20Function::from(func_id) {
-                ERC20Function::UNKNOWN => ContractType::UNKNOWN,
+                ERC20Function::Unknown => ContractType::Unknown,
                 _ => ContractType::ERC20,
             }
         } else {
-            ContractType::UNKNOWN
+            ContractType::Unknown
         }
     }
 

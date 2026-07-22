@@ -22,6 +22,9 @@ pub type Bytecodes = HashMap<B256, Bytecode>;
 /// Mapping from block numbers to block hashes
 pub type BlockHashes = HashMap<u64, B256>;
 
+pub type Cluster =
+    (HashMap<Address, PlainAccount>, HashMap<B256, Bytecode>, Vec<Address>, Vec<Address>);
+
 // TODO: Better randomness control. Sometimes we want duplicates to test
 // dependent transactions, sometimes we want to guarantee non-duplicates
 // for independent benchmarks.
@@ -133,10 +136,7 @@ pub fn generate_erc20_batch(
 }
 
 /// Return a tuple of (state, bytecodes, eoa_addresses, sca_addresses)
-pub fn generate_cluster(
-    num_eoa: usize,
-    num_sca: usize,
-) -> (HashMap<Address, PlainAccount>, HashMap<B256, Bytecode>, Vec<Address>, Vec<Address>) {
+pub fn generate_cluster(num_eoa: usize, num_sca: usize) -> Cluster {
     let mut state = HashMap::default();
     let eoa_addresses: Vec<Address> = generate_addresses(num_eoa);
 
@@ -189,7 +189,7 @@ pub fn generate_contract_accounts(
         let gld_address = Address::new(rand::random());
         let mut gld_account =
             ERC20Token::new("Gold Token", "GLD", 18, 222_222_000_000_000_000_000_000u128)
-                .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
+                .add_balances(eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
                 .build();
         bytecodes.insert(gld_account.info.code_hash, gld_account.info.code.take().unwrap());
         accounts.push((gld_address, gld_account));

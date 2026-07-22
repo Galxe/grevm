@@ -1,310 +1,41 @@
+mod context;
+mod executor;
+mod fallback;
+mod metrics;
+#[cfg(test)]
+mod tests;
+
 use crate::{
-    AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType,
-    MIN_PARALLEL_TXS, MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult,
-    TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
+    AbortReason, GrevmConfig, GrevmError, LocationAndType, MVMemory, ParallelState, ReadVersion,
+    Task, TransactionResult, TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
     async_commit::{CommitGuard, StateAsyncCommit},
+    cache_db::CacheDB,
+    delegated_safety::{DelegatedSafetyConfig, ReservePlanner},
     hint::ParallelExecutionHints,
-    storage::CacheDB,
     tx_dependency::TxDependency,
-    utils::ContinuousDetectSet,
 };
+use ::metrics::histogram;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use alloy_evm::{
-    EthEvm, Evm,
-    precompiles::{DynPrecompile, PrecompilesMap},
-};
-use dashmap::DashMap;
-use metrics::histogram;
-use metrics_derive::Metrics;
+use alloy_evm::precompiles::DynPrecompile;
+use context::SchedulerContext;
+use executor::{GrevmExecutor, ParallelTransactionExecutor};
+use metrics::ExecuteMetricsCollector;
 use parking_lot::Mutex;
-use revm::{
-    Context, DatabaseCommit, DatabaseRef, ExecuteEvm, MainBuilder, MainContext,
-    context::Evm as RevmEvm,
-    handler::{
-        EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, instructions::EthInstructions,
-    },
-    interpreter::{interpreter::EthInterpreter, interpreter_action::FrameInit},
-    precompile::{PrecompileSpecId, Precompiles},
-};
-use revm_context::{
-    BlockEnv, CfgEnv, ContextSetters, ContextTr, JournalTr, TxEnv,
-    result::{EVMError, HaltReason, ResultAndState},
-};
-use revm_inspector::NoOpInspector;
+use revm::DatabaseRef;
+use revm_context::{BlockEnv, CfgEnv, TxEnv, result::EVMError};
 use revm_primitives::Address;
-use revm_state::EvmState;
 
 use std::{
     cell::UnsafeCell,
     cmp::max,
-    collections::BTreeMap,
     fmt::Debug,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Instant,
 };
-
-pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
-
-/// The mainnet EVM context grevm executes against on the parallel path (an `EthEvm`-shaped stack).
-type GrevmCtx<'a, DB> = Context<BlockEnv, TxEnv, CfgEnv, CacheDB<'a, ParallelState<DB>>>;
-
-/// The raw revm EVM, unwrapped from alloy's `EthEvm`, so we can drive a custom [`Handler`] that
-/// skips the miner reward during execution.
-type GrevmEvm<'a, DB> = RevmEvm<
-    GrevmCtx<'a, DB>,
-    NoOpInspector,
-    EthInstructions<EthInterpreter, GrevmCtx<'a, DB>>,
-    PrecompilesMap,
-    EthFrame,
->;
-
-/// A mainnet [`Handler`] that suppresses the beneficiary (miner) reward. Instead of crediting the
-/// coinbase inside transaction execution — which would make every transaction read & write the
-/// coinbase account and thus conflict — grevm defers the reward and applies it at commit time (see
-/// [`crate::async_commit::StateAsyncCommit::compute_reward`]). This mirrors revm's `MainnetHandler`
-/// with only `reward_beneficiary` overridden to a no-op, and replaces the old `Galxe/revm` fork's
-/// `cfg.lazy_reward` flag so grevm can build against upstream revm.
-struct NoRewardHandler<EVM, ERROR, FRAME> {
-    _phantom: core::marker::PhantomData<(EVM, ERROR, FRAME)>,
-}
-
-impl<EVM, ERROR, FRAME> Default for NoRewardHandler<EVM, ERROR, FRAME> {
-    fn default() -> Self {
-        Self { _phantom: core::marker::PhantomData }
-    }
-}
-
-impl<EVM, ERROR, FRAME> Handler for NoRewardHandler<EVM, ERROR, FRAME>
-where
-    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState>>, Frame = FRAME>,
-    ERROR: EvmTrError<EVM>,
-    FRAME: FrameTr<FrameResult = FrameResult, FrameInit = FrameInit>,
-{
-    type Evm = EVM;
-    type Error = ERROR;
-    type HaltReason = HaltReason;
-
-    /// Skip the miner reward; grevm applies it lazily at commit time.
-    fn reward_beneficiary(
-        &self,
-        _evm: &mut Self::Evm,
-        _exec_result: &mut FrameResult,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-#[derive(Metrics)]
-#[metrics(scope = "grevm")]
-struct ExecuteMetrics {
-    /// Total number of transactions
-    total_tx_cnt: metrics::Histogram,
-    /// Number of conflict incarnations
-    conflict_cnt: metrics::Histogram,
-    /// Number of validation incarnations
-    validation_cnt: metrics::Histogram,
-    /// Number of execution incarnations
-    execution_cnt: metrics::Histogram,
-    /// Number of validation reset
-    reset_validation_idx_cnt: metrics::Histogram,
-    /// Number of useless dependency update
-    useless_dependent_update: metrics::Histogram,
-
-    /// Number of conflict by miner&self-destruct
-    conflict_by_miner: metrics::Histogram,
-    /// Number of conflict by evm error
-    conflict_by_error: metrics::Histogram,
-    /// Number of conflict by estimate
-    conflict_by_estimate: metrics::Histogram,
-    /// Number of conflict by version
-    conflict_by_version: metrics::Histogram,
-    /// Number of transactions whose incarnation == 1
-    one_attempt_with_dependency: metrics::Histogram,
-    /// Number of transactions whose incarnation > 2
-    more_attempts_with_dependency: metrics::Histogram,
-    /// Number of transactions without dependency
-    no_dependency_txs: metrics::Histogram,
-    /// Number of conflict transactions
-    conflict_txs: metrics::Histogram,
-    /// Executition time(nanosecond)
-    execution_time: metrics::Histogram,
-    /// Commit time(nanosecond)
-    commit_time: metrics::Histogram,
-    /// Total time(nanosecond)
-    total_time: metrics::Histogram,
-}
-
-#[derive(Default)]
-struct ExecuteMetricsCollector {
-    total_tx_cnt: AtomicUsize,
-    conflict_cnt: AtomicUsize,
-    validation_cnt: AtomicUsize,
-    execution_cnt: AtomicUsize,
-    reset_validation_idx_cnt: AtomicUsize,
-    useless_dependent_update: AtomicUsize,
-
-    conflict_by_miner: AtomicUsize,
-    conflict_by_error: AtomicUsize,
-    conflict_by_estimate: AtomicUsize,
-    conflict_by_version: AtomicUsize,
-    one_attempt_with_dependency: AtomicUsize,
-    more_attempts_with_dependency: AtomicUsize,
-    no_dependency_txs: AtomicUsize,
-    conflict_txs: AtomicUsize,
-    execution_time: AtomicUsize,
-    commit_time: AtomicUsize,
-    total_time: AtomicUsize,
-}
-
-impl ExecuteMetricsCollector {
-    fn report(&self) {
-        let execute_metrics = ExecuteMetrics::default();
-        execute_metrics.total_tx_cnt.record(self.total_tx_cnt.load(Ordering::Relaxed) as f64);
-        execute_metrics.conflict_cnt.record(self.conflict_cnt.load(Ordering::Relaxed) as f64);
-        execute_metrics.validation_cnt.record(self.validation_cnt.load(Ordering::Relaxed) as f64);
-        execute_metrics.execution_cnt.record(self.execution_cnt.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .reset_validation_idx_cnt
-            .record(self.reset_validation_idx_cnt.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .useless_dependent_update
-            .record(self.useless_dependent_update.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .conflict_by_miner
-            .record(self.conflict_by_miner.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .conflict_by_error
-            .record(self.conflict_by_error.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .conflict_by_estimate
-            .record(self.conflict_by_estimate.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .conflict_by_version
-            .record(self.conflict_by_version.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .one_attempt_with_dependency
-            .record(self.one_attempt_with_dependency.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .more_attempts_with_dependency
-            .record(self.more_attempts_with_dependency.load(Ordering::Relaxed) as f64);
-        execute_metrics
-            .no_dependency_txs
-            .record(self.no_dependency_txs.load(Ordering::Relaxed) as f64);
-        execute_metrics.conflict_txs.record(self.conflict_txs.load(Ordering::Relaxed) as f64);
-        let execution_time = self.execution_time.load(Ordering::Relaxed);
-        if execution_time > 0 {
-            execute_metrics.execution_time.record(execution_time as f64);
-        }
-        execute_metrics.commit_time.record(self.commit_time.load(Ordering::Relaxed) as f64);
-        execute_metrics.total_time.record(self.total_time.load(Ordering::Relaxed) as f64);
-    }
-}
-
-/// The `SchedulerContext` provides the execution context for transaction scheduling. The
-/// `validation_idx` parameter serves as the validation cursor, mirroring its functionality in
-/// Block-STM. Unlike Block-STM, Grevm eliminates the execution cursor and instead employs
-/// `TxDependency` to drive transaction execution. Since transaction execution order is determined
-/// by the DAG rather than sequential numbering, Grevm utilizes the `ContinuousDetectSet` to monitor
-/// consecutively executed transactions. Compared to Block-STM where `validation_idx` can be
-/// reached when executing, this approach enables validation right aflter execution while
-/// significantly reducing the number of validation tasks through the ContinuousDetectSet mechanism.
-struct SchedulerContext {
-    num_txs: usize,
-    validation_idx: AtomicUsize,
-    finality_idx: AtomicUsize,
-    commit_idx: AtomicUsize,
-    executed_set: ContinuousDetectSet,
-    reset_validation_idx_cnt: AtomicUsize,
-
-    // To implement asynchronous transaction commitment (`StateAsyncCommit`), Grevm must handle
-    // complex scenarios like: tx2/tx4 being unconfirmed while tx3 enters conflict state and
-    // requires re-execution (rolling back to `validation_idx`=3). Under high concurrency, if tx3
-    // re-enters unconfirmed state before tx4 begins validation, tx4 might get incorrectly
-    // committed. While locking would be the naive solution, extensive optimization attempts
-    // revealed that even minimal critical sections cause unacceptable
-    // performance degradation(reference: https://github.com/Galxe/grevm/issues/64).
-    // Grevm instead employs logical timestamps to verify transaction availability in unconfirmed
-    // states, maintaining lock-free execution while ensuring correctness.
-    logical_ts: AtomicUsize,
-    lower_ts: Vec<AtomicUsize>,
-    unconfirmed_ts: Vec<AtomicUsize>,
-}
-
-impl SchedulerContext {
-    fn new(num_txs: usize) -> Self {
-        Self {
-            num_txs,
-            validation_idx: AtomicUsize::new(0),
-            finality_idx: AtomicUsize::new(0),
-            commit_idx: AtomicUsize::new(0),
-            executed_set: ContinuousDetectSet::new(num_txs),
-            reset_validation_idx_cnt: AtomicUsize::new(0),
-            logical_ts: AtomicUsize::new(1),
-            lower_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
-            unconfirmed_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
-        }
-    }
-
-    fn reset_validation_idx(&self, index: usize) {
-        if index < self.num_txs {
-            let ts = self.logical_ts.fetch_add(1, Ordering::AcqRel);
-            // Rolling back the `validation_idx` implies that the commitment time of subsequent
-            // transactions must be logically later than the current timestamp.
-            self.lower_ts[index].fetch_max(ts, Ordering::AcqRel);
-            let prev = self.validation_idx.fetch_min(index, Ordering::AcqRel);
-            if prev > index {
-                self.reset_validation_idx_cnt.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-    }
-
-    fn logical_timestamp(&self) -> usize {
-        self.logical_ts.fetch_add(1, Ordering::AcqRel)
-    }
-
-    fn executed(&self, index: usize) {
-        self.executed_set.add(index);
-    }
-
-    fn unconfirmed(&self, index: usize, ts: usize) {
-        self.unconfirmed_ts[index].fetch_max(ts, Ordering::AcqRel);
-    }
-
-    fn finished(&self) -> bool {
-        self.finality_idx.load(Ordering::Acquire) >= self.num_txs
-    }
-
-    fn finality_idx(&self) -> usize {
-        self.finality_idx.load(Ordering::Acquire)
-    }
-
-    fn validation_idx(&self) -> usize {
-        self.validation_idx.load(Ordering::Acquire)
-    }
-
-    fn should_schedule(&self, executing_idx: usize) -> bool {
-        let validation_idx = self.validation_idx.load(Ordering::Acquire);
-        let should_validation =
-            validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx();
-        let should_execution = executing_idx < self.num_txs;
-        should_validation || should_execution
-    }
-
-    fn next_validation_idx(&self, executing_idx: usize) -> Option<usize> {
-        let validation_idx = self.validation_idx.load(Ordering::Acquire);
-        if validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx() {
-            let validation_idx = self.validation_idx.fetch_add(1, Ordering::AcqRel);
-            if validation_idx < self.num_txs {
-                return Some(validation_idx);
-            }
-        }
-        None
-    }
-}
 
 /// The `Scheduler` struct is responsible for managing the parallel execution of transactions
 /// in a block. It coordinates the execution, validation, and finalization of transactions
@@ -330,6 +61,8 @@ where
     mv_memory: MVMemory,
     scheduler_ctx: SchedulerContext,
     custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>,
+    config: GrevmConfig,
+    reserve_planner: Option<Arc<ReservePlanner>>,
 
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason<DB::Error>>,
@@ -370,12 +103,74 @@ where
         with_hints: bool,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
     ) -> Self {
+        Self::new_with_config(
+            cfg,
+            env,
+            txs,
+            state,
+            with_hints,
+            custom_precompiles,
+            GrevmConfig::from_env(),
+        )
+    }
+
+    /// Create a scheduler with an explicit, block-scoped runtime configuration.
+    pub fn new_with_config(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        with_hints: bool,
+        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        config: GrevmConfig,
+    ) -> Self {
+        assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
+        Self::build(cfg, env, txs, state, with_hints, custom_precompiles, config)
+    }
+
+    /// Compatibility constructor for callers that only override delegated-account safety.
+    #[deprecated(note = "use Scheduler::new_with_config and GrevmConfig")]
+    pub fn new_with_delegated_safety(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        with_hints: bool,
+        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        delegated_safety: DelegatedSafetyConfig,
+    ) -> Self {
+        Self::new_with_config(
+            cfg,
+            env,
+            txs,
+            state,
+            with_hints,
+            custom_precompiles,
+            GrevmConfig::from_env().with_delegated_safety(delegated_safety),
+        )
+    }
+
+    fn build(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        with_hints: bool,
+        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        config: GrevmConfig,
+    ) -> Self {
         let num_txs = txs.len();
         let tx_dependency = if with_hints {
             ParallelExecutionHints::new(txs.clone()).parse_hints()
         } else {
             TxDependency::new(num_txs)
         };
+        // Construction is O(1): sender indexing and per-account maximum-cost suffixes remain lazy
+        // until surviving delegated execution actually debits an account.
+        let reserve_planner = config
+            .delegated_safety
+            .reserve_delegated_balance
+            .then(|| Arc::new(ReservePlanner::new(txs.clone())));
         Self {
             cfg,
             env,
@@ -389,6 +184,8 @@ where
             mv_memory: MVMemory::new(),
             scheduler_ctx: SchedulerContext::new(num_txs),
             custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
+            config,
+            reserve_planner,
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             metrics: ExecuteMetricsCollector::default(),
@@ -510,18 +307,24 @@ where
         (self.results.into_inner(), self.state.into_inner())
     }
 
-    /// Paralle execution
+    /// Execute using the scheduler's unified runtime configuration.
+    pub fn execute(&self) -> Result<(), GrevmError<DB::Error>> {
+        self.parallel_execute(None)
+    }
+
+    /// Execute with an optional per-call concurrency override.
+    ///
+    /// New integrations should configure [`GrevmConfig::concurrency_level`] and call
+    /// [`Self::execute`].
     pub fn parallel_execute(
         &self,
         concurrency_level: Option<usize>,
     ) -> Result<(), GrevmError<DB::Error>> {
         let start_time = Instant::now();
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
-        let concurrency_level = concurrency_level.unwrap_or(
-            std::env::var("GREVM_CONCURRENT_LEVEL")
-                .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap_or(*CONCURRENT_LEVEL)),
-        );
-        if *FALLBACK_SEQUENTIAL || self.block_size < *MIN_PARALLEL_TXS {
+        let concurrency_level = concurrency_level.unwrap_or(self.config.concurrency_level);
+        assert!(concurrency_level > 0, "grevm concurrency level must be greater than zero");
+        if self.config.force_sequential || self.block_size < self.config.min_parallel_txs {
             return self.fallback_sequential();
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
@@ -558,33 +361,15 @@ where
                     // the nonce against committed state; a mismatch leaves the transaction
                     // uncommitted and triggers sequential revalidation from that transaction.
                     cfg.disable_nonce_check = true;
-                    // Build the raw revm EVM (not wrapped in `EthEvm`) so we can drive a custom
-                    // `Handler` that skips the miner reward — the reward is deferred and applied at
-                    // commit time (see `async_commit`).
-                    let mut evm = Context::mainnet()
-                        .with_db(cache_db)
-                        .with_cfg(cfg)
-                        .with_block(self.env.clone())
-                        .build_mainnet_with_inspector(NoOpInspector {})
-                        .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-                            PrecompileSpecId::from_spec_id(self.cfg.spec),
-                        )));
-                    // Apply additional precompiles if provided
-                    for (address, precompile) in self.custom_precompiles.iter() {
-                        let precompile_clone = precompile.clone();
-                        evm.precompiles.apply_precompile(&address, move |_| Some(precompile_clone));
-                    }
-
-                    let mut task = self.next();
-                    while let Some(current_task) = task {
-                        task = match current_task {
-                            Task::Execution(tx_version) => self.execute(&mut evm, tx_version),
-                            Task::Validation(tx_version) => self.validate(tx_version),
-                        };
-                        if task.is_none() && !self.abort.load(Ordering::Acquire) {
-                            task = self.next();
-                        }
-                    }
+                    let mut executor = GrevmExecutor::new(
+                        cache_db,
+                        cfg,
+                        self.env.clone(),
+                        self.custom_precompiles.as_ref(),
+                        self.config.delegated_safety,
+                        self.reserve_planner.clone(),
+                    );
+                    self.run_worker(&mut executor);
                 });
             }
         });
@@ -659,96 +444,6 @@ where
         Ok(())
     }
 
-    fn fallback_after_parallel_error(
-        &self,
-        txid: TxId,
-        message: &str,
-    ) -> Result<(), GrevmError<DB::Error>> {
-        tracing::error!(
-            target: "grevm::scheduler",
-            block_number = %self.env.number,
-            txid,
-            reason = message,
-            "parallel execution invariant failed; falling back to sequential execution",
-        );
-        self.fallback_sequential()
-    }
-
-    /// Fallback to sequential execution
-    pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
-        let mut results = self.results.lock();
-        let num_commit = results.len();
-        if num_commit == self.block_size {
-            return Ok(());
-        }
-
-        let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
-        let mut commit_guard = CommitGuard::new(&self.state);
-        let state_mut = commit_guard.state_mut();
-        {
-            let evm = Context::mainnet()
-                .with_db(state_mut)
-                .with_cfg(self.cfg.clone())
-                .with_block(self.env.clone())
-                .build_mainnet_with_inspector(NoOpInspector {})
-                .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-                    PrecompileSpecId::from_spec_id(self.cfg.spec),
-                )));
-            let mut evm = EthEvm::new(evm, false);
-            // Apply additional precompiles if provided
-            for (address, precompile) in self.custom_precompiles.iter() {
-                let precompile_clone = precompile.clone();
-                evm.precompiles_mut().apply_precompile(&address, move |_| Some(precompile_clone));
-            }
-            for txid in num_commit..self.block_size {
-                let tx = &self.txs[txid];
-                if !self.cfg.disable_nonce_check && tx.nonce == u64::MAX {
-                    let state_nonce = match evm.db_mut().basic_ref(tx.caller) {
-                        Ok(info) => info.map_or(0, |info| info.nonce),
-                        Err(error) => {
-                            return Err(GrevmError { txid, error: EVMError::Database(error) });
-                        }
-                    };
-                    if state_nonce == u64::MAX {
-                        let error = crate::InvalidTransaction::NonceOverflowInTransaction;
-                        tracing::warn!(
-                            target: "grevm::scheduler",
-                            block_number = %self.env.number,
-                            txid,
-                            ?error,
-                            "skipping invalid transaction during sequential fallback",
-                        );
-                        sequential_results.push(TxExecutionOutcome::Skipped(error));
-                        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                }
-                let result_and_state = match evm.transact_raw(self.txs[txid].clone()) {
-                    Ok(result_and_state) => result_and_state,
-                    Err(EVMError::Transaction(error)) => {
-                        tracing::warn!(
-                            target: "grevm::scheduler",
-                            block_number = %self.env.number,
-                            txid,
-                            ?error,
-                            "skipping invalid transaction during sequential fallback",
-                        );
-                        sequential_results.push(TxExecutionOutcome::Skipped(error));
-                        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    Err(error) => return Err(GrevmError { txid, error }),
-                };
-
-                evm.db_mut().commit(result_and_state.state);
-                sequential_results.push(TxExecutionOutcome::Executed(result_and_state.result));
-                self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        results.extend(sequential_results);
-        Ok(())
-    }
-
     fn abort(&self, abort_reason: AbortReason<DB::Error>) {
         self.abort_reason.get_or_init(|| abort_reason);
         self.abort.store(true, Ordering::Release);
@@ -760,8 +455,31 @@ where
     /// - ​Unconfirmed Miner/Self-Destruct Accounts: The transaction interacts with miner rewards or
     ///   self-destructed accounts before their committing transaction is finalized (txid ≠
     ///   commit_idx)
-    fn execute(&self, evm: &mut GrevmEvm<'_, DB>, tx_version: TxVersion) -> Option<Task> {
-        let TxVersion { txid, incarnation } = tx_version;
+    fn run_worker<'db>(&self, executor: &mut impl ParallelTransactionExecutor<'db, DB>)
+    where
+        DB: 'db,
+    {
+        let mut task = self.next();
+        while let Some(current_task) = task {
+            task = match current_task {
+                Task::Execution(version) => self.execute_task(executor, version),
+                Task::Validation(version) => self.validate(version),
+            };
+            if task.is_none() && !self.abort.load(Ordering::Acquire) {
+                task = self.next();
+            }
+        }
+    }
+
+    fn execute_task<'db>(
+        &self,
+        executor: &mut impl ParallelTransactionExecutor<'db, DB>,
+        tx_version: TxVersion,
+    ) -> Option<Task>
+    where
+        DB: 'db,
+    {
+        let TxVersion { txid, incarnation } = tx_version.clone();
         let mut tx_state = self.tx_states[txid].lock();
         if tx_state.status != TransactionStatus::Executing {
             return None;
@@ -775,21 +493,9 @@ where
         }
         self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
 
-        evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         let tx_env = self.txs[txid].clone();
         let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
-        // Execute with the miner reward suppressed (see `NoRewardHandler`); the reward is applied
-        // later in `async_commit`. This replicates revm's `ExecuteEvm::transact` (set tx → run
-        // handler → finalize) but with our handler instead of the default `MainnetHandler`.
-        //
-        // `finalize` clears the journal and MUST run even when execution errors: this EVM is reused
-        // for the next transaction on the same thread, so a dirty journal left by a failed
-        // (optimistic) tx would corrupt the following one. revm's `transact` finalizes
-        // unconditionally and only then propagates the error — we do the same.
-        evm.ctx.set_tx(tx_env);
-        let output_or_error = NoRewardHandler::default().run(evm);
-        let state = evm.finalize();
-        let result = output_or_error.map(|result| ResultAndState { result, state });
+        let result = executor.transact(tx_version, tx_env);
 
         // The `​write_new_locations` mechanism optimizes validation by intelligently reducing
         // redundant verification tasks. Under standard validation logic, when a conflicted
@@ -805,12 +511,13 @@ where
             Ok(result_and_state) => {
                 // only the miner involved in transaction should accumulate the rewards of finality
                 // txs return true if the tx doesn't visit the miner account
-                let read_accurate_origin = evm.db_mut().read_accurate_origin();
+                let read_accurate_origin = executor.db_mut().read_accurate_origin();
 
-                let blocking_txs = evm.db_mut().take_estimate_txs();
+                let blocking_txs = executor.db_mut().take_estimate_txs();
                 conflict = !read_accurate_origin || !blocking_txs.is_empty();
-                let read_set = evm.db_mut().take_read_set();
-                let write_set = evm.db_mut().update_mv_memory(&result_and_state.state, conflict);
+                let read_set = executor.db_mut().take_read_set();
+                let write_set =
+                    executor.db_mut().update_mv_memory(&result_and_state.state, conflict);
 
                 let mut last_result = self.tx_results[txid].lock();
                 if let Some(last_result) = last_result.as_ref() {
@@ -821,11 +528,10 @@ where
                         }
                     }
                     for location in &last_result.write_set {
-                        if !write_set.contains(location) {
-                            if let Some(mut written_transactions) = self.mv_memory.get_mut(location)
-                            {
-                                written_transactions.remove(&txid);
-                            }
+                        if !write_set.contains(location) &&
+                            let Some(mut written_transactions) = self.mv_memory.get_mut(location)
+                        {
+                            written_transactions.remove(&txid);
                         }
                     }
                 } else {
@@ -996,9 +702,7 @@ where
 
         if conflict {
             // update dependency
-            let dep_tx = dependency.and_then(|dep| {
-                if dep >= self.scheduler_ctx.finality_idx() { Some(dep) } else { None }
-            });
+            let dep_tx = dependency.filter(|&dep| dep >= self.scheduler_ctx.finality_idx());
             self.tx_dependency.add(txid, dep_tx);
         }
         None
@@ -1006,10 +710,10 @@ where
 
     fn mark_estimate(&self, txid: TxId, write_set: &HashSet<LocationAndType>) {
         for location in write_set {
-            if let Some(mut written_transactions) = self.mv_memory.get_mut(location) {
-                if let Some(entry) = written_transactions.get_mut(&txid) {
-                    entry.estimate = true;
-                }
+            if let Some(mut written_transactions) = self.mv_memory.get_mut(location) &&
+                let Some(entry) = written_transactions.get_mut(&txid)
+            {
+                entry.estimate = true;
             }
         }
     }
@@ -1021,18 +725,15 @@ where
     ) -> Option<TxId> {
         let mut max_dep_id = None;
         for location in read_set.keys() {
-            if let Some(written_transactions) = self.mv_memory.get(location) {
-                // To prevent dependency explosion, only add the tx with the highest TxId in
-                // written_transactions
-                if let Some((&dep_id, _)) = written_transactions.range(..txid).next_back() {
-                    if (max_dep_id.is_none() || dep_id > max_dep_id.unwrap()) &&
-                        dep_id >= self.scheduler_ctx.finality_idx()
-                    {
-                        max_dep_id = Some(dep_id);
-                        if dep_id == txid - 1 {
-                            return max_dep_id;
-                        }
-                    }
+            if let Some(written_transactions) = self.mv_memory.get(location) &&
+                let Some((&dep_id, _)) = written_transactions.range(..txid).next_back() &&
+                max_dep_id.is_none_or(|current| dep_id > current) &&
+                dep_id >= self.scheduler_ctx.finality_idx()
+            {
+                // To prevent dependency explosion, keep only the highest preceding transaction.
+                max_dep_id = Some(dep_id);
+                if dep_id == txid - 1 {
+                    return max_dep_id;
                 }
             }
         }
@@ -1074,108 +775,12 @@ where
                 }
             }
 
-            if let Some(execute_id) = self.tx_dependency.next() {
-                if let Some(task) = self.execution_task(execute_id) {
-                    return Some(task);
-                }
+            if let Some(execute_id) = self.tx_dependency.next() &&
+                let Some(task) = self.execution_task(execute_id)
+            {
+                return Some(task);
             }
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use revm_database::EmptyDB;
-    use revm_primitives::{TxKind, U256, hardfork::SpecId};
-    use revm_state::AccountInfo;
-
-    fn empty_scheduler(num_txs: usize) -> Scheduler<EmptyDB> {
-        Scheduler::new(
-            CfgEnv::new_with_spec(SpecId::SHANGHAI),
-            BlockEnv::default(),
-            Arc::new(vec![TxEnv::default(); num_txs]),
-            ParallelState::new(EmptyDB::default(), true, false),
-            false,
-            None,
-        )
-    }
-
-    #[test]
-    fn fatal_execution_abort_uses_recorded_txid_not_finality_idx() {
-        let scheduler = empty_scheduler(3);
-        *scheduler.tx_results[2].lock() = Some(TransactionResult {
-            read_set: Default::default(),
-            write_set: Default::default(),
-            execute_result: Err(EVMError::Custom("fatal execution error".to_owned())),
-        });
-        scheduler.abort(AbortReason::FatalEvmError(2));
-
-        let error = scheduler.post_execute().expect_err("fatal abort must be returned");
-        assert_eq!(scheduler.scheduler_ctx.finality_idx(), 0);
-        assert_eq!(error.txid, 2);
-        assert!(matches!(
-            error.error,
-            EVMError::Custom(message) if message == "fatal execution error"
-        ));
-    }
-
-    #[test]
-    fn commit_abort_carries_error_without_using_tx_results() {
-        let scheduler = empty_scheduler(3);
-        scheduler.abort(AbortReason::CommitError(GrevmError {
-            txid: 1,
-            error: EVMError::Custom("commit error".to_owned()),
-        }));
-
-        let error = scheduler.post_execute().expect_err("commit abort must be returned");
-        assert_eq!(error.txid, 1);
-        assert!(matches!(
-            error.error,
-            EVMError::Custom(message) if message == "commit error"
-        ));
-        assert!(scheduler.tx_results.iter().all(|result| result.lock().is_none()));
-    }
-
-    #[test]
-    fn parallel_error_replays_suffix_from_committed_prefix() {
-        let caller = Address::from([0xCA; 20]);
-        let receiver = Address::from([0xCB; 20]);
-        let state = ParallelState::new(EmptyDB::default(), true, false);
-        state.insert_account(
-            caller,
-            AccountInfo { balance: U256::from(1_000_000), nonce: 1, ..Default::default() },
-        );
-        let suffix_tx = TxEnv {
-            caller,
-            gas_limit: 21_000,
-            kind: TxKind::Call(receiver),
-            value: U256::from(1),
-            nonce: 1,
-            ..Default::default()
-        };
-        let scheduler = Scheduler::new(
-            CfgEnv::new_with_spec(SpecId::SHANGHAI),
-            BlockEnv::default(),
-            Arc::new(vec![TxEnv::default(), suffix_tx]),
-            state,
-            false,
-            None,
-        );
-        // Model one already committed transaction. Fallback must preserve this prefix and start
-        // from tx 1 against its committed post-state.
-        scheduler.results.lock().push(TxExecutionOutcome::Skipped(
-            crate::InvalidTransaction::NonceTooLow { tx: 0, state: 1 },
-        ));
-        scheduler.abort(AbortReason::ParallelError {
-            txid: 1,
-            message: "test parallel invariant failure",
-        });
-
-        scheduler.post_execute().expect("sequential suffix replay must succeed");
-        let results = scheduler.results.lock();
-        assert_eq!(results.len(), 2);
-        assert!(matches!(results[1], TxExecutionOutcome::Executed(_)));
     }
 }

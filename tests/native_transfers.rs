@@ -164,8 +164,7 @@ fn basefee_error_falls_back_and_continues_suffix() {
     txs[0].gas_price = 50;
 
     let state = ParallelState::new(db, true, false);
-    let mut env = BlockEnv::default();
-    env.basefee = 100;
+    let env = BlockEnv { basefee: 100, ..Default::default() };
     let scheduler = Scheduler::new(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         env,

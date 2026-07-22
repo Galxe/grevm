@@ -8,7 +8,7 @@ use revm::{
     bytecode::Bytecode,
     context::TxEnv,
     database::PlainAccount,
-    primitives::{Address, B256, Bytes, HashMap, TxKind, U256, uint},
+    primitives::{Address, B256, HashMap, TxKind, U256, uint},
     state::AccountInfo,
 };
 
@@ -39,14 +39,14 @@ pub fn generate_contract_accounts(
 
     let dai_account = ERC20Token::new("DAI", "DAI", 18, 222_222_000_000_000_000_000_000u128)
         .add_balances(&[pool_address], uint!(111_111_000_000_000_000_000_000_U256))
-        .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
-        .add_allowances(&eoa_addresses, single_swap_address, uint!(1_000_000_000_000_000_000_U256))
+        .add_balances(eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
+        .add_allowances(eoa_addresses, single_swap_address, uint!(1_000_000_000_000_000_000_U256))
         .build();
 
     let usdc_account = ERC20Token::new("USDC", "USDC", 18, 222_222_000_000_000_000_000_000u128)
         .add_balances(&[pool_address], uint!(111_111_000_000_000_000_000_000_U256))
-        .add_balances(&eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
-        .add_allowances(&eoa_addresses, single_swap_address, uint!(1_000_000_000_000_000_000_U256))
+        .add_balances(eoa_addresses, uint!(1_000_000_000_000_000_000_U256))
+        .add_allowances(eoa_addresses, single_swap_address, uint!(1_000_000_000_000_000_000_U256))
         .build();
 
     let factory_account = UniswapV3Factory::new(owner)
@@ -91,14 +91,15 @@ pub fn generate_contract_accounts(
     let single_swap_account =
         SingleSwap::new(swap_router_address, dai_address, usdc_address).build();
 
-    let mut accounts = Vec::new();
-    accounts.push((weth9_address, weth9_account));
-    accounts.push((dai_address, dai_account));
-    accounts.push((usdc_address, usdc_account));
-    accounts.push((factory_address, factory_account));
-    accounts.push((pool_address, pool_account));
-    accounts.push((swap_router_address, swap_router_account));
-    accounts.push((single_swap_address, single_swap_account));
+    let mut accounts = vec![
+        (weth9_address, weth9_account),
+        (dai_address, dai_account),
+        (usdc_address, usdc_account),
+        (factory_address, factory_account),
+        (pool_address, pool_account),
+        (swap_router_address, swap_router_account),
+        (single_swap_address, single_swap_account),
+    ];
 
     let mut bytecodes = revm_primitives::HashMap::default();
     for (_, account) in accounts.iter_mut() {
@@ -155,7 +156,7 @@ pub fn generate_cluster(
                 gas_limit: GAS_LIMIT,
                 gas_price: 0x_b2d0_5e07u128,
                 kind: TxKind::Call(single_swap_address),
-                data: Bytes::from(data_bytes),
+                data: data_bytes,
                 nonce: nonce as u64,
                 ..TxEnv::default()
             })
