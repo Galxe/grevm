@@ -16,7 +16,7 @@ Grevm's public surface is small: build a [`ParallelState`] over any read-only da
 ```rust
 use std::sync::Arc;
 
-use grevm::{ParallelState, ParallelTakeBundle, Scheduler};
+use grevm::{ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome};
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
 use revm_database::states::bundle_state::BundleRetention;
@@ -43,7 +43,18 @@ where
     let (results, mut state) = scheduler.take_result_and_state();
     let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
 
-    // `results`: one `ExecutionResult` per transaction, in order.
+    // `results`: one outcome per transaction, in order. Transaction-validation errors are
+    // returned as `Skipped(InvalidTransaction)` and do not modify state or consume gas.
+    for outcome in &results {
+        match outcome {
+            TxExecutionOutcome::Executed(result) => {
+                let _gas_used = result.gas_used();
+            }
+            TxExecutionOutcome::Skipped(reason) => {
+                eprintln!("transaction skipped: {reason:?}");
+            }
+        }
+    }
     // `bundle`:  the `BundleState` to persist to your database.
     let _ = (results, bundle);
 }
@@ -69,7 +80,7 @@ where
     pub fn parallel_execute(&self, concurrency_level: Option<usize>)
         -> Result<(), GrevmError<DB::Error>>;
 
-    pub fn take_result_and_state(self) -> (Vec<ExecutionResult>, ParallelState<DB>);
+    pub fn take_result_and_state(self) -> (Vec<TxExecutionOutcome>, ParallelState<DB>);
 }
 
 impl<DB> ParallelState<DB> {
@@ -77,11 +88,12 @@ impl<DB> ParallelState<DB> {
 }
 ```
 
-Public items re-exported from the crate root: `Scheduler`, `ParallelState`, `ParallelCacheState`,
-`ParallelBundleState`, `ParallelTakeBundle`, `GrevmError`, `fork_join_util`.
+Public items re-exported from the crate root include `Scheduler`, `ParallelState`,
+`ParallelCacheState`, `ParallelBundleState`, `ParallelTakeBundle`, `TxExecutionOutcome`,
+`InvalidTransaction`, `GrevmError`, and `fork_join_util`.
 
 Execution is tuned by a few environment variables (`GREVM_MIN_PARALLEL_TXS`,
-`GREVM_FALLBACK_SEQUENTIAL`, `GREVM_CONCURRENT_LEVEL`, `ASYNC_COMMIT_STATE`). See
+`GREVM_FALLBACK_SEQUENTIAL`, `GREVM_CONCURRENT_LEVEL`). See
 [Testing & Benchmarking](testing.md#environment-variable-knobs) for the full list and a working
 end-to-end harness (`src/test_utils/common/execute.rs`).
 

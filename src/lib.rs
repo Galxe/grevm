@@ -29,7 +29,8 @@ mod utils;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use lazy_static::lazy_static;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use revm_context::result::{EVMError, ResultAndState};
+pub use revm_context::result::InvalidTransaction;
+use revm_context::result::{EVMError, ExecutionResult, ResultAndState};
 use revm_primitives::{Address, B256, U256};
 use revm_state::{AccountInfo, Bytecode};
 use std::{cmp::min, thread};
@@ -146,12 +147,32 @@ impl Default for Task {
     }
 }
 
-enum AbortReason {
-    EvmError,
+enum AbortReason<DBError> {
+    /// A fatal EVM error produced while executing this transaction. The error itself remains in
+    /// `Scheduler::tx_results`.
+    FatalEvmError(TxId),
+    /// A commit error is not stored in `Scheduler::tx_results`, so the abort reason carries the
+    /// complete error instead of trying to recover it from an execution result.
+    CommitError(GrevmError<DBError>),
+    /// An invariant of the parallel scheduler was violated before the current transaction was
+    /// committed. The committed prefix is still valid, so execution can resume sequentially.
+    ParallelError {
+        txid: TxId,
+        message: &'static str,
+    },
     #[allow(dead_code)]
     SelfDestructed,
-    #[allow(dead_code)]
     FallbackSequential,
+}
+
+/// Final outcome for one transaction in block order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxExecutionOutcome {
+    /// The transaction executed normally, including EVM reverts and halts.
+    Executed(ExecutionResult),
+    /// The transaction was invalid at the committed state and was applied as a no-op. The exact
+    /// revm validation error is forwarded to the consumer for protocol-specific encoding.
+    Skipped(InvalidTransaction),
 }
 
 /// Grevm error type.
