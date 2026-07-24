@@ -67,7 +67,7 @@ fn bench_continuous(c: &mut Criterion) {
         group.bench_function("Origin Sequential", |b| {
             b.iter(|| {
                 let _ =
-                    execute::execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &*txs)
+                    execute::execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &txs)
                         .unwrap();
             })
         });

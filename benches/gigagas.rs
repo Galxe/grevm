@@ -24,15 +24,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut cfg = CfgEnv::new_with_spec(SpecId::SHANGHAI);
     cfg.disable_nonce_check = true;
-    let mut env = BlockEnv::default();
-    env.beneficiary = account::MINER_ADDRESS;
+    let env = BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() };
     let db = Arc::new(db);
     let txs = Arc::new(txs);
 
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
     let mut iter_loop = 0;
     let report_metrics = rand::rng().random_range(0..10);
-    let with_hints = std::env::var("WITH_HINTS").map_or(false, |s| s.parse().unwrap());
+    let with_hints = std::env::var("WITH_HINTS").is_ok_and(|s| s.parse().unwrap());
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
@@ -66,7 +65,7 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
 
     group.bench_function("Origin Sequential", |b| {
         b.iter(|| {
-            let _ = execute::execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &*txs)
+            let _ = execute::execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &txs)
                 .unwrap();
         })
     });
@@ -313,8 +312,8 @@ fn bench_half_chained_erc20(c: &mut Criterion, db_latency_us: u64) {
     let sca = sca[0];
     let eoa_len = eoa.len();
     for i in 0..eoa_len {
-        let addr = eoa[i].clone();
-        let recipient = if i > eoa_len / 2 { eoa[i].clone() } else { eoa[i + 1].clone() };
+        let addr = eoa[i];
+        let recipient = if i > eoa_len / 2 { eoa[i] } else { eoa[i + 1] };
         let tx = TxEnv {
             caller: addr,
             kind: TxKind::Call(sca),
@@ -340,8 +339,8 @@ fn bench_worst_erc20(c: &mut Criterion, db_latency_us: u64) {
     let mut txs = Vec::with_capacity(block_size);
     let sca = sca[0];
     for i in 0..eoa.len() {
-        let addr = eoa[i].clone();
-        let recipient = if i == eoa.len() - 1 { eoa[i].clone() } else { eoa[i + 1].clone() };
+        let addr = eoa[i];
+        let recipient = if i == eoa.len() - 1 { eoa[i] } else { eoa[i + 1] };
         let tx = TxEnv {
             caller: addr,
             kind: TxKind::Call(sca),
@@ -444,7 +443,7 @@ fn bench_worst_uniswap(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, ho
         state.extend(uniswap_contract_accounts);
         bytecodes.extend(uniswap_bytecodes);
         for _ in 0..(block_size / NUM_UNISWAP_CLUSTER) {
-            let data_bytes = if rand::random::<u64>() % 2 == 0 {
+            let data_bytes = if rand::random::<u64>().is_multiple_of(2) {
                 SingleSwap::sell_token0(U256::from(2000))
             } else {
                 SingleSwap::sell_token1(U256::from(2000))
@@ -488,7 +487,7 @@ fn bench_half_chained_uniswap(
         state.extend(uniswap_contract_accounts);
         bytecodes.extend(uniswap_bytecodes);
         for _ in 0..(num_uniswap / NUM_UNISWAP_CLUSTER) {
-            let data_bytes = if rand::random::<u64>() % 2 == 0 {
+            let data_bytes = if rand::random::<u64>().is_multiple_of(2) {
                 SingleSwap::sell_token0(U256::from(2000))
             } else {
                 SingleSwap::sell_token1(U256::from(2000))
@@ -562,7 +561,7 @@ fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio
             txs.push(tx);
         }
     }
-    state.extend(erc20_contract_accounts.into_iter());
+    state.extend(erc20_contract_accounts);
 
     let mut bytecodes = erc20_bytecodes;
     const NUM_UNISWAP_CLUSTER: usize = 2;
@@ -572,7 +571,7 @@ fn bench_hybrid(c: &mut Criterion, db_latency_us: u64, num_eoa: usize, hot_ratio
         state.extend(uniswap_contract_accounts);
         bytecodes.extend(uniswap_bytecodes);
         for _ in 0..(num_uniswap / NUM_UNISWAP_CLUSTER) {
-            let data_bytes = if rand::random::<u64>() % 2 == 0 {
+            let data_bytes = if rand::random::<u64>().is_multiple_of(2) {
                 SingleSwap::sell_token0(U256::from(2000))
             } else {
                 SingleSwap::sell_token1(U256::from(2000))

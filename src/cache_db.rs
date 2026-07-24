@@ -1,142 +1,11 @@
 use crate::{
-    AccountBasic, LocationAndType, MemoryEntry, MemoryValue, ParallelState, ReadVersion, TxId,
-    TxVersion, fork_join_util, scheduler::MVMemory,
+    AccountBasic, LocationAndType, MVMemory, MemoryEntry, MemoryValue, ReadVersion, TxId, TxVersion,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use parking_lot::Mutex;
 use revm::{Database, DatabaseRef};
-use revm_database::{BundleState, TransitionState, states::bundle_state::BundleRetention};
 use revm_primitives::{Address, B256, U256, hardfork::SpecId};
 use revm_state::{AccountInfo, Bytecode, EvmState};
-use std::{
-    cell::UnsafeCell,
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-/// A wrapper around `Vec<T>` that allows disjoint parallel writes to different indices.
-///
-/// SAFETY: Callers must ensure that concurrent accesses target non-overlapping index ranges.
-/// This is guaranteed by `fork_join_util` which partitions indices into disjoint ranges.
-struct DisjointVec<T>(UnsafeCell<Vec<T>>);
-
-// SAFETY: DisjointVec is only used within fork_join_util where each thread writes to
-// a disjoint range of indices, so no data race can occur.
-unsafe impl<T: Send> Sync for DisjointVec<T> {}
-
-impl<T> DisjointVec<T> {
-    fn new(vec: Vec<T>) -> Self {
-        Self(UnsafeCell::new(vec))
-    }
-
-    /// SAFETY: Caller must ensure no other thread accesses the same index concurrently.
-    unsafe fn set(&self, index: usize, value: T) {
-        unsafe { (&mut (*self.0.get()))[index] = value };
-    }
-
-    fn into_inner(self) -> Vec<T> {
-        self.0.into_inner()
-    }
-}
-
-/// A trait that provides functionality for applying state transitions in parallel
-/// and creating reverts for a `BundleState`.
-///
-/// This trait is designed to optimize the process of applying transitions and
-/// generating reverts by leveraging parallelism, especially when dealing with
-/// large sets of transitions.
-pub trait ParallelBundleState {
-    /// apply transitions to create reverts for BundleState in parallel
-    fn parallel_apply_transitions_and_create_reverts(
-        &mut self,
-        transitions: TransitionState,
-        retention: BundleRetention,
-    );
-}
-
-impl ParallelBundleState for BundleState {
-    fn parallel_apply_transitions_and_create_reverts(
-        &mut self,
-        transitions: TransitionState,
-        retention: BundleRetention,
-    ) {
-        if !self.state.is_empty() {
-            self.apply_transitions_and_create_reverts(transitions, retention);
-            return;
-        }
-
-        let include_reverts = retention.includes_reverts();
-        // pessimistically pre-allocate assuming _all_ accounts changed.
-        let reverts_capacity = if include_reverts { transitions.transitions.len() } else { 0 };
-        let transitions = transitions.transitions;
-        let addresses: Vec<Address> = transitions.keys().cloned().collect();
-        let reverts = DisjointVec::new(vec![None; reverts_capacity]);
-        let bundle_state = DisjointVec::new(vec![None; transitions.len()]);
-        let state_size = AtomicUsize::new(0);
-        let reverts_size = AtomicUsize::new(0);
-        let contracts = Mutex::new(revm_primitives::HashMap::default());
-
-        fork_join_util(transitions.len(), None, |start_pos, end_pos, _| {
-            for pos in start_pos..end_pos {
-                let address = addresses[pos];
-                let transition = transitions.get(&address).cloned().unwrap();
-                // add new contract if it was created/changed.
-                if let Some((hash, new_bytecode)) = transition.has_new_contract() {
-                    contracts.lock().insert(hash, new_bytecode.clone());
-                }
-                let present_bundle = transition.present_bundle_account();
-                let revert = transition.create_revert();
-                if let Some(revert) = revert {
-                    state_size.fetch_add(present_bundle.size_hint(), Ordering::Relaxed);
-                    unsafe { bundle_state.set(pos, Some((address, present_bundle))) };
-                    if include_reverts {
-                        reverts_size.fetch_add(revert.size_hint(), Ordering::Relaxed);
-                        unsafe { reverts.set(pos, Some((address, revert))) };
-                    }
-                }
-            }
-        });
-        self.state_size = state_size.load(Ordering::Acquire);
-        self.reverts_size = reverts_size.load(Ordering::Acquire);
-
-        // much faster than bundle_state.into_iter().filter_map(|r| r).collect()
-        self.state.reserve(transitions.len());
-        for bundle in bundle_state.into_inner() {
-            if let Some((address, state)) = bundle {
-                self.state.insert(address, state);
-            }
-        }
-        let mut final_reverts = Vec::with_capacity(reverts_capacity);
-        for revert in reverts.into_inner() {
-            if let Some(r) = revert {
-                final_reverts.push(r);
-            }
-        }
-        self.reverts.push(final_reverts);
-        self.contracts = contracts.into_inner();
-    }
-}
-
-/// Provides functionality for extracting a `BundleState` from a `ParallelState`
-/// while applying state transitions in parallel.
-///
-/// This trait is designed to optimize the process of taking a `BundleState` by leveraging
-/// parallelism to apply transitions and generate reverts efficiently. It ensures that the
-/// resulting `BundleState` reflects the latest state changes based on the provided retention
-/// policy.
-pub trait ParallelTakeBundle {
-    /// take bundle in parallel
-    fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
-}
-
-impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
-    fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState {
-        if let Some(transition_state) = self.transition_state.as_mut().map(TransitionState::take) {
-            self.bundle_state
-                .parallel_apply_transitions_and_create_reverts(transition_state, retention);
-        }
-        self.take_bundle()
-    }
-}
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug)]
 pub(crate) struct CacheDB<'a, DB>
@@ -268,14 +137,14 @@ where
                 let code_changed = has_code &&
                     account.info.code.is_some() &&
                     read_account
-                        .map_or(true, |basic| basic.code_hash != Some(account.info.code_hash));
+                        .is_none_or(|basic| basic.code_hash != Some(account.info.code_hash));
                 if code_changed {
                     // Record whether this code write *created* the account (`CREATE`/`CREATE2`),
                     // which clears its storage, versus merely re-pointing it (an EIP-7702
                     // (re)delegation), which preserves the account's pre-existing storage. Later
                     // txs use this to decide whether an unwritten slot reads as zero or from the
                     // base database (see `storage_cleared_in_block`).
-                    let location = LocationAndType::Code(address.clone());
+                    let location = LocationAndType::Code(*address);
                     write_set.insert(location.clone());
                     self.mv_memory.entry(location).or_default().insert(
                         self.current_tx.txid,
@@ -296,7 +165,7 @@ where
                         basic.nonce != account.info.nonce || basic.balance != account.info.balance
                     })
                 {
-                    let location = LocationAndType::Basic(address.clone());
+                    let location = LocationAndType::Basic(*address);
                     write_set.insert(location.clone());
                     self.mv_memory.entry(location).or_default().insert(
                         self.current_tx.txid,
@@ -335,22 +204,16 @@ where
         let mut read_version = ReadVersion::Storage;
         let location = LocationAndType::Code(address);
         // 1. read from multi-version memory
-        if let Some(written_transactions) = self.mv_memory.get(&location) {
-            if let Some((&txid, entry)) =
-                written_transactions.range(..self.current_tx.txid).next_back()
-            {
-                match &entry.data {
-                    MemoryValue::Code(code, _) => {
-                        result = Some(code.clone());
-                        if entry.estimate {
-                            self.estimate_txs.insert(txid);
-                        }
-                        read_version =
-                            ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
-                    }
-                    _ => {}
-                }
+        if let Some(written_transactions) = self.mv_memory.get(&location) &&
+            let Some((&txid, entry)) =
+                written_transactions.range(..self.current_tx.txid).next_back() &&
+            let MemoryValue::Code(code, _) = &entry.data
+        {
+            result = Some(code.clone());
+            if entry.estimate {
+                self.estimate_txs.insert(txid);
             }
+            read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
         }
         // 2. read from database
         if result.is_none() {
@@ -391,42 +254,41 @@ where
         } else {
             let mut read_version = ReadVersion::Storage;
             let mut read_account = AccountBasic { balance: U256::ZERO, nonce: 0, code_hash: None };
-            let location = LocationAndType::Basic(address.clone());
+            let location = LocationAndType::Basic(address);
             // 1. read from multi-version memory
             let mut clear_destructed_entry = false;
-            if let Some(written_transactions) = self.mv_memory.get(&location) {
-                if let Some((&txid, entry)) =
+            if let Some(written_transactions) = self.mv_memory.get(&location) &&
+                let Some((&txid, entry)) =
                     written_transactions.range(..self.current_tx.txid).next_back()
-                {
-                    match &entry.data {
-                        MemoryValue::Basic(info) => {
-                            result = Some(info.clone());
-                            read_account = AccountBasic {
-                                balance: info.balance,
-                                nonce: info.nonce,
-                                code_hash: if info.is_empty_code_hash() {
-                                    None
-                                } else {
-                                    Some(info.code_hash)
-                                },
-                            };
-                            if entry.estimate {
-                                self.estimate_txs.insert(txid);
-                            }
-                            read_version =
-                                ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
-                        }
-                        MemoryValue::SelfDestructed => {
-                            if self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid {
-                                // make sure read after the latest self-destructed
-                                clear_destructed_entry = true;
+            {
+                match &entry.data {
+                    MemoryValue::Basic(info) => {
+                        result = Some(info.clone());
+                        read_account = AccountBasic {
+                            balance: info.balance,
+                            nonce: info.nonce,
+                            code_hash: if info.is_empty_code_hash() {
+                                None
                             } else {
-                                self.accurate_origin = false;
-                                result = Some(AccountInfo::default());
-                            }
+                                Some(info.code_hash)
+                            },
+                        };
+                        if entry.estimate {
+                            self.estimate_txs.insert(txid);
                         }
-                        _ => {}
+                        read_version =
+                            ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
+                    MemoryValue::SelfDestructed => {
+                        if self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid {
+                            // make sure read after the latest self-destructed
+                            clear_destructed_entry = true;
+                        } else {
+                            self.accurate_origin = false;
+                            result = Some(AccountInfo::default());
+                        }
+                    }
+                    _ => {}
                 }
             }
             if clear_destructed_entry {
@@ -454,10 +316,11 @@ where
             self.read_set.insert(location, read_version);
         }
 
-        if let Some(info) = &mut result {
-            if !info.is_empty_code_hash() && info.code.is_none() {
-                info.code = Some(self.code_by_address(address.clone(), info.code_hash)?);
-            }
+        if let Some(info) = &mut result &&
+            !info.is_empty_code_hash() &&
+            info.code.is_none()
+        {
+            info.code = Some(self.code_by_address(address, info.code_hash)?);
         }
         Ok(result)
     }
@@ -469,20 +332,18 @@ where
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let mut result = None;
         let mut read_version = ReadVersion::Storage;
-        let location = LocationAndType::Storage(address.clone(), index.clone());
+        let location = LocationAndType::Storage(address, index);
         // 1. read from multi-version memory
-        if let Some(written_transactions) = self.mv_memory.get(&location) {
-            if let Some((&txid, entry)) =
-                written_transactions.range(..self.current_tx.txid).next_back()
-            {
-                if let MemoryValue::Storage(slot) = &entry.data {
-                    result = Some(*slot);
-                    if entry.estimate {
-                        self.estimate_txs.insert(txid);
-                    }
-                    read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
-                }
+        if let Some(written_transactions) = self.mv_memory.get(&location) &&
+            let Some((&txid, entry)) =
+                written_transactions.range(..self.current_tx.txid).next_back() &&
+            let MemoryValue::Storage(slot) = &entry.data
+        {
+            result = Some(*slot);
+            if entry.estimate {
+                self.estimate_txs.insert(txid);
             }
+            read_version = ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
         }
         // 2. read from database
         if result.is_none() {

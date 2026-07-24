@@ -164,7 +164,7 @@ where
             }
         }
         // Self-compute the miner reward: upstream revm credits the coinbase inside execution, which
-        // grevm suppresses with a custom `Handler` (see `scheduler::NoRewardHandler`) and applies
+        // grevm suppresses with `GrevmHandler` in deferred-beneficiary mode and applies
         // here instead. This reproduces what the dropped `Galxe/revm` fork returned via
         // `ResultAndState.lazy_reward`.
         let reward = self.compute_reward(tx_env, &result);

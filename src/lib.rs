@@ -8,8 +8,7 @@
 //! ## Concurrency
 //!
 //! Grevm automatically determines the optimal level of concurrency based on the available CPU
-//! cores, but this can be customized as needed. The `CONCURRENT_LEVEL` static variable provides the
-//! default concurrency level.
+//! cores. Integrations can override it through [`GrevmConfig::concurrency_level`].
 //!
 //! ## Error Handling
 //!
@@ -17,214 +16,30 @@
 //! transaction ID and the underlying EVM error. This allows for precise debugging and error
 //! reporting.
 mod async_commit;
+mod bundle;
+mod cache_db;
+mod config;
+mod delegated_safety;
 mod hint;
+mod model;
+mod outcome;
 mod parallel_state;
 mod scheduler;
-mod storage;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 mod tx_dependency;
 mod utils;
 
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
-use lazy_static::lazy_static;
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-pub use revm_context::result::InvalidTransaction;
-use revm_context::result::{EVMError, ExecutionResult, ResultAndState};
-use revm_primitives::{Address, B256, U256};
-use revm_state::{AccountInfo, Bytecode};
-use std::{cmp::min, thread};
+pub(crate) use model::{
+    AbortReason, AccountBasic, LocationAndType, MVMemory, MemoryEntry, MemoryValue, ReadVersion,
+    Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
+};
 
-lazy_static! {
-    static ref CONCURRENT_LEVEL: usize =
-        thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    static ref FALLBACK_SEQUENTIAL: bool =
-        std::env::var("GREVM_FALLBACK_SEQUENTIAL").map_or(false, |s| s.parse().unwrap_or(false));
-    /// Minimum number of transactions in a block to run the parallel scheduler; smaller blocks
-    /// fall back to sequential execution. Defaults to 64 but can be overridden via the
-    /// `GREVM_MIN_PARALLEL_TXS` environment variable. Set it to `0` to force the parallel path
-    /// even for tiny blocks (useful when replaying small mainnet blocks to validate parallelism).
-    static ref MIN_PARALLEL_TXS: usize =
-        std::env::var("GREVM_MIN_PARALLEL_TXS").map_or(64, |s| s.parse().unwrap_or(64));
-}
-
-type TxId = usize;
-
-#[derive(Debug, Clone, Eq, PartialEq, Default)]
-enum TransactionStatus {
-    #[default]
-    Initial,
-    Executing,
-    Executed,
-    Validating,
-    Unconfirmed,
-    Conflict,
-    Finality,
-}
-
-#[derive(Debug, Default)]
-struct TxState {
-    pub status: TransactionStatus,
-    pub incarnation: usize,
-    pub dependency: Option<TxId>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct TxVersion {
-    pub txid: TxId,
-    pub incarnation: usize,
-}
-
-impl TxVersion {
-    pub(crate) fn new(txid: TxId, incarnation: usize) -> Self {
-        Self { txid, incarnation }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum ReadVersion {
-    MvMemory(TxVersion),
-    Storage,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AccountBasic {
-    /// The balance of the account.
-    pub balance: U256,
-    /// The nonce of the account.
-    pub nonce: u64,
-    pub code_hash: Option<B256>,
-}
-
-#[derive(Debug, Clone)]
-enum MemoryValue {
-    Basic(AccountInfo),
-    /// An account's code set by a transaction, plus whether that transaction *created* the account
-    /// (`CREATE`/`CREATE2`), which clears its storage. `false` for an EIP-7702 (re)delegation,
-    /// which only re-points code and preserves the account's pre-existing storage.
-    Code(Bytecode, bool),
-    Storage(U256),
-    SelfDestructed,
-}
-
-#[derive(Debug, Clone)]
-struct MemoryEntry {
-    incarnation: usize,
-    data: MemoryValue,
-    estimate: bool,
-}
-
-impl MemoryEntry {
-    pub(crate) fn new(incarnation: usize, data: MemoryValue, estimate: bool) -> Self {
-        Self { incarnation, data, estimate }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum LocationAndType {
-    Basic(Address),
-
-    Storage(Address, U256),
-
-    Code(Address),
-}
-
-struct TransactionResult<DBError> {
-    pub read_set: HashMap<LocationAndType, ReadVersion>,
-    pub write_set: HashSet<LocationAndType>,
-    pub execute_result: Result<ResultAndState, EVMError<DBError>>,
-}
-
-#[derive(Clone, Debug)]
-enum Task {
-    Execution(TxVersion),
-    Validation(TxVersion),
-}
-
-impl Default for Task {
-    fn default() -> Self {
-        Task::Execution(TxVersion::new(0, 0))
-    }
-}
-
-enum AbortReason<DBError> {
-    /// A fatal EVM error produced while executing this transaction. The error itself remains in
-    /// `Scheduler::tx_results`.
-    FatalEvmError(TxId),
-    /// A commit error is not stored in `Scheduler::tx_results`, so the abort reason carries the
-    /// complete error instead of trying to recover it from an execution result.
-    CommitError(GrevmError<DBError>),
-    /// An invariant of the parallel scheduler was violated before the current transaction was
-    /// committed. The committed prefix is still valid, so execution can resume sequentially.
-    ParallelError {
-        txid: TxId,
-        message: &'static str,
-    },
-    #[allow(dead_code)]
-    SelfDestructed,
-    FallbackSequential,
-}
-
-/// Final outcome for one transaction in block order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TxExecutionOutcome {
-    /// The transaction executed normally, including EVM reverts and halts.
-    Executed(ExecutionResult),
-    /// The transaction was invalid at the committed state and was applied as a no-op. The exact
-    /// revm validation error is forwarded to the consumer for protocol-specific encoding.
-    Skipped(InvalidTransaction),
-}
-
-/// Grevm error type.
-#[derive(Debug, Clone)]
-pub struct GrevmError<DBError> {
-    /// The transaction id that caused the error.
-    pub txid: TxId,
-    /// The error that occurred.
-    pub error: EVMError<DBError>,
-}
-
-/// Utility function for parallel execution using fork-join pattern.
-///
-/// This function divides the work into partitions and executes the provided closure `f`
-/// in parallel across multiple threads. The number of partitions can be specified, or it
-/// will default to twice the number of CPU cores plus one.
-///
-/// # Arguments
-///
-/// * `num_elements` - The total number of elements to process.
-/// * `num_partitions` - Optional number of partitions to divide the work into.
-/// * `f` - A closure that takes three arguments: the start index, the end index, and the partition
-///   index.
-///
-/// # Example
-///
-/// ```
-/// use grevm::fork_join_util;
-/// fork_join_util(100, Some(4), |start, end, index| {
-///     println!("Partition {}: processing elements {} to {}", index, start, end);
-/// });
-/// ```
-pub fn fork_join_util<'scope, F>(num_elements: usize, num_partitions: Option<usize>, f: F)
-where
-    F: Fn(usize, usize, usize) + Send + Sync + 'scope,
-{
-    if num_elements == 0 {
-        return;
-    }
-    let parallel_cnt = num_partitions.unwrap_or(*CONCURRENT_LEVEL);
-    let remaining = num_elements % parallel_cnt;
-    let chunk_size = num_elements / parallel_cnt;
-    (0..parallel_cnt).into_par_iter().for_each(|index| {
-        let start_pos = chunk_size * index + min(index, remaining);
-        let mut end_pos = start_pos + chunk_size;
-        if index < remaining {
-            end_pos += 1;
-        }
-        f(start_pos, end_pos, index);
-    });
-}
-
+pub use bundle::{ParallelBundleState, ParallelTakeBundle};
+pub use config::GrevmConfig;
+pub use delegated_safety::DelegatedSafetyConfig;
+pub use outcome::{GrevmError, TxExecutionOutcome};
 pub use parallel_state::{ParallelCacheState, ParallelState};
+pub use revm_context::result::InvalidTransaction;
 pub use scheduler::Scheduler;
-pub use storage::{ParallelBundleState, ParallelTakeBundle};
+pub use utils::fork_join_util;

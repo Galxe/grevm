@@ -51,7 +51,7 @@ impl CacheAccountInfo {
         &mut self,
         change: F,
     ) -> (T, TransitionAccount) {
-        let previous_status = self.status.clone();
+        let previous_status = self.status;
         let previous_info = self.account.clone();
         let mut info = self.account.take().unwrap_or_default();
         let output = change(&mut info);
@@ -65,7 +65,7 @@ impl CacheAccountInfo {
             output,
             TransitionAccount {
                 info: self.account.clone(),
-                status: self.status.clone(),
+                status: self.status,
                 previous_info,
                 previous_status,
                 storage: Default::default(),
@@ -80,7 +80,7 @@ impl CacheAccountInfo {
     pub fn selfdestruct(&mut self) -> Option<TransitionAccount> {
         // account should be None after selfdestruct so we can take it.
         let previous_info = self.account.take();
-        let previous_status = self.status.clone();
+        let previous_status = self.status;
 
         self.status = self.status.on_selfdestructed();
 
@@ -89,7 +89,7 @@ impl CacheAccountInfo {
         } else {
             Some(TransitionAccount {
                 info: None,
-                status: self.status.clone(),
+                status: self.status,
                 previous_info,
                 previous_status,
                 storage: Default::default(),
@@ -105,14 +105,14 @@ impl CacheAccountInfo {
         new_storage: StorageWithOriginalValues,
     ) -> (TransitionAccount, PlainStorage) {
         let previous_info = self.account.take();
-        let previous_status = self.status.clone();
+        let previous_status = self.status;
 
         let new_bundle_storage = new_storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
 
         self.status = self.status.on_created();
         let transition_account = TransitionAccount {
             info: Some(new_info.clone()),
-            status: self.status.clone(),
+            status: self.status,
             previous_status,
             previous_info,
             storage: new_storage,
@@ -128,7 +128,7 @@ impl CacheAccountInfo {
     pub fn touch_empty_eip161(&mut self) -> Option<TransitionAccount> {
         // Set account to None.
         let previous_info = self.account.take();
-        let previous_status = self.status.clone();
+        let previous_status = self.status;
 
         // Set account state to Destroyed as we need to clear the storage if it exist.
         self.status = self.status.on_touched_empty_post_eip161();
@@ -143,7 +143,7 @@ impl CacheAccountInfo {
         } else {
             Some(TransitionAccount {
                 info: None,
-                status: self.status.clone(),
+                status: self.status,
                 previous_info,
                 previous_status,
                 storage: Default::default(),
@@ -157,7 +157,7 @@ impl CacheAccountInfo {
         &mut self,
         storage: StorageWithOriginalValues,
     ) -> (Option<TransitionAccount>, PlainStorage) {
-        let previous_status = self.status.clone();
+        let previous_status = self.status;
 
         let had_no_info = self.account.as_ref().map(|info| info.is_empty()).unwrap_or_default();
         match self.status.on_touched_created_pre_eip161(had_no_info) {
@@ -175,7 +175,7 @@ impl CacheAccountInfo {
         (
             Some(TransitionAccount {
                 info: Some(AccountInfo::default()),
-                status: self.status.clone(),
+                status: self.status,
                 previous_info,
                 previous_status,
                 storage,
@@ -191,7 +191,7 @@ impl CacheAccountInfo {
         storage: StorageWithOriginalValues,
     ) -> (TransitionAccount, PlainStorage) {
         let previous_info = self.account.take();
-        let previous_status = self.status.clone();
+        let previous_status = self.status;
         let new_bundle_storage = storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
 
         let had_no_nonce_and_code =
@@ -202,7 +202,7 @@ impl CacheAccountInfo {
         (
             TransitionAccount {
                 info: self.account.clone(),
-                status: self.status.clone(),
+                status: self.status,
                 previous_info,
                 previous_status,
                 storage,
@@ -254,29 +254,27 @@ impl ParallelCacheState {
         for kv in self.accounts.iter() {
             let info = kv.value();
             state.accounts.insert(
-                kv.key().clone(),
+                *kv.key(),
                 CacheAccount {
                     account: info
                         .account
                         .clone()
                         .map(|info| PlainAccount { info, storage: PlainStorage::default() }),
-                    status: info.status.clone(),
+                    status: info.status,
                 },
             );
         }
         for kv in self.contracts.iter() {
-            state.contracts.insert(kv.key().clone(), kv.value().clone());
+            state.contracts.insert(*kv.key(), kv.value().clone());
         }
         for kv in self.storage.iter() {
-            let address = kv.key().clone();
+            let address = *kv.key();
             let slots = kv.value();
-            if let Some(account) = state.accounts.get_mut(&address) {
-                if let Some(plain_account) = account.account.as_mut() {
-                    for slot_value in slots.iter() {
-                        plain_account
-                            .storage
-                            .insert(slot_value.key().clone(), slot_value.value().clone());
-                    }
+            if let Some(account) = state.accounts.get_mut(&address) &&
+                let Some(plain_account) = account.account.as_mut()
+            {
+                for slot_value in slots.iter() {
+                    plain_account.storage.insert(*slot_value.key(), *slot_value.value());
                 }
             }
         }
@@ -395,10 +393,10 @@ impl ParallelCacheState {
                 (Some(transition), Some(changed_slots))
             }
         };
-        if let Some(changed_slots) = changed_slots {
-            if !changed_slots.is_empty() {
-                self.update_storage_slot(address, changed_slots);
-            }
+        if let Some(changed_slots) = changed_slots &&
+            !changed_slots.is_empty()
+        {
+            self.update_storage_slot(address, changed_slots);
         }
         transition
     }
@@ -708,10 +706,10 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     }
 
     fn db_storage(&self, address: Address, index: U256) -> Result<U256, DB::Error> {
-        if let Some(slots) = self.cache.storage.get(&address) {
-            if let Some(value) = slots.get(&index) {
-                return Ok(value.value().clone());
-            }
+        if let Some(slots) = self.cache.storage.get(&address) &&
+            let Some(value) = slots.get(&index)
+        {
+            return Ok(*value.value());
         }
         // Account is guaranteed to be loaded.
         // Note that storage from bundle is already loaded with account.
@@ -730,12 +728,12 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             self.with_metrics(|| self.database.storage_ref(address, index))?
         };
         let value = if let Some(slots) = self.cache.storage.get(&address) {
-            slots.entry(index).or_insert(value).value().clone()
+            *slots.entry(index).or_insert(value).value()
         } else {
             match self.cache.storage.entry(address) {
-                Entry::Occupied(entry) => entry.get().entry(index).or_insert(value).value().clone(),
+                Entry::Occupied(entry) => *entry.get().entry(index).or_insert(value).value(),
                 Entry::Vacant(entry) => {
-                    entry.insert(Default::default()).entry(index).or_insert(value).value().clone()
+                    *entry.insert(Default::default()).entry(index).or_insert(value).value()
                 }
             }
         };

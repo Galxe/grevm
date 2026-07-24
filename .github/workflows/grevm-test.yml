@@ -24,6 +24,11 @@ jobs:
         with:
           toolchain: stable
           override: true
+          components: clippy
+
+      # Compile every feature and target, and reject both rustc and Clippy warnings.
+      - name: Run Clippy
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       # GREVM_MIN_PARALLEL_TXS=0 forces the parallel path for the (often small) replayed mainnet
       # blocks so the parallel-vs-sequential comparison is actually exercised.

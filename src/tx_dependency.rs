@@ -41,7 +41,7 @@ impl TxDependency {
                 .into_iter()
                 .map(|dep| Mutex::new(DependentState { onboard: true, dependency: dep }))
                 .collect(),
-            affect_txs: affect_txs.into_iter().map(|affects| Mutex::new(affects)).collect(),
+            affect_txs: affect_txs.into_iter().map(Mutex::new).collect(),
             index: AtomicUsize::new(0),
         }
     }

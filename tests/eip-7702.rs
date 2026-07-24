@@ -295,7 +295,7 @@ fn delegated_balance_drain_makes_following_tx_invalid() {
 
 /// Positive control: a single delegation followed by a CALL. Exercises the whole 7702
 /// plumbing end-to-end and must agree with the sequential reference both before and after
-/// the storage.rs fix.
+/// the CacheDB code-publication fix.
 #[test]
 fn single_delegation_then_call() {
     let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
