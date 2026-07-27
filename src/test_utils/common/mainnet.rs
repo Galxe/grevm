@@ -75,8 +75,9 @@ pub struct BlockFixture {
     pub excess_blob_gas: Option<u64>,
     /// Chain id (1 for mainnet).
     pub chain_id: u64,
-    /// Hardfork name, parsed via [`SpecId::from_str`] (e.g. `"Prague"`). Falls back to
-    /// [`SpecId::PRAGUE`] if unrecognized.
+    /// Hardfork name, parsed via [`SpecId::from_str`] (e.g. `"Prague"`). Unrecognized values and
+    /// legacy fixtures that incorrectly labeled pre-merge blocks as `"Merge"` are resolved from
+    /// the mainnet block number and timestamp.
     pub spec_id: String,
     /// Recent block hashes for the `BLOCKHASH` opcode (block number -> hash), normally the last
     /// 256 ancestors. Not part of any account's state, so `prestateTracer` cannot provide them;
@@ -86,9 +87,17 @@ pub struct BlockFixture {
 }
 
 impl BlockFixture {
-    /// Resolve the [`SpecId`] for this block, defaulting to [`SpecId::PRAGUE`].
+    /// Resolve the [`SpecId`] for this block.
     pub fn spec_id(&self) -> SpecId {
-        SpecId::from_str(&self.spec_id).unwrap_or(SpecId::PRAGUE)
+        let historical = || {
+            SpecId::from_str(spec_for_mainnet_block(self.number, self.timestamp))
+                .expect("mainnet hardfork names are valid SpecIds")
+        };
+        match SpecId::from_str(&self.spec_id) {
+            Ok(SpecId::MERGE) if self.number < 15_537_394 => historical(),
+            Ok(stored) => stored,
+            Err(_) => historical(),
+        }
     }
 
     /// Build the revm [`CfgEnv`] for this block. `disable_nonce_check` is left `false`: real
@@ -110,6 +119,8 @@ impl BlockFixture {
             difficulty: self.difficulty,
             prevrandao: self.prevrandao,
             blob_excess_gas_and_price: None,
+            // Amsterdam (EIP-7843) is not modeled in the test fixtures; leave slot_num at zero.
+            slot_num: 0,
         };
         if let Some(excess) = self.excess_blob_gas {
             // Record the real `excess_blob_gas` but pin the blob gas price to the protocol minimum
@@ -273,7 +284,13 @@ pub fn pre_state_to_db(pre_state: &PreState) -> InMemoryDB {
             }
             _ => (KECCAK_EMPTY, None),
         };
-        let info = AccountInfo { balance: acc.balance, nonce: acc.nonce, code_hash, code };
+        let info = AccountInfo {
+            balance: acc.balance,
+            nonce: acc.nonce,
+            code_hash,
+            code,
+            ..Default::default()
+        };
         let storage = acc.storage.iter().map(|(k, v)| (*k, *v)).collect();
         accounts.insert(*addr, PlainAccount { info, storage });
     }
@@ -466,15 +483,44 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 // the `src/bin/` fetchers.
 // ---------------------------------------------------------------------------------------------
 
-/// Mainnet hardfork activation by block timestamp (recent forks only). The replay oracle is
-/// parallel-vs-sequential, and this revm build models up to Prague, so we cap there; pass an
-/// explicit spec to the fetcher to override.
+/// Mainnet hardfork activation by timestamp when the block number is unavailable.
+///
+/// This helper only distinguishes timestamp-activated forks. Use [`spec_for_mainnet_block`] when
+/// the block number is known so pre-merge block-height activations are handled correctly.
 pub fn spec_for_timestamp(ts: u64) -> &'static str {
     match ts {
+        t if t >= 1_764_798_551 => "Osaka",    // Fusaka,   2025-12-03
         t if t >= 1_746_612_311 => "Prague",   // Pectra,  2025-05-07
         t if t >= 1_710_338_135 => "Cancun",   // Dencun,  2024-03-13
-        t if t >= 1_681_338_479 => "Shanghai", // Shapella, 2023-04-12
+        t if t >= 1_681_338_455 => "Shanghai", // Shapella, 2023-04-12
         _ => "Merge",
+    }
+}
+
+/// Resolve the closest revm EVM spec for an Ethereum mainnet block number and timestamp.
+///
+/// Pre-merge forks activated by block height; Shanghai and later forks activate by timestamp.
+/// revm intentionally collapses hardforks that did not change EVM execution rules (for example,
+/// DAO, Muir Glacier, Arrow Glacier, and Gray Glacier) into the preceding supported spec.
+/// Amsterdam has no mainnet activation yet, so automatic fixture generation is capped at Osaka.
+pub fn spec_for_mainnet_block(number: u64, timestamp: u64) -> &'static str {
+    match timestamp {
+        t if t >= 1_764_798_551 => "Osaka",    // Fusaka,   2025-12-03
+        t if t >= 1_746_612_311 => "Prague",   // Pectra,  2025-05-07
+        t if t >= 1_710_338_135 => "Cancun",   // Dencun,  2024-03-13
+        t if t >= 1_681_338_455 => "Shanghai", // Shapella, 2023-04-12
+        _ => match number {
+            n if n >= 15_537_394 => "Merge",
+            n if n >= 12_965_000 => "London",
+            n if n >= 12_244_000 => "Berlin",
+            n if n >= 9_069_000 => "Istanbul",
+            n if n >= 7_280_000 => "Petersburg",
+            n if n >= 4_370_000 => "Byzantium",
+            n if n >= 2_675_000 => "Spurious",
+            n if n >= 2_463_000 => "Tangerine",
+            n if n >= 1_150_000 => "Homestead",
+            _ => "Frontier",
+        },
     }
 }
 
@@ -649,4 +695,41 @@ fn parse_b256(s: &str) -> Result<B256, String> {
 
 fn parse_bytes(s: &str) -> Result<Bytes, String> {
     s.parse::<Bytes>().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_hardfork_resolution_covers_historical_and_timestamp_boundaries() {
+        assert_eq!(spec_for_mainnet_block(1_149_999, 0), "Frontier");
+        assert_eq!(spec_for_mainnet_block(1_150_000, 0), "Homestead");
+        assert_eq!(spec_for_mainnet_block(2_674_999, 0), "Tangerine");
+        assert_eq!(spec_for_mainnet_block(2_675_000, 0), "Spurious");
+        assert_eq!(spec_for_mainnet_block(15_537_394, 0), "Merge");
+        assert_eq!(spec_for_mainnet_block(17_034_870, 1_681_338_455), "Shanghai");
+        assert_eq!(spec_for_mainnet_block(23_935_694, 1_764_798_551), "Osaka");
+    }
+
+    #[test]
+    fn invalid_and_legacy_fixture_specs_are_resolved_from_block_metadata() {
+        let mut fixture = BlockFixture {
+            number: 1_124_576,
+            coinbase: Address::ZERO,
+            timestamp: 1_457_550_778,
+            gas_limit: 0,
+            basefee: 0,
+            difficulty: U256::ZERO,
+            prevrandao: None,
+            excess_blob_gas: None,
+            chain_id: 1,
+            spec_id: "Merge".to_string(),
+            block_hashes: BTreeMap::new(),
+        };
+
+        assert_eq!(fixture.spec_id(), SpecId::FRONTIER);
+        fixture.spec_id = "not-a-hardfork".to_string();
+        assert_eq!(fixture.spec_id(), SpecId::FRONTIER);
+    }
 }

@@ -1,6 +1,7 @@
 use super::{ReserveJournalExt, ReservePlanner};
 use metrics::counter;
 use revm::{
+    context_interface::journaled_state::account::JournaledAccountTr,
     handler::{EvmTr, EvmTrError, FrameResult, FrameTr, Handler, post_execution},
     interpreter::{
         CallOutcome, InitialAndFloorGas, InstructionResult, InterpreterResult,
@@ -10,7 +11,7 @@ use revm::{
 use revm_context::{
     BlockEnv, ContextTr, JournalTr, Transaction, TxEnv,
     journaled_state::JournalCheckpoint,
-    result::{ExecutionResult, HaltReason, InvalidTransaction},
+    result::{ExecutionResult, HaltReason, InvalidTransaction, ResultGas},
 };
 use revm_primitives::Bytes;
 use revm_state::EvmState;
@@ -217,13 +218,17 @@ where
     type Error = ERROR;
     type HaltReason = HaltReason;
 
-    fn pre_execution(&self, evm: &mut Self::Evm) -> Result<u64, Self::Error> {
+    fn pre_execution(
+        &self,
+        evm: &mut Self::Evm,
+        init_and_floor_gas: &mut InitialAndFloorGas,
+    ) -> Result<u64, Self::Error> {
         // This is revm's default `pre_execution` sequence. The trait has no hook after
         // authorization processing, so these three calls are repeated here solely to place the
         // reserve checkpoint at the transaction/execution boundary.
-        self.validate_against_state_and_deduct_caller(evm)?;
+        self.validate_against_state_and_deduct_caller(evm, init_and_floor_gas)?;
         self.load_accounts(evm)?;
-        let eip7702_refund = self.apply_eip7702_auth_list(evm)?;
+        let eip7702_refund = self.apply_eip7702_auth_list(evm, init_and_floor_gas)?;
 
         debug_assert!(self.execution_checkpoint.get().is_none());
         self.execution_checkpoint.set(Some(evm.ctx().journal_mut().checkpoint()));
@@ -237,23 +242,34 @@ where
         exec_result: &mut FrameResult,
         init_and_floor_gas: InitialAndFloorGas,
         eip7702_gas_refund: i64,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<ResultGas, Self::Error> {
         // Preserve the gas state before revm merges execution refunds with the authorization
         // refund. A reserve violation rolls back execution, so only the independently earned
         // EIP-7702 authorization refund may be reapplied to this snapshot.
         let execution_gas = *exec_result.gas();
 
         self.refund(evm, exec_result, eip7702_gas_refund);
+        // Match revm's default lifecycle: capture the pre-floor gas components. `ResultGas`
+        // applies the EIP-7623 floor when deriving `tx_gas_used`, while retaining the actual
+        // pre-floor spend and refund for downstream consumers.
+        let mut result_gas = post_execution::build_result_gas(
+            exec_result.instruction_result().is_halt(),
+            exec_result.gas(),
+            init_and_floor_gas,
+        );
         self.eip7623_check_gas_floor(evm, exec_result, init_and_floor_gas);
         self.reimburse_caller(evm, exec_result)?;
-        self.enforce_reserve(
+        if let Some(reserve_result_gas) = self.enforce_reserve(
             evm,
             exec_result,
             execution_gas,
             init_and_floor_gas,
             eip7702_gas_refund,
-        )?;
-        self.beneficiary_mode.apply(evm, exec_result)
+        )? {
+            result_gas = reserve_result_gas;
+        }
+        self.beneficiary_mode.apply::<EVM, ERROR>(evm, exec_result)?;
+        Ok(result_gas)
     }
 }
 
@@ -277,7 +293,7 @@ where
         execution_gas: revm::interpreter::Gas,
         init_and_floor_gas: InitialAndFloorGas,
         eip7702_gas_refund: i64,
-    ) -> Result<(), ERROR> {
+    ) -> Result<Option<ResultGas>, ERROR> {
         let execution_checkpoint = self
             .execution_checkpoint
             .take()
@@ -301,12 +317,18 @@ where
             // from the pre-refund execution gas. The first reimbursement was also reverted, so
             // apply it again using this synthetic top-level REVERT result.
             self.refund(evm, exec_result, eip7702_gas_refund);
+            let result_gas = post_execution::build_result_gas(
+                exec_result.instruction_result().is_halt(),
+                exec_result.gas(),
+                init_and_floor_gas,
+            );
             self.eip7623_check_gas_floor(evm, exec_result, init_and_floor_gas);
             self.reimburse_caller(evm, exec_result)?;
+            return Ok(Some(result_gas))
         } else {
             evm.ctx().journal_mut().checkpoint_commit();
         }
-        Ok(())
+        Ok(None)
     }
 
     fn has_reserve_violation(
@@ -357,11 +379,9 @@ where
     // Reproduce the nonce bump normally performed by revm's top-level CREATE frame. It must be a
     // journaled mutation so a surrounding transaction/error rollback still has correct semantics.
     let sender = evm.ctx_ref().tx().caller();
-    let account = evm.ctx().journal_mut().load_account(sender)?;
-    let Some(new_nonce) = account.data.info.nonce.checked_add(1) else {
+    let mut account = evm.ctx().journal_mut().load_account_mut(sender)?;
+    if !account.data.bump_nonce() {
         return Err(InvalidTransaction::NonceOverflowInTransaction.into());
-    };
-    account.data.info.nonce = new_nonce;
-    evm.ctx().journal_mut().nonce_bump_journal_entry(sender);
+    }
     Ok(())
 }

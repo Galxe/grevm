@@ -125,7 +125,7 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
 mod tests {
     use super::*;
     use revm_database::{AccountStatus, TransitionAccount};
-    use revm_primitives::{Bytes, HashMap};
+    use revm_primitives::{AddressMap, Bytes};
     use revm_state::AccountInfo;
 
     fn transitions(count: usize) -> TransitionState {
@@ -142,7 +142,7 @@ mod tests {
                         },
                     )
                 })
-                .collect::<HashMap<_, _>>(),
+                .collect::<AddressMap<_>>(),
         }
     }
 

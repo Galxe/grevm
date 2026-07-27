@@ -66,6 +66,7 @@ fn eoa_account(balance: u128, nonce: u64) -> PlainAccount {
             nonce,
             code_hash: KECCAK_EMPTY,
             code: None,
+            ..Default::default()
         },
         storage: Default::default(),
     }
@@ -355,7 +356,7 @@ fn retry_probe_precompiles(
     let blocker_executions = executions.clone();
     let blocker_precompile = DynPrecompile::new_stateful(
         PrecompileId::Custom("grevm-test-retry-blocker".into()),
-        move |_| {
+        move |input| {
             if coordinate_parallel_attempt {
                 while blocker_executions.load(Ordering::Acquire) == 0 {
                     thread::yield_now();
@@ -364,14 +365,14 @@ fn retry_probe_precompiles(
                 // for tx 1 to publish its stale speculative result before tx 0 publishes its write.
                 thread::sleep(Duration::from_millis(50));
             }
-            Ok(PrecompileOutput::new(0, Bytes::new()))
+            Ok(PrecompileOutput::new(0, Bytes::new(), input.reservoir))
         },
     );
     let probe_precompile = DynPrecompile::new_stateful(
         PrecompileId::Custom("grevm-test-retry-probe".into()),
-        move |_| {
+        move |input| {
             executions.fetch_add(1, Ordering::AcqRel);
-            Ok(PrecompileOutput::new(0, Bytes::new()))
+            Ok(PrecompileOutput::new(0, Bytes::new(), input.reservoir))
         },
     );
     Arc::new(vec![(blocker, blocker_precompile), (probe, probe_precompile)])
@@ -693,8 +694,8 @@ fn reserve_revert_preserves_eip7702_authorization_refund() {
     // policy changes the final outcome to REVERT, but the pre-execution authorization refund is
     // independent of the rolled-back balance transfer and therefore keeps gas usage identical.
     let (standard, _) =
-        execute_block(db.clone(), txs.clone(), DelegatedSafetyConfig::disabled(), false);
-    let (reserve, _) = execute_block(db, txs, DelegatedSafetyConfig::reserve_only(), false);
+        execute_in_both_modes(db.clone(), txs.clone(), DelegatedSafetyConfig::disabled());
+    let (reserve, _) = execute_in_both_modes(db, txs, DelegatedSafetyConfig::reserve_only());
     assert_outcome(&standard[10], OutcomeKind::Success, "reserve disabled");
     assert_outcome(&reserve[10], OutcomeKind::Revert, "reserve enabled");
     let TxExecutionOutcome::Executed(standard) = &standard[10] else {
@@ -703,7 +704,7 @@ fn reserve_revert_preserves_eip7702_authorization_refund() {
     let TxExecutionOutcome::Executed(reserve) = &reserve[10] else {
         unreachable!("outcome checked above")
     };
-    assert_eq!(standard.gas_used(), reserve.gas_used());
+    assert_eq!(standard.gas(), reserve.gas());
 }
 
 #[test]
@@ -803,6 +804,31 @@ fn reserve_tracking_does_not_change_selfdestruct_gas() {
     let TxExecutionOutcome::Executed(reserve) = &reserve[10] else {
         panic!("selfdestruct transaction must execute on the reserve path")
     };
-    assert_eq!(standard.gas_used(), reserve.gas_used());
+    assert_eq!(standard.gas(), reserve.gas());
     execute::compare_bundle_state(&standard_bundle, &reserve_bundle);
+}
+
+#[test]
+fn reserve_handler_preserves_full_result_gas_when_eip7623_floor_applies() {
+    let db = database(Bytecode::new());
+    let mut txs: Vec<_> = (0..BLOCK_SIZE).map(padding_tx).collect();
+    txs[10] = TxEnv {
+        data: Bytes::from(vec![1; 1_000]),
+        gas_limit: 100_000,
+        value: U256::ZERO,
+        ..padding_tx(10)
+    };
+
+    let (standard, _) =
+        execute_in_both_modes(db.clone(), txs.clone(), DelegatedSafetyConfig::disabled());
+    let (reserve, _) = execute_in_both_modes(db, txs, DelegatedSafetyConfig::reserve_only());
+    let TxExecutionOutcome::Executed(standard) = &standard[10] else {
+        panic!("floor transaction must execute on the standard path")
+    };
+    let TxExecutionOutcome::Executed(reserve) = &reserve[10] else {
+        panic!("floor transaction must execute on the reserve path")
+    };
+
+    assert_eq!(standard.tx_gas_used(), standard.gas().floor_gas());
+    assert_eq!(standard.gas(), reserve.gas());
 }

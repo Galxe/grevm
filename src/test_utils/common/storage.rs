@@ -8,7 +8,7 @@ use revm::{
 };
 use revm_context::DBErrorMarker;
 use revm_database::PlainAccount;
-use revm_primitives::HashMap;
+use revm_primitives::{HashMap, StorageKeyMap};
 use revm_state::{AccountInfo, Bytecode};
 
 /// A DatabaseRef that stores chain data in memory.
@@ -95,12 +95,12 @@ impl DatabaseRef for InMemoryDB {
 
 #[derive(Debug, Default)]
 pub struct StorageBuilder {
-    dict: HashMap<U256, U256>,
+    dict: StorageKeyMap<U256>,
 }
 
 impl StorageBuilder {
     pub fn new() -> Self {
-        StorageBuilder { dict: HashMap::default() }
+        StorageBuilder { dict: StorageKeyMap::default() }
     }
 
     pub fn set<K, V>(&mut self, slot: K, value: V)
@@ -135,7 +135,7 @@ impl StorageBuilder {
         *entry = buffer.into();
     }
 
-    pub fn build(self) -> HashMap<U256, U256> {
+    pub fn build(self) -> StorageKeyMap<U256> {
         self.dict
     }
 }
