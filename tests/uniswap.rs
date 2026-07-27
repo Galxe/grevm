@@ -27,5 +27,5 @@ fn uniswap_clusters() {
     }
 
     let db = InMemoryDB::new(final_state, final_bytecodes, Default::default());
-    execute::compare_evm_execute(db, final_txs, false, false, HashMap::default());
+    execute::compare_evm_execute(db, final_txs, false, HashMap::default());
 }

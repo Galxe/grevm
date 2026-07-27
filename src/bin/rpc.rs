@@ -12,6 +12,31 @@ use serde_json::{Value, json};
 // `Send + Sync` so errors can cross a thread boundary (the `replay_7702` prefetch thread).
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+const RETRY_ATTEMPTS: usize = 7;
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(400);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+const BLOCK_HASH_BATCH_SIZE: usize = 32;
+
+fn backoff(delay: &mut Duration) {
+    std::thread::sleep(*delay);
+    *delay = (*delay * 2).min(MAX_RETRY_DELAY);
+}
+
+fn is_rate_limit_error(error: &Value) -> bool {
+    let code = error.get("code").and_then(Value::as_i64);
+    let message =
+        error.get("message").and_then(Value::as_str).unwrap_or_default().to_ascii_lowercase();
+    matches!(code, Some(429 | -32005 | -32007)) ||
+        message.contains("rate limit") ||
+        message.contains("request limit") ||
+        message.contains("too many requests")
+}
+
+fn response_id(response: &Value) -> Option<u64> {
+    let id = response.get("id")?;
+    id.as_u64().or_else(|| id.as_str()?.parse().ok())
+}
+
 /// A tiny JSON-RPC-over-HTTP client.
 pub struct Rpc {
     agent: ureq::Agent,
@@ -30,16 +55,15 @@ impl Rpc {
 
     /// POST a JSON body, retrying on HTTP 429 (Too Many Requests) and 5xx with exponential backoff.
     fn send(&self, body: &Value) -> Result<Value, Error> {
-        let mut delay = Duration::from_millis(400);
-        for attempt in 0..7 {
+        let mut delay = INITIAL_RETRY_DELAY;
+        for attempt in 0..RETRY_ATTEMPTS {
             match self.agent.post(&self.url).send_json(body) {
                 Ok(resp) => return resp.into_json().map_err(Into::into),
                 Err(ureq::Error::Status(code, _)) if code == 429 || code >= 500 => {
-                    if attempt == 6 {
+                    if attempt + 1 == RETRY_ATTEMPTS {
                         return Err(format!("HTTP {code} after {} retries", attempt + 1).into());
                     }
-                    std::thread::sleep(delay);
-                    delay = (delay * 2).min(Duration::from_secs(10));
+                    backoff(&mut delay);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -48,13 +72,24 @@ impl Rpc {
     }
 
     /// Issue a JSON-RPC call and return its `result` (or `Null`).
+    ///
+    /// Some providers report rate limits as a JSON-RPC error inside an HTTP 200 response. Retry
+    /// those errors here; transport-level throttling remains the responsibility of [`Self::send`].
     pub fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let resp = self.send(&body)?;
-        if let Some(err) = resp.get("error") {
-            return Err(format!("{method} failed: {err}").into());
+        let mut delay = INITIAL_RETRY_DELAY;
+        for attempt in 0..RETRY_ATTEMPTS {
+            let resp = self.send(&body)?;
+            if let Some(error) = resp.get("error") {
+                if is_rate_limit_error(error) && attempt + 1 < RETRY_ATTEMPTS {
+                    backoff(&mut delay);
+                    continue;
+                }
+                return Err(format!("{method} failed: {error}").into());
+            }
+            return Ok(resp.get("result").cloned().unwrap_or(Value::Null))
         }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+        unreachable!()
     }
 
     /// `eth_chainId`, defaulting to mainnet (1) if unavailable.
@@ -75,23 +110,26 @@ impl Rpc {
     /// already present. Callers replaying consecutive blocks can reuse one `cache` across blocks
     /// (the 256-hash windows overlap almost entirely), turning ~256 fetches/block into ~1.
     ///
-    /// Uses JSON-RPC batches of 32 (with 429/5xx backoff) and retries entries a batch dropped, so
-    /// the requested range ends up complete; errors otherwise.
+    /// Uses JSON-RPC batches, retries partial and rate-limited responses with exponential backoff,
+    /// then fetches any residual entries individually. The requested range is always complete on
+    /// success.
     pub fn fetch_block_hashes_into(
         &self,
         cache: &mut BTreeMap<u64, B256>,
         lo: u64,
         hi: u64,
     ) -> Result<(), Error> {
-        for attempt in 0..5 {
+        let mut delay = INITIAL_RETRY_DELAY;
+        for attempt in 0..RETRY_ATTEMPTS {
             let missing: Vec<u64> = (lo..=hi).filter(|n| !cache.contains_key(n)).collect();
             if missing.is_empty() {
                 return Ok(());
             }
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(250));
+                backoff(&mut delay);
             }
-            for chunk in missing.chunks(32) {
+            let mut rate_limited = false;
+            for chunk in missing.chunks(BLOCK_HASH_BATCH_SIZE) {
                 let batch: Vec<Value> = chunk
                     .iter()
                     .map(|&b| {
@@ -100,20 +138,52 @@ impl Rpc {
                     })
                     .collect();
                 let resp = self.send(&Value::Array(batch))?;
-                let Some(arr) = resp.as_array() else { continue };
-                for item in arr {
-                    let id = item.get("id").and_then(Value::as_u64);
+                let Some(responses) = resp.as_array() else {
+                    rate_limited = resp.get("error").is_some_and(is_rate_limit_error);
+                    if rate_limited {
+                        break;
+                    }
+                    continue
+                };
+                for item in responses {
+                    if item.get("error").is_some_and(is_rate_limit_error) {
+                        rate_limited = true;
+                        continue
+                    }
+                    let id = response_id(item);
                     let hash =
                         item.get("result").and_then(|r| r.get("hash")).and_then(Value::as_str);
-                    if let (Some(id), Some(hash)) = (id, hash) {
-                        cache.insert(id, hash.parse().map_err(|e| format!("{e:?}"))?);
+                    if let (Some(id), Some(hash)) = (id, hash) &&
+                        chunk.contains(&id)
+                    {
+                        let hash = hash
+                            .parse()
+                            .map_err(|error| format!("invalid hash for block {id}: {error:?}"))?;
+                        cache.insert(id, hash);
                     }
+                }
+                if rate_limited {
+                    // Stop consuming provider capacity once any item reports throttling. The next
+                    // pass retries only unresolved entries after a bounded backoff.
+                    break
                 }
             }
         }
-        let missing = (lo..=hi).filter(|n| !cache.contains_key(n)).count();
-        if missing > 0 {
-            return Err(format!("could not fetch {missing} block hashes in [{lo}, {hi}]").into());
+
+        // Batch APIs may omit entries or apply stricter limits than individual requests. Resolve
+        // the usually small remainder through `call`, which also handles JSON-RPC rate limiting.
+        let missing: Vec<u64> = (lo..=hi).filter(|n| !cache.contains_key(n)).collect();
+        for number in missing {
+            let block = self
+                .call("eth_getBlockByNumber", json!([format!("0x{number:x}"), false]))
+                .map_err(|error| format!("could not fetch block {number} hash: {error}"))?;
+            let hash = block
+                .get("hash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("block {number} returned no hash"))?
+                .parse()
+                .map_err(|error| format!("invalid hash for block {number}: {error:?}"))?;
+            cache.insert(number, hash);
         }
         Ok(())
     }
@@ -206,4 +276,26 @@ pub fn parse_block_number(s: &str) -> Result<u64, Error> {
         s.parse::<u64>()?
     };
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_http_and_json_rpc_rate_limits() {
+        assert!(is_rate_limit_error(&json!({"code": 429, "message": "throttled"})));
+        assert!(is_rate_limit_error(
+            &json!({"code": -32007, "message": "50/second request limit reached"})
+        ));
+        assert!(is_rate_limit_error(&json!({"code": -1, "message": "Too many requests"})));
+        assert!(!is_rate_limit_error(&json!({"code": -32602, "message": "invalid params"})));
+    }
+
+    #[test]
+    fn accepts_numeric_and_decimal_string_response_ids() {
+        assert_eq!(response_id(&json!({"id": 42})), Some(42));
+        assert_eq!(response_id(&json!({"id": "42"})), Some(42));
+        assert_eq!(response_id(&json!({"id": "0x2a"})), None);
+    }
 }

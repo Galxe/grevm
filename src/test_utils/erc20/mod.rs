@@ -13,10 +13,10 @@ use erc20_contract::ERC20Token;
 pub const GAS_LIMIT: u64 = 35_000;
 pub const ESTIMATED_GAS_USED: u64 = 29_738;
 
-/// Mapping from address to [EvmAccount]
+/// Mapping from addresses to [`DbAccount`] values.
 pub type ChainState = HashMap<Address, DbAccount>;
 
-/// Mapping from code hashes to [EvmCode]s
+/// Mapping from code hashes to [`Bytecode`] values.
 pub type Bytecodes = HashMap<B256, Bytecode>;
 
 /// Mapping from block numbers to block hashes

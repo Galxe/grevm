@@ -1,5 +1,9 @@
 # Grevm 2.0
 
+> Historical design report: this document describes the Grevm 2.0 implementation. Task Groups,
+> static dependency hints, and the original asynchronous-commit design are not descriptions of the
+> current scheduler.
+
 ## **TL;DR – Highlights of Grevm 2.0**
 
 - **Grevm 2.0 achieves near-optimal performance in low-contention scenarios**, matching Block-STM with **16.57

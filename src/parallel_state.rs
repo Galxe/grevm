@@ -9,7 +9,16 @@ use revm_database::{
 };
 use revm_primitives::{Address, B256, HashMap, U256};
 use revm_state::{Account, AccountInfo, Bytecode, EvmState};
-use std::{fmt::Formatter, time::Instant, vec::Vec};
+use std::{
+    fmt::Formatter,
+    time::{Duration, Instant},
+    vec::Vec,
+};
+
+#[inline]
+fn duration_micros(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000_000.0
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CacheAccountInfo {
@@ -316,6 +325,10 @@ impl ParallelCacheState {
     /// Apply output of revm execution and create account transitions that are used to build
     /// BundleState.
     pub fn apply_evm_state(&mut self, evm_state: EvmState) -> Vec<(Address, TransitionAccount)> {
+        self.apply_evm_state_inner(evm_state)
+    }
+
+    fn apply_evm_state_inner(&self, evm_state: EvmState) -> Vec<(Address, TransitionAccount)> {
         let mut transitions = Vec::with_capacity(evm_state.len());
         for (address, account) in evm_state {
             if let Some(transition) = self.apply_account_state(address, account) {
@@ -486,6 +499,233 @@ pub struct ParallelState<DB> {
     db_latency: metrics::Histogram,
 }
 
+/// Borrowed view of the state that is safe to share with speculative workers.
+///
+/// The view deliberately excludes `transition_state` and `bundle_state`: those fields are owned by
+/// the ordered commit path while workers are running. All mutation reachable through this view is
+/// provided by the concurrent cache and block-hash maps.
+pub(crate) struct ParallelStateView<'a, DB> {
+    cache: &'a ParallelCacheState,
+    database: &'a DB,
+    block_hashes: &'a DashMap<u64, B256, BuildIdentityHasher>,
+    update_db_metrics: bool,
+    db_latency: &'a metrics::Histogram,
+}
+
+impl<DB> Copy for ParallelStateView<'_, DB> {}
+
+impl<DB> Clone for ParallelStateView<'_, DB> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<DB> std::fmt::Debug for ParallelStateView<'_, DB> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParallelStateView").field("cache", self.cache).finish_non_exhaustive()
+    }
+}
+
+impl<'a, DB: DatabaseRef> ParallelStateView<'a, DB> {
+    fn with_metrics<F, R>(self, func: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        if self.update_db_metrics {
+            let start = Instant::now();
+            let result = func();
+            self.db_latency.record(duration_micros(start.elapsed()));
+            result
+        } else {
+            func()
+        }
+    }
+
+    fn load_mut_cache_account(
+        self,
+        address: Address,
+    ) -> Result<RefMut<'a, Address, CacheAccountInfo>, DB::Error> {
+        if let Some(account) = self.cache.accounts.get_mut(&address) {
+            return Ok(account);
+        }
+        let info = self.with_metrics(|| self.database.basic_ref(address))?;
+        let account = match info {
+            None => CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting),
+            Some(acc) if acc.is_empty() => CacheAccountInfo::new(
+                Some(AccountInfo::default()),
+                AccountStatus::LoadedEmptyEIP161,
+            ),
+            Some(acc) => CacheAccountInfo::new(Some(acc), AccountStatus::Loaded),
+        };
+        match self.cache.accounts.entry(address) {
+            Entry::Vacant(entry) => Ok(entry.insert(account)),
+            Entry::Occupied(entry) => Ok(entry.into_ref()),
+        }
+    }
+
+    fn increment_balance_transitions(
+        self,
+        balances: impl IntoIterator<Item = (Address, u128)>,
+    ) -> Result<Vec<(Address, TransitionAccount)>, DB::Error> {
+        let mut transitions = Vec::new();
+        for (address, balance) in balances {
+            if balance == 0 {
+                continue;
+            }
+            let mut account = self.load_mut_cache_account(address)?;
+            let transition =
+                account.increment_balance(balance).expect("balance was checked as non-zero");
+            transitions.push((address, transition));
+        }
+        Ok(transitions)
+    }
+
+    fn db_basic(self, address: Address) -> Result<Option<AccountInfo>, DB::Error> {
+        if let Some(account) = self.cache.accounts.get(&address) {
+            return Ok(account.account.clone());
+        }
+        let info = self.with_metrics(|| self.database.basic_ref(address))?;
+        let account = match info {
+            None => CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting),
+            Some(acc) if acc.is_empty() => CacheAccountInfo::new(
+                Some(AccountInfo::default()),
+                AccountStatus::LoadedEmptyEIP161,
+            ),
+            Some(acc) => CacheAccountInfo::new(Some(acc), AccountStatus::Loaded),
+        };
+        match self.cache.accounts.entry(address) {
+            Entry::Vacant(entry) => Ok(entry.insert(account).account.clone()),
+            Entry::Occupied(entry) => Ok(entry.into_ref().account.clone()),
+        }
+    }
+
+    fn db_code_by_hash(self, code_hash: B256) -> Result<Bytecode, DB::Error> {
+        if let Some(code) = self.cache.contracts.get(&code_hash) {
+            return Ok(code.value().clone());
+        }
+        let code = self.with_metrics(|| self.database.code_by_hash_ref(code_hash))?;
+        match self.cache.contracts.entry(code_hash) {
+            Entry::Occupied(entry) => Ok(entry.get().clone()),
+            Entry::Vacant(entry) => {
+                entry.insert(code.clone());
+                Ok(code)
+            }
+        }
+    }
+
+    fn db_storage(self, address: Address, index: U256) -> Result<U256, DB::Error> {
+        if let Some(slots) = self.cache.storage.get(&address) &&
+            let Some(value) = slots.get(&index)
+        {
+            return Ok(*value.value());
+        }
+        // Account is guaranteed to be loaded. Storage for destroyed and newly-created accounts is
+        // known to be zero without consulting the backing database.
+        let is_storage_known = if let Some(account) = self.cache.accounts.get(&address) {
+            account.status.is_storage_known() || account.account.is_none()
+        } else {
+            unreachable!("For accessing any storage account is guaranteed to be loaded beforehand")
+        };
+
+        let value = if is_storage_known {
+            U256::ZERO
+        } else {
+            self.with_metrics(|| self.database.storage_ref(address, index))?
+        };
+        let value = if let Some(slots) = self.cache.storage.get(&address) {
+            *slots.entry(index).or_insert(value).value()
+        } else {
+            match self.cache.storage.entry(address) {
+                Entry::Occupied(entry) => *entry.get().entry(index).or_insert(value).value(),
+                Entry::Vacant(entry) => {
+                    *entry.insert(Default::default()).entry(index).or_insert(value).value()
+                }
+            }
+        };
+        Ok(value)
+    }
+
+    fn db_block_hash(self, number: u64) -> Result<B256, DB::Error> {
+        match self.block_hashes.entry(number) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
+                Ok(*entry.insert(self.with_metrics(|| self.database.block_hash_ref(number))?))
+            }
+        }
+    }
+}
+
+impl<DB: DatabaseRef> DatabaseRef for ParallelStateView<'_, DB> {
+    type Error = DB::Error;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        (*self).db_basic(address)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        (*self).db_code_by_hash(code_hash)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        (*self).db_storage(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        (*self).db_block_hash(number)
+    }
+}
+
+/// Mutable state owned exclusively by the ordered commit thread.
+///
+/// Cache updates still go through the shared `DashMap`-backed view; only transition aggregation is
+/// mutably borrowed. This makes the actual field-level concurrency contract explicit.
+pub(crate) struct ParallelStateCommit<'a, DB> {
+    shared: ParallelStateView<'a, DB>,
+    transition_state: &'a mut Option<TransitionState>,
+}
+
+impl<DB: DatabaseRef> ParallelStateCommit<'_, DB> {
+    pub(crate) fn increment_balances(
+        &mut self,
+        balances: impl IntoIterator<Item = (Address, u128)>,
+    ) -> Result<(), DB::Error> {
+        let transitions = self.shared.increment_balance_transitions(balances)?;
+        if let Some(state) = self.transition_state.as_mut() {
+            state.add_transitions(transitions);
+        }
+        Ok(())
+    }
+}
+
+impl<DB: DatabaseRef> DatabaseRef for ParallelStateCommit<'_, DB> {
+    type Error = DB::Error;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.shared.basic_ref(address)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.shared.code_by_hash_ref(code_hash)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.shared.storage_ref(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.shared.block_hash_ref(number)
+    }
+}
+
+impl<DB: DatabaseRef> DatabaseCommit for ParallelStateCommit<'_, DB> {
+    fn commit(&mut self, evm_state: HashMap<Address, Account>) {
+        let transitions = self.shared.cache.apply_evm_state_inner(evm_state);
+        if let Some(state) = self.transition_state.as_mut() {
+            state.add_transitions(transitions);
+        }
+    }
+}
+
 impl<DB> std::fmt::Debug for ParallelState<DB> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParallelState")
@@ -513,19 +753,38 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         }
     }
 
-    fn with_metrics<F, R>(&self, func: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        if self.update_db_metrics {
-            let start = Instant::now();
-            let result = func();
-            let duration = start.elapsed().as_nanos();
-            self.db_latency.record(duration as f64);
-            result
-        } else {
-            func()
+    fn shared_view(&self) -> ParallelStateView<'_, DB> {
+        ParallelStateView {
+            cache: &self.cache,
+            database: &self.database,
+            block_hashes: &self.block_hashes,
+            update_db_metrics: self.update_db_metrics,
+            db_latency: &self.db_latency,
         }
+    }
+
+    /// Split the state into the fields shared by speculative workers and the fields exclusively
+    /// owned by ordered commit.
+    pub(crate) fn split_for_parallel(
+        &mut self,
+    ) -> (ParallelStateView<'_, DB>, ParallelStateCommit<'_, DB>) {
+        let Self {
+            cache,
+            database,
+            transition_state,
+            bundle_state: _,
+            block_hashes,
+            update_db_metrics,
+            db_latency,
+        } = self;
+        let shared = ParallelStateView {
+            cache,
+            database,
+            block_hashes,
+            update_db_metrics: *update_db_metrics,
+            db_latency,
+        };
+        (shared, ParallelStateCommit { shared, transition_state })
     }
 
     /// Returns the size hint for the inner bundle state.
@@ -546,22 +805,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         balances: impl IntoIterator<Item = (Address, u128)>,
     ) -> Result<(), DB::Error> {
-        // make transition and update cache state
-        let mut transitions = Vec::new();
-        for (address, balance) in balances {
-            if balance == 0 {
-                continue;
-            }
-            let mut original_account = self.load_mut_cache_account(address)?;
-            transitions.push((
-                address,
-                original_account.increment_balance(balance).expect("Balance is not zero"),
-            ))
-        }
-        // append transition
-        if let Some(s) = self.transition_state.as_mut() {
-            s.add_transitions(transitions)
-        }
+        let transitions = self.shared_view().increment_balance_transitions(balances)?;
+        self.apply_transition(transitions);
         Ok(())
     }
 
@@ -638,117 +883,35 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &self,
         address: Address,
     ) -> Result<RefMut<'_, Address, CacheAccountInfo>, DB::Error> {
-        if let Some(account) = self.cache.accounts.get_mut(&address) {
-            return Ok(account);
-        }
-        let info = self.with_metrics(|| self.database.basic_ref(address))?;
-        let account = match info {
-            None => CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting),
-            Some(acc) if acc.is_empty() => CacheAccountInfo::new(
-                Some(AccountInfo::default()),
-                AccountStatus::LoadedEmptyEIP161,
-            ),
-            Some(acc) => CacheAccountInfo::new(Some(acc), AccountStatus::Loaded),
-        };
-        match self.cache.accounts.entry(address) {
-            Entry::Vacant(entry) => Ok(entry.insert(account)),
-            Entry::Occupied(entry) => Ok(entry.into_ref()),
-        }
+        self.shared_view().load_mut_cache_account(address)
     }
 
     // TODO make cache aware of transitions dropping by having global transition counter.
-    /// Takes the [`BundleState`] changeset from the [`State`], replacing it
-    /// with an empty one.
+    /// Takes the accumulated [`BundleState`], replacing it with an empty one.
     ///
-    /// This will not apply any pending [`TransitionState`]. It is recommended
-    /// to call [`State::merge_transitions`] before taking the bundle.
-    ///
-    /// If the `State` has been built with the
-    /// [`StateBuilder::with_bundle_prestate`] option, the pre-state will be
-    /// taken along with any changes made by [`State::merge_transitions`].
+    /// This is a low-level, destructive operation: it does not apply or drain a pending
+    /// [`TransitionState`]. Call [`crate::ParallelTakeBundle::parallel_take_bundle`] when producing
+    /// a finalized block bundle; use this method directly only after transitions have already been
+    /// merged.
     pub fn take_bundle(&mut self) -> BundleState {
         core::mem::take(&mut self.bundle_state)
     }
 
     // Database stuff
     fn db_basic(&self, address: Address) -> Result<Option<AccountInfo>, DB::Error> {
-        if let Some(account) = self.cache.accounts.get(&address) {
-            return Ok(account.account.clone());
-        }
-        let info = self.with_metrics(|| self.database.basic_ref(address))?;
-        let account = match info {
-            None => CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting),
-            Some(acc) if acc.is_empty() => CacheAccountInfo::new(
-                Some(AccountInfo::default()),
-                AccountStatus::LoadedEmptyEIP161,
-            ),
-            Some(acc) => CacheAccountInfo::new(Some(acc), AccountStatus::Loaded),
-        };
-        match self.cache.accounts.entry(address) {
-            Entry::Vacant(entry) => Ok(entry.insert(account).account.clone()),
-            Entry::Occupied(entry) => Ok(entry.into_ref().account.clone()),
-        }
+        self.shared_view().db_basic(address)
     }
 
     fn db_code_by_hash(&self, code_hash: B256) -> Result<Bytecode, DB::Error> {
-        if let Some(code) = self.cache.contracts.get(&code_hash) {
-            return Ok(code.value().clone());
-        }
-        let code = self.with_metrics(|| self.database.code_by_hash_ref(code_hash))?;
-        match self.cache.contracts.entry(code_hash) {
-            Entry::Occupied(entry) => Ok(entry.get().clone()),
-            Entry::Vacant(entry) => {
-                // if not found in bundle ask database
-                entry.insert(code.clone());
-                Ok(code)
-            }
-        }
+        self.shared_view().db_code_by_hash(code_hash)
     }
 
     fn db_storage(&self, address: Address, index: U256) -> Result<U256, DB::Error> {
-        if let Some(slots) = self.cache.storage.get(&address) &&
-            let Some(value) = slots.get(&index)
-        {
-            return Ok(*value.value());
-        }
-        // Account is guaranteed to be loaded.
-        // Note that storage from bundle is already loaded with account.
-        let is_storage_known = if let Some(account) = self.cache.accounts.get(&address) {
-            // account will always be some, but if it is not, U256::ZERO will be returned.
-            account.status.is_storage_known() || account.account.is_none()
-        } else {
-            unreachable!("For accessing any storage account is guaranteed to be loaded beforehand")
-        };
-
-        // if account was destroyed or account is newly built
-        // we return zero and don't ask database.
-        let value = if is_storage_known {
-            U256::ZERO
-        } else {
-            self.with_metrics(|| self.database.storage_ref(address, index))?
-        };
-        let value = if let Some(slots) = self.cache.storage.get(&address) {
-            *slots.entry(index).or_insert(value).value()
-        } else {
-            match self.cache.storage.entry(address) {
-                Entry::Occupied(entry) => *entry.get().entry(index).or_insert(value).value(),
-                Entry::Vacant(entry) => {
-                    *entry.insert(Default::default()).entry(index).or_insert(value).value()
-                }
-            }
-        };
-        Ok(value)
+        self.shared_view().db_storage(address, index)
     }
 
     fn db_block_hash(&self, number: u64) -> Result<B256, DB::Error> {
-        match self.block_hashes.entry(number) {
-            Entry::Occupied(entry) => Ok(*entry.get()),
-            Entry::Vacant(entry) => {
-                let ret =
-                    *entry.insert(self.with_metrics(|| self.database.block_hash_ref(number))?);
-                Ok(ret)
-            }
-        }
+        self.shared_view().db_block_hash(number)
     }
 }
 
@@ -796,5 +959,16 @@ impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
     fn commit(&mut self, evm_state: HashMap<Address, Account>) {
         let transitions = self.cache.apply_evm_state(evm_state);
         self.apply_transition(transitions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_micros_preserves_sub_microsecond_precision() {
+        assert_eq!(duration_micros(Duration::from_nanos(1_500)), 1.5);
+        assert_eq!(duration_micros(Duration::from_secs(2)), 2_000_000.0);
     }
 }

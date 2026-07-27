@@ -1,37 +1,38 @@
-use crate::{ParallelState, utils::fork_join_util};
-use parking_lot::Mutex;
+use crate::ParallelState;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use revm::DatabaseRef;
-use revm_database::{BundleState, TransitionState, states::bundle_state::BundleRetention};
-use revm_primitives::Address;
-use std::{
-    cell::UnsafeCell,
-    sync::atomic::{AtomicUsize, Ordering},
+use revm_database::{
+    AccountRevert, BundleAccount, BundleState, TransitionState,
+    states::bundle_state::BundleRetention,
 };
+use revm_primitives::{Address, B256};
+use revm_state::Bytecode;
 
-/// A vector supporting concurrent writes to caller-guaranteed disjoint indices.
-struct DisjointVec<T>(UnsafeCell<Vec<T>>);
-
-// SAFETY: all use sites partition indices through `fork_join_util`.
-unsafe impl<T: Send> Sync for DisjointVec<T> {}
-
-impl<T> DisjointVec<T> {
-    fn new(values: Vec<T>) -> Self {
-        Self(UnsafeCell::new(values))
-    }
-
-    /// SAFETY: no other thread may access `index` concurrently.
-    unsafe fn set(&self, index: usize, value: T) {
-        unsafe { (&mut (*self.0.get()))[index] = value };
-    }
-
-    fn into_inner(self) -> Vec<T> {
-        self.0.into_inner()
-    }
+struct ProcessedAccount {
+    address: Address,
+    present: BundleAccount,
+    revert: Option<AccountRevert>,
+    state_size: usize,
+    revert_size: usize,
 }
 
-/// Parallel transition application for an initially empty bundle.
+struct ProcessedTransition {
+    contract: Option<(B256, Bytecode)>,
+    account: Option<ProcessedAccount>,
+}
+
+/// Parallel transition application for an initially empty [`BundleState`].
+///
+/// The implementation has two phases: it derives immutable per-account bundle/revert data in
+/// parallel, then updates the destination maps and accounting fields serially. Keeping mutation
+/// in the second phase avoids aliased access to the bundle while preserving revm's transition
+/// order and accounting semantics.
 pub trait ParallelBundleState {
-    /// Apply transitions and create reverts in parallel.
+    /// Applies transitions and creates reverts, using parallel preparation when `self` is empty.
+    ///
+    /// If `self` already contains state, contracts, or reverts, this delegates to revm's canonical
+    /// occupied-entry merge because existing entries may need to be combined with the new
+    /// transitions.
     fn parallel_apply_transitions_and_create_reverts(
         &mut self,
         transitions: TransitionState,
@@ -45,51 +46,69 @@ impl ParallelBundleState for BundleState {
         transitions: TransitionState,
         retention: BundleRetention,
     ) {
-        if !self.state.is_empty() {
+        if !self.state.is_empty() || !self.contracts.is_empty() || !self.reverts.is_empty() {
             self.apply_transitions_and_create_reverts(transitions, retention);
             return;
         }
 
         let include_reverts = retention.includes_reverts();
-        let revert_capacity = if include_reverts { transitions.transitions.len() } else { 0 };
-        let transitions = transitions.transitions;
-        let addresses: Vec<Address> = transitions.keys().copied().collect();
-        let reverts = DisjointVec::new(vec![None; revert_capacity]);
-        let bundle = DisjointVec::new(vec![None; transitions.len()]);
-        let state_size = AtomicUsize::new(0);
-        let reverts_size = AtomicUsize::new(0);
-        let contracts = Mutex::new(revm_primitives::HashMap::default());
-
-        fork_join_util(transitions.len(), None, |start, end, _| {
-            for (position, address) in addresses.iter().enumerate().take(end).skip(start) {
-                let transition = transitions.get(address).cloned().expect("address comes from map");
-                if let Some((hash, bytecode)) = transition.has_new_contract() {
-                    contracts.lock().insert(hash, bytecode.clone());
-                }
+        let transitions: Vec<_> = transitions.transitions.into_iter().collect();
+        let transition_count = transitions.len();
+        // This phase is pure with respect to `self`; each transition produces an independent
+        // value that can be prepared safely on any Rayon worker.
+        let processed: Vec<_> = transitions
+            .into_par_iter()
+            .map(|(address, transition)| {
+                let contract =
+                    transition.has_new_contract().map(|(hash, code)| (hash, code.clone()));
                 let present = transition.present_bundle_account();
-                if let Some(revert) = transition.create_revert() {
-                    state_size.fetch_add(present.size_hint(), Ordering::Relaxed);
-                    unsafe { bundle.set(position, Some((*address, present))) };
-                    if include_reverts {
-                        reverts_size.fetch_add(revert.size_hint(), Ordering::Relaxed);
-                        unsafe { reverts.set(position, Some((*address, revert))) };
+                let account = transition.create_revert().map(|revert| {
+                    let (revert, revert_size) = if include_reverts {
+                        let size = revert.size_hint();
+                        (Some(revert), size)
+                    } else {
+                        (None, 0)
+                    };
+                    ProcessedAccount {
+                        address,
+                        state_size: present.size_hint(),
+                        revert_size,
+                        present,
+                        revert,
                     }
+                });
+                ProcessedTransition { contract, account }
+            })
+            .collect();
+
+        let revert_capacity = if include_reverts { transition_count } else { 0 };
+        let mut reverts = Vec::with_capacity(revert_capacity);
+        self.state.reserve(transition_count);
+        // Mutate the bundle only after parallel preparation has finished. `collect` preserves the
+        // indexed input order, so this phase matches the transition order used by revm.
+        for ProcessedTransition { contract, account } in processed {
+            if let Some((hash, code)) = contract {
+                self.contracts.insert(hash, code);
+            }
+            if let Some(account) = account {
+                self.state_size += account.state_size;
+                self.reverts_size += account.revert_size;
+                self.state.insert(account.address, account.present);
+                if let Some(revert) = account.revert {
+                    reverts.push((account.address, revert));
                 }
             }
-        });
-
-        self.state_size = state_size.load(Ordering::Acquire);
-        self.reverts_size = reverts_size.load(Ordering::Acquire);
-        self.state.reserve(transitions.len());
-        self.state.extend(bundle.into_inner().into_iter().flatten());
-        self.reverts.push(reverts.into_inner().into_iter().flatten().collect());
-        self.contracts = contracts.into_inner();
+        }
+        self.reverts.push(reverts);
     }
 }
 
 /// Parallel bundle extraction from `ParallelState`.
 pub trait ParallelTakeBundle {
-    /// Take the accumulated bundle using parallel transition application.
+    /// Finalizes pending transitions and takes the accumulated bundle.
+    ///
+    /// Pending transitions are drained and the returned bundle is replaced by an empty bundle in
+    /// `ParallelState`.
     fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
 }
 
@@ -99,5 +118,64 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
             self.bundle_state.parallel_apply_transitions_and_create_reverts(transitions, retention);
         }
         self.take_bundle()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm_database::{AccountStatus, TransitionAccount};
+    use revm_primitives::{Bytes, HashMap};
+    use revm_state::AccountInfo;
+
+    fn transitions(count: usize) -> TransitionState {
+        TransitionState {
+            transitions: (0..count)
+                .map(|index| {
+                    (
+                        Address::from([index as u8; 20]),
+                        TransitionAccount {
+                            info: Some(AccountInfo { nonce: index as u64, ..Default::default() }),
+                            status: AccountStatus::InMemoryChange,
+                            previous_status: AccountStatus::LoadedNotExisting,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn parallel_bundle_matches_revm_for_empty_bundle() {
+        for include_reverts in [false, true] {
+            let retention = || {
+                if include_reverts { BundleRetention::Reverts } else { BundleRetention::PlainState }
+            };
+            let transitions = transitions(128);
+            let mut expected = BundleState::default();
+            expected.apply_transitions_and_create_reverts(transitions.clone(), retention());
+
+            let mut actual = BundleState::default();
+            actual.parallel_apply_transitions_and_create_reverts(transitions, retention());
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn existing_bundle_data_uses_revm_merge_semantics() {
+        let mut expected = BundleState::default();
+        expected
+            .contracts
+            .insert(B256::from([0x42; 32]), Bytecode::new_raw(Bytes::from_static(&[0x00])));
+        let mut actual = expected.clone();
+        let transitions = transitions(32);
+
+        expected
+            .apply_transitions_and_create_reverts(transitions.clone(), BundleRetention::Reverts);
+        actual.parallel_apply_transitions_and_create_reverts(transitions, BundleRetention::Reverts);
+
+        assert_eq!(actual, expected);
     }
 }

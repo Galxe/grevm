@@ -1,14 +1,36 @@
 # Grevm
 
-> Grevm (both 1.0 and 2.1) is reth-ready, please see [use-with-reth.md](docs/use-with-reth.md) for more details.
+Grevm is a Block-STM-inspired optimistic parallel EVM execution engine built on
+[revm](https://github.com/bluealloy/revm). It combines multi-version state, read-set validation,
+and dependency-aware scheduling while preserving block-order outcomes and state.
 
-Grevm is a Block-STM inspired optimistic parallel EVM execution engine that leverages DAG-based task scheduling, dynamic
-dependency management, and parallel state storage to significantly boost throughput of
-[revm](https://github.com/bluealloy/revm), while reducing CPU overhead in high-conflict scenarios.
+See [Use Grevm with reth](docs/use-with-reth.md) for the public API and integration model.
 
-![Design Diagram](docs/v2/images/g2design.png)
+## Current execution pipeline
 
-## **TL;DR – Highlights of Grevm 2.1**
+1. Speculative workers execute transactions against multi-version memory and record their read and
+   write sets.
+2. Validation checks every read against the latest preceding writer and incarnation. Conflicts are
+   marked as estimates and rescheduled; discovered dependencies are scheduling hints, not the
+   source of correctness.
+3. One finality loop publishes only the contiguous prefix whose validations remain newer than every
+   relevant validation rewind.
+4. One ordered-commit loop validates each original transaction nonce against committed state when
+   nonce checking is enabled, applies EVM state and the deferred beneficiary reward, records the
+   outcome, and only then publishes the new committed-prefix boundary.
+5. A nonce mismatch or recoverable scheduler abort replays only the uncommitted suffix
+   sequentially. Invalid transactions become ordered `Skipped` outcomes; fatal errors retain the
+   successfully committed prefix.
+
+`GrevmConfig::concurrency_level` controls the number of speculative workers. The finality and
+ordered-commit loops are additional coordinator threads.
+
+## Historical Grevm 2.1 highlights
+
+The following results and diagram describe the Grevm 2.1 release. Static hints, Task Groups, and
+the original lock-free DAG are historical designs and do not describe the current scheduler.
+
+![Historical Grevm 2.1 design](docs/v2/images/g2design.png)
 
 - **Grevm 2.1 achieves near-optimal performance in low-contention scenarios**, matching Block-STM with **11.25
   gigagas/s** for Uniswap workloads and outperforming it with **95% less CPU usage** in inherently non-parallelizable
@@ -26,31 +48,22 @@ dependency management, and parallel state storage to significantly boost through
   change reduces DAG scheduling overhead by **60%** and improves overall performance by more than **30%**. In workloads
   with fast-executing transactions—such as raw and ERC20 transfers—it delivers nearly **2×** higher throughput.
 
-## Architecture Overview
-
-Grevm 2.1 is composed of three main modules:
-
-- **Dependency Manager (DAG Manager):**  
-  Constructs a directed acyclic graph (DAG) of transaction dependencies based on speculative read/write hints.
-
-- **Execution Scheduler:**  
-  Selects transactions with no dependencies (out-degree of 0) for parallel execution, groups adjacent dependent
-  transactions into **task groups**, and dynamically updates dependencies to minimize re-execution.
-
-- **Parallel State Storage:**  
-  Provides an asynchronous commit mechanism with multi-version memory to reduce latency and manage miner rewards and
-  self-destruct opcodes efficiently.
-
 ## Testing
 
-All tests and benchmarks require the `test-utils` feature:
+Core library tests run without optional features:
+
+```bash
+cargo test
+```
+
+The integration suites, fixtures, and benchmarks use `test-utils`:
 
 ```bash
 cargo test --features test-utils
 ```
 
 This runs the library unit tests plus the integration suites (`erc20`, `native_transfers`,
-`uniswap`, `eip-7702`, and the mainnet replay test). See
+`uniswap`, `eip-7702`, `delegated_safety`, and mainnet replay). See
 [Testing & Benchmarking](docs/testing.md) for the full guide, including how to replay real mainnet
 blocks (EIP-7702 included) and the available environment-variable knobs.
 
@@ -70,8 +83,9 @@ is also a `continuous` benchmark that runs merged real-mainnet "big blocks"; see
 
 ## Further Details
 
-For a comprehensive explanation of the design, algorithmic choices, and in-depth benchmark analysis, please refer to the
-full technical report.
+For historical design context and benchmark analysis, refer to the versioned technical reports.
+Some implementation details in those reports, such as static dependency hints, describe their
+respective releases rather than the current code.
 
-- [Grevm 2.1 Tech Report](docs/v2/grevm2.1.md)
+- [Grevm 2.1 Historical Tech Report](docs/v2/grevm2.1.md)
 - [Grevm 1.0 Tech Report](docs/v1/README.md)

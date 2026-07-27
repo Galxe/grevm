@@ -8,8 +8,8 @@ variables that tune execution.
 
 | Feature | Pulls in | Used by |
 | --- | --- | --- |
-| `test-utils` | mock accounts, `InMemoryDB`, the execute/compare helpers, the mainnet fixture schema (`serde`, `serde_json`, `revm-primitives/serde`, `metrics-util`) | every test and benchmark |
-| `tools` | `test-utils` **+** a blocking HTTP client (`ureq`) | the `fetch_block` / `fetch_continuous` fetcher binaries only |
+| `test-utils` | mock accounts, `InMemoryDB`, execute/compare helpers, the mainnet fixture schema (`serde`, `serde_json`, `revm-primitives/serde`, `metrics-util`) | integration tests and benchmarks |
+| `tools` | `test-utils` **+** a blocking HTTP client (`ureq`) | `fetch_block`, `fetch_continuous`, and `replay_mainnet` |
 
 `tools` is kept separate from `test-utils` so the test/bench path never compiles the HTTP client,
 and a normal library build (e.g. when Grevm is a dependency) pulls in neither.
@@ -42,8 +42,9 @@ replay and upstream EIP-7702 regression tests therefore remain pure grevm-vs-rev
 checks even if the policy defaults change. Policy-enabled behavior is tested separately in
 `tests/delegated_safety.rs`.
 
-> Plain `cargo test` (without `--features test-utils`) only builds the library; the integration
-> tests and benches require the feature.
+Plain `cargo test` runs the core library unit tests without optional features; the integration
+targets are skipped by their `required-features` declarations. Integration suites and all
+benchmarks require `--features test-utils`.
 
 ## Environment-variable knobs
 
@@ -51,30 +52,36 @@ checks even if the policy defaults change. Policy-enabled behavior is tested sep
 | --- | --- | --- |
 | `GREVM_MIN_PARALLEL_TXS` | `64` | Blocks with fewer transactions fall back to sequential. Set to `0` to force the parallel path even for tiny blocks (needed when replaying small real blocks). |
 | `GREVM_FALLBACK_SEQUENTIAL` | `false` | Force sequential execution for every block. |
-| `GREVM_CONCURRENT_LEVEL` | number of CPU cores | Worker/partition count for parallel execution. |
+| `GREVM_CONCURRENT_LEVEL` | logical CPUs reported by `available_parallelism` (or `8` if unavailable) | Number of speculative execution workers. |
 | `GREVM_MAINNET_BLOCKS` | `test_data/mainnet_blocks` | Directory the mainnet replay test reads single-block fixtures from. |
+| `GREVM_MAINNET_BLOCK` | unset | If set, replay only this fixture number. |
 | `GREVM_CONTINUOUS_BLOCKS` | `test_data/con_eth_blocks` | Directory the `continuous` bench reads merged "big block" fixtures from. |
+| `GREVM_CONTINUOUS_RANGE` | unset | If set, replay only this merged-block directory name. |
+| `GREVM_PRINT_METRICS` | unset | Print captured Grevm metrics from replay helpers. |
 
 Benchmark-only tuning (read by `benches/gigagas.rs`): `NUM_EOA` (default `100000`), `HOT_RATIO`
-(`0.0`), `DB_LATENCY_US` (`0`), `WITH_HINTS` (`false`), `DEPENDENCY_RATIO` (`0.1`),
+(`0.0`), `DB_LATENCY_US` (`0`), `DEPENDENCY_RATIO` (`0.1`),
 `DEPENDENCY_DISTANCE` (`8`), `FILTER` (substring filter for which sub-benchmarks to run).
 
 These execution knobs are represented by `GrevmConfig` together with
-`DelegatedSafetyConfig`. `Scheduler::new(...)` calls `GrevmConfig::from_env()` for compatibility;
-production integrations can use `Scheduler::new_with_config(...)` and `Scheduler::execute()` to
-avoid process-global environment reads and make the block execution policy explicit.
+`DelegatedSafetyConfig`. `Scheduler::new(...)` calls `GrevmConfig::from_env()` as a convenience;
+production integrations can use `Scheduler::new_with_runtime_config(...)` and
+`Scheduler::execute()` to avoid process-global environment reads and make the block execution
+policy explicit.
 
 ## Replaying real mainnet blocks
 
 Grevm can replay real mainnet blocks and check that parallel execution matches sequential revm on
 the exact same inputs. The block's *execution environment* is downloaded over JSON-RPC and stored
-as a self-contained fixture; no full node or archive database is needed.
+as a self-contained fixture. Once downloaded, replaying that fixture needs no node or archive
+database.
 
 ### 1. Fetch a block
 
-Requires a JSON-RPC endpoint with the `debug` namespace enabled (it uses `debug_traceBlockByNumber`
-with the `prestateTracer`). Find blocks containing EIP-7702 (type-4) transactions via
-<https://etherscan.io/txnauthlist>.
+Fetching a historical block requires an endpoint that serves historical state (typically an
+archive-capable endpoint) and enables the `debug` namespace. The fetcher uses
+`debug_traceBlockByNumber` with the `prestateTracer`. Find blocks containing EIP-7702 (type-4)
+transactions via <https://etherscan.io/txnauthlist>.
 
 ```bash
 cargo run --bin fetch_block --features tools -- <block> <rpc_url> [spec] [out_dir]

@@ -5,11 +5,12 @@
 //! handler prevents delegated execution from consuming the conservative cost of later sender
 //! transactions.
 
+mod config;
 mod handler;
 mod instructions;
 mod reserve;
 
+pub use config::DelegatedSafetyConfig;
 pub(crate) use handler::{BeneficiaryMode, GrevmHandler, ReserveMode};
 pub(crate) use instructions::gravity_instructions;
-pub use reserve::DelegatedSafetyConfig;
 pub(crate) use reserve::{ReserveJournalExt, ReservePlanner};

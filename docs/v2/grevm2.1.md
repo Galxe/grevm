@@ -1,5 +1,10 @@
 # Grevm 2.1
 
+> Historical design report: this document describes the Grevm 2.1 implementation. The current
+> scheduler no longer uses static bytecode hints, Task Groups, the original lock-free DAG, or the
+> original asynchronous-commit design; it discovers scheduling dependencies from speculative reads
+> and writes at runtime.
+
 ## **TL;DR – Highlights of Grevm 2.1**
 
 - **Grevm 2.1 achieves near-optimal performance in low-contention scenarios**, matching Block-STM with **11.25

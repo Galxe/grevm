@@ -36,7 +36,6 @@ fn bench_continuous(c: &mut Criterion) {
         execute::compare_evm_execute_with_env(
             block.db.clone(),
             block.txs.clone(),
-            false,
             block.cfg.clone(),
             block.block_env.clone(),
             Default::default(),
@@ -56,7 +55,6 @@ fn bench_continuous(c: &mut Criterion) {
                     black_box(env.clone()),
                     black_box(txs.clone()),
                     state,
-                    false,
                     None,
                 );
                 executor.parallel_execute(None).unwrap();

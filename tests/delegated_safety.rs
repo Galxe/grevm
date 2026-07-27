@@ -273,12 +273,11 @@ fn execute_block_with_precompiles(
         min_parallel_txs: 0,
         delegated_safety: safety,
     };
-    let scheduler = Scheduler::new_with_config(
+    let scheduler = Scheduler::new_with_runtime_config(
         CfgEnv::new_with_spec(SpecId::PRAGUE),
         block,
         txs,
         state,
-        false,
         custom_precompiles,
         config,
     );
