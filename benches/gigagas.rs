@@ -31,7 +31,6 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
     let mut iter_loop = 0;
     let report_metrics = rand::rng().random_range(0..10);
-    let with_hints = std::env::var("WITH_HINTS").is_ok_and(|s| s.parse().unwrap());
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
@@ -42,7 +41,6 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
                     black_box(env.clone()),
                     black_box(txs.clone()),
                     black_box(state),
-                    with_hints,
                     None,
                 );
                 executor.parallel_execute(None).unwrap();

@@ -97,8 +97,10 @@ impl<'a> ReserveMode<'a> {
 ///                                                   restore CREATE-tx nonce if needed
 ///                                                                        |
 ///                                        keep authorization refund, reimburse caller
-///                                                                        |
-///                                                               reward beneficiary
+///                              |                                                 |
+///                              +-------------------------+-----------------------+
+///                                                        |
+///                                     apply beneficiary policy (immediate/deferred)
 /// ```
 ///
 /// With reserve protection disabled, no checkpoint or journal scan is performed.

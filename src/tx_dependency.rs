@@ -1,9 +1,13 @@
-use crate::TxId;
+//! Lightweight dependency scheduling for speculative transactions.
+//!
+//! Edges only decide when work is retried and may intentionally omit conflicts. Block-STM
+//! read-set validation, not this graph, is the correctness boundary.
+
+use crate::{TxId, scheduler::PublishedCursorReader};
 use ahash::AHashSet as HashSet;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[derive(Debug, Clone)]
 struct DependentState {
     onboard: bool,
     dependency: Option<TxId>,
@@ -17,7 +21,10 @@ impl Default for DependentState {
 
 pub(crate) struct TxDependency {
     num_txs: usize,
+    // `onboard` means the transaction may be claimed; `dependency` blocks that claim until its
+    // predecessor clears the reverse edge. Cursor claims remain advisory.
     dependent_state: Vec<Mutex<DependentState>>,
+    // Reverse edges keyed by predecessor.
     affect_txs: Vec<Mutex<HashSet<TxId>>>,
     index: AtomicUsize,
 }
@@ -32,30 +39,18 @@ impl TxDependency {
         }
     }
 
-    pub(crate) fn create(dependent_tx: Vec<Option<TxId>>, affect_txs: Vec<HashSet<TxId>>) -> Self {
-        assert_eq!(dependent_tx.len(), affect_txs.len());
-        let num_txs = dependent_tx.len();
-        Self {
-            num_txs,
-            dependent_state: dependent_tx
-                .into_iter()
-                .map(|dep| Mutex::new(DependentState { onboard: true, dependency: dep }))
-                .collect(),
-            affect_txs: affect_txs.into_iter().map(Mutex::new).collect(),
-            index: AtomicUsize::new(0),
-        }
-    }
-
     pub(crate) fn next(&self) -> Option<TxId> {
-        if self.index.load(Ordering::Relaxed) < self.num_txs {
-            let index = self.index.fetch_add(1, Ordering::Relaxed);
-            if index < self.num_txs {
-                let mut state = self.dependent_state[index].lock();
-                if state.onboard && state.dependency.is_none() {
-                    state.onboard = false;
-                    return Some(index)
-                }
-            }
+        if self.index.load(Ordering::Relaxed) >= self.num_txs {
+            return None;
+        }
+        let index = self.index.fetch_add(1, Ordering::Relaxed);
+        if index >= self.num_txs {
+            return None;
+        }
+        let mut state = self.dependent_state[index].lock();
+        if state.onboard && state.dependency.is_none() {
+            state.onboard = false;
+            return Some(index)
         }
         None
     }
@@ -64,11 +59,10 @@ impl TxDependency {
         self.index.load(Ordering::Relaxed)
     }
 
-    /// The benchmark `bench_dependency_distance` tests how transaction dependency distance affects
-    /// actual conflicts. When dependency_distance ≤ 4, transactions exhibit significantly higher
-    /// conflict probability, with the most pronounced effect occurring at distance = 1.
-    /// Accordingly, Grevm specifically checks dependencies with distance = 1 when updating the DAG.
-    /// This optimization balances conflict detection accuracy with computational efficiency.
+    /// Clear transactions waiting on `txid`.
+    ///
+    /// When requested, the immediate successor can be handed directly to the same worker after
+    /// its cursor position has already been passed; all other released work rewinds the cursor.
     pub(crate) fn remove(&self, txid: TxId, pop_next: bool) -> Option<TxId> {
         let mut next = None;
         let mut affects = self.affect_txs[txid].lock();
@@ -93,6 +87,7 @@ impl TxDependency {
         next
     }
 
+    /// Clear the immediate successor's blocker after publishing this committed boundary.
     pub(crate) fn commit(&self, txid: TxId) {
         let next = txid + 1;
         if next < self.num_txs {
@@ -104,14 +99,14 @@ impl TxDependency {
         }
     }
 
-    /// When transactions fail due to EVM execution errors or access incorrect miner/self-destructed
-    /// states, Grevm assigns them a special self-referential dependency (where dependency equals
-    /// the transaction's own ID). This dependency is only cleared when commit_idx matches txid,
-    /// ensuring the transaction can only proceed after obtaining the correct account state. This
-    /// mechanism guarantees state consistency while maintaining parallel execution capabilities.
-    pub(crate) fn key_tx(&self, txid: TxId, commit_idx: &AtomicUsize) {
+    /// Hold `txid` behind its own ordered-commit boundary.
+    ///
+    /// This is used after an EVM error or a read that requires committed origin state. Once the
+    /// committed prefix reaches `txid`, no barrier is installed and the cursor is rewound
+    /// immediately; otherwise committing `txid - 1` releases it through [`Self::commit`].
+    pub(crate) fn key_tx(&self, txid: TxId, commit_idx: PublishedCursorReader<'_>) {
         let mut state = self.dependent_state[txid].lock();
-        if txid > commit_idx.load(Ordering::Acquire) {
+        if txid > commit_idx.get() {
             state.dependency = Some(txid);
         }
         if !state.onboard {
@@ -122,8 +117,20 @@ impl TxDependency {
         }
     }
 
+    /// Add one scheduling predecessor, or make `txid` eligible when no predecessor is needed.
+    ///
+    /// The caller normally supplies only the latest conflicting predecessor; validation covers
+    /// dependencies not represented here. Replacing a blocker may leave a stale reverse edge;
+    /// [`Self::remove`] rechecks the current blocker before releasing work.
+    ///
+    /// `dep_id` must be a strict predecessor of `txid`. Besides matching transaction order, this
+    /// preserves the global lock order used below.
     pub(crate) fn add(&self, txid: TxId, dep_id: Option<TxId>) {
         if let Some(dep_id) = dep_id {
+            assert!(
+                dep_id < txid,
+                "dependency transaction {dep_id} must precede dependent transaction {txid}",
+            );
             let mut dep = self.affect_txs[dep_id].lock();
             let mut dep_state = self.dependent_state[dep_id].lock();
             let mut state = self.dependent_state[txid].lock();
@@ -148,18 +155,96 @@ impl TxDependency {
             }
         }
     }
+}
 
-    #[allow(dead_code)]
-    pub(crate) fn print(&self) {
-        let dependent_tx: Vec<(TxId, DependentState)> =
-            self.dependent_state.iter().map(|dep| dep.lock().clone()).enumerate().collect();
-        let affect_txs: Vec<(TxId, HashSet<TxId>)> =
-            self.affect_txs.iter().map(|affects| affects.lock().clone()).enumerate().collect();
-        tracing::debug!(
-            target: "grevm::tx_dependency",
-            ?dependent_tx,
-            ?affect_txs,
-            "dependency state dump",
-        );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_a_blocker_ignores_the_stale_reverse_edge() {
+        let dependencies = TxDependency::new(3);
+        assert_eq!(dependencies.next(), Some(0));
+        assert_eq!(dependencies.next(), Some(1));
+        assert_eq!(dependencies.next(), Some(2));
+
+        dependencies.add(2, Some(0));
+        dependencies.add(2, Some(1));
+
+        assert_eq!(dependencies.next(), Some(0));
+        dependencies.remove(0, false);
+        assert_eq!(dependencies.next(), Some(1));
+        assert_eq!(dependencies.next(), None, "transaction 2 must still wait for transaction 1");
+
+        dependencies.remove(1, false);
+        assert_eq!(dependencies.next(), Some(2));
+        assert_eq!(dependencies.next(), None);
+    }
+
+    #[test]
+    fn direct_handoff_is_not_claimed_again_by_the_cursor() {
+        let dependencies = TxDependency::new(2);
+        assert_eq!(dependencies.next(), Some(0));
+        assert_eq!(dependencies.next(), Some(1));
+
+        dependencies.add(1, Some(0));
+        assert_eq!(dependencies.next(), Some(0));
+        assert_eq!(dependencies.next(), None);
+
+        assert_eq!(dependencies.remove(0, true), Some(1));
+        assert_eq!(dependencies.next(), None);
+    }
+
+    #[test]
+    fn committed_prefix_barrier_is_released_in_either_order() {
+        fn claimed_pair() -> TxDependency {
+            let dependencies = TxDependency::new(2);
+            assert_eq!(dependencies.next(), Some(0));
+            assert_eq!(dependencies.next(), Some(1));
+            dependencies
+        }
+
+        let commit_cursor = AtomicUsize::new(0);
+        let dependencies = claimed_pair();
+        dependencies.key_tx(1, PublishedCursorReader::new(&commit_cursor));
+        assert_eq!(dependencies.next(), None);
+        commit_cursor.store(1, Ordering::Release);
+        dependencies.commit(0);
+        assert_eq!(dependencies.next(), Some(1));
+
+        let commit_cursor = AtomicUsize::new(1);
+        let dependencies = claimed_pair();
+        dependencies.commit(0);
+        dependencies.key_tx(1, PublishedCursorReader::new(&commit_cursor));
+        assert_eq!(dependencies.next(), Some(1));
+    }
+
+    #[test]
+    fn concurrent_commit_and_barrier_installation_do_not_lose_the_retry() {
+        for _ in 0..100 {
+            let dependencies = TxDependency::new(2);
+            assert_eq!(dependencies.next(), Some(0));
+            assert_eq!(dependencies.next(), Some(1));
+            let commit_cursor = AtomicUsize::new(0);
+
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    commit_cursor.store(1, Ordering::Release);
+                    dependencies.commit(0);
+                });
+                scope.spawn(|| {
+                    dependencies.key_tx(1, PublishedCursorReader::new(&commit_cursor));
+                });
+            });
+
+            assert_eq!(dependencies.next(), Some(1));
+            assert_eq!(dependencies.next(), None);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "must precede")]
+    fn dependency_must_be_a_strict_predecessor() {
+        TxDependency::new(1).add(0, Some(0));
     }
 }

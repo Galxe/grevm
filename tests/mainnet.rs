@@ -71,7 +71,6 @@ fn replay(blocks: Vec<mainnet::MainnetBlock>, root: &Path) {
         match execute::compare_evm_execute_with_env(
             block.db,
             block.txs,
-            false,
             block.cfg,
             block.block_env,
             Default::default(),

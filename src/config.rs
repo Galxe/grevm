@@ -4,7 +4,7 @@ use crate::DelegatedSafetyConfig;
 ///
 /// Environment variables are read once when [`Self::from_env`] is called. Callers that need
 /// consensus-stable behavior should construct this value explicitly and pass it to
-/// `Scheduler::new_with_config`.
+/// [`crate::Scheduler::new_with_runtime_config`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrevmConfig {
     /// Number of speculative execution workers.
@@ -18,7 +18,7 @@ pub struct GrevmConfig {
 }
 
 impl GrevmConfig {
-    /// Builds the legacy grevm runtime configuration from environment variables.
+    /// Builds the Grevm runtime configuration from environment variables.
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {

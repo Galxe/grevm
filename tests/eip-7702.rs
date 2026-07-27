@@ -208,7 +208,7 @@ fn authority_tx(authority: Address, nonce: u64, to: Address) -> TxEnv {
 /// Execute a Prague block with sender nonce validation enabled, compare Grevm's outcomes and final
 /// state against the strictly sequential skip reference, and return the verified outcomes.
 fn execute_skip_outcomes(db: InMemoryDB, txs: Vec<TxEnv>) -> Vec<TxExecutionOutcome> {
-    execute::compare_evm_execute_skipping_invalid_with_spec(db, txs, false, SpecId::PRAGUE)
+    execute::compare_evm_execute_skipping_invalid_with_spec(db, txs, SpecId::PRAGUE)
 }
 
 fn db_with_delegate_target(target: Address, code: Bytecode) -> InMemoryDB {
@@ -226,14 +226,7 @@ fn run_with_db(db: InMemoryDB, txs: Vec<TxEnv>) {
     // Prague enables EIP-7702. `disable_nonce_check = true` only relaxes the tx-sender nonce
     // (every sponsor/caller is distinct here anyway); the authorization-nonce check, which
     // orders the delegations on a shared authority, is independent and still enforced.
-    execute::compare_evm_execute_with_spec(
-        db,
-        txs,
-        false,
-        true,
-        Default::default(),
-        SpecId::PRAGUE,
-    );
+    execute::compare_evm_execute_with_spec(db, txs, true, Default::default(), SpecId::PRAGUE);
 }
 
 /// The authorization increments A's nonce from 0 to 1, then the delegated code executes CREATE
@@ -494,14 +487,7 @@ fn selfdestruct_then_recreate_clears_storage() {
     txs[creator_idx] = create_tx(creator_idx, init_code); // redeploy "copy slot0->slot1" at victim
     txs[80] = call_tx(80, victim); // runs recreated: slot1 := slot0, which must be 0 (cleared)
 
-    execute::compare_evm_execute_with_spec(
-        db,
-        txs,
-        false,
-        true,
-        Default::default(),
-        SpecId::SHANGHAI,
-    );
+    execute::compare_evm_execute_with_spec(db, txs, true, Default::default(), SpecId::SHANGHAI);
 }
 
 /// Init code that, when run, deploys `runtime` as the new account's code

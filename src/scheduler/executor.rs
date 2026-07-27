@@ -1,7 +1,7 @@
 //! EVM construction and transaction driving for the scheduler.
 
 use crate::{
-    ParallelState, TxVersion,
+    TxVersion,
     cache_db::CacheDB,
     delegated_safety::{
         BeneficiaryMode, DelegatedSafetyConfig, GrevmHandler, ReserveMode, ReservePlanner,
@@ -25,7 +25,7 @@ use revm_context::{
 };
 use revm_inspector::NoOpInspector;
 use revm_primitives::Address;
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 type GrevmContext<DB> = Context<BlockEnv, TxEnv, CfgEnv, DB>;
 
@@ -48,7 +48,7 @@ where
         tx: TxEnv,
     ) -> Result<ResultAndState, EVMError<DB::Error>>;
 
-    fn db_mut(&mut self) -> &mut CacheDB<'db, ParallelState<DB>>;
+    fn db_mut(&mut self) -> &mut CacheDB<'db, DB>;
 }
 
 /// One executor for all four delegated-safety configurations.
@@ -59,18 +59,18 @@ pub(crate) struct GrevmExecutor<'a, DB>
 where
     DB: DatabaseRef,
 {
-    evm: GrevmEvm<CacheDB<'a, ParallelState<DB>>>,
+    evm: GrevmEvm<CacheDB<'a, DB>>,
     /// `Some` enables delegated-balance reserve checks; `None` adds no checkpoint or scan.
     reserve_planner: Option<Arc<ReservePlanner>>,
 }
 
 impl<'a, DB> GrevmExecutor<'a, DB>
 where
-    DB: DatabaseRef,
+    DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + 'static,
 {
     pub(crate) fn new(
-        db: CacheDB<'a, ParallelState<DB>>,
+        db: CacheDB<'a, DB>,
         cfg: CfgEnv,
         block: BlockEnv,
         custom_precompiles: &[(Address, DynPrecompile)],
@@ -85,7 +85,7 @@ where
 
 impl<'a, DB> ParallelTransactionExecutor<'a, DB> for GrevmExecutor<'a, DB>
 where
-    DB: DatabaseRef,
+    DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + 'static,
 {
     fn transact(
@@ -102,7 +102,7 @@ where
         output.map(|result| ResultAndState { result, state })
     }
 
-    fn db_mut(&mut self) -> &mut CacheDB<'a, ParallelState<DB>> {
+    fn db_mut(&mut self) -> &mut CacheDB<'a, DB> {
         self.evm.db_mut()
     }
 }

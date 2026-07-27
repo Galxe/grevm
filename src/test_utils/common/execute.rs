@@ -35,8 +35,7 @@ use std::{
 /// instead captures metrics from all threads and all blocks; [`Snapshotter::snapshot`] drains the
 /// histograms, so each call returns just that block's values and memory stays bounded.
 ///
-/// Returns `None` if metric capture isn't requested or another global recorder is already
-/// installed.
+/// Returns `None` if another global recorder is already installed.
 fn metrics_snapshotter() -> Option<&'static Snapshotter> {
     static SNAPSHOTTER: OnceLock<Option<Snapshotter>> = OnceLock::new();
     SNAPSHOTTER
@@ -46,6 +45,18 @@ fn metrics_snapshotter() -> Option<&'static Snapshotter> {
             recorder.install().ok().map(|()| snapshotter)
         })
         .as_ref()
+}
+
+fn assert_expected_metrics(
+    observed: &BTreeMap<&'static str, usize>,
+    expected: HashMap<&str, usize>,
+) {
+    for (name, expected) in expected {
+        let actual = observed
+            .get(name)
+            .unwrap_or_else(|| panic!("expected metric `{name}` was not recorded"));
+        assert_eq!(actual, &expected, "metric `{name}` mismatch");
+    }
 }
 
 /// Runtime configuration for revm-compatibility tests.
@@ -118,21 +129,13 @@ pub fn compare_execution_result(left: &[ExecutionResult], right: &[TxExecutionOu
 pub fn compare_evm_execute<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    with_hints: bool,
     disable_nonce_check: bool,
     parallel_metrics: HashMap<&str, usize>,
 ) where
     DB: DatabaseRef + Send + Sync + Debug,
     DB::Error: Send + Sync + Clone + Debug + 'static,
 {
-    compare_evm_execute_with_spec(
-        db,
-        txs,
-        with_hints,
-        disable_nonce_check,
-        parallel_metrics,
-        SpecId::SHANGHAI,
-    );
+    compare_evm_execute_with_spec(db, txs, disable_nonce_check, parallel_metrics, SpecId::SHANGHAI);
 }
 
 /// Same as [`compare_evm_execute`] but lets the caller pick the [`SpecId`]. Needed for
@@ -140,7 +143,6 @@ pub fn compare_evm_execute<DB>(
 pub fn compare_evm_execute_with_spec<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    with_hints: bool,
     disable_nonce_check: bool,
     parallel_metrics: HashMap<&str, usize>,
     spec: SpecId,
@@ -152,7 +154,7 @@ pub fn compare_evm_execute_with_spec<DB>(
     let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.disable_nonce_check = disable_nonce_check;
     // Synthetic blocks are constructed to always execute, so a sequential failure is itself a bug.
-    match compare_evm_execute_with_env(db, txs, with_hints, cfg, env, parallel_metrics) {
+    match compare_evm_execute_with_env(db, txs, cfg, env, parallel_metrics) {
         ReplayOutcome::Ok { .. } => {}
         ReplayOutcome::SequentialFailed(e) => panic!("sequential reference execution failed: {e}"),
     }
@@ -167,7 +169,6 @@ pub fn compare_evm_execute_with_spec<DB>(
 pub fn compare_evm_execute_skipping_invalid_with_spec<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    with_hints: bool,
     spec: SpecId,
 ) -> Vec<TxExecutionOutcome>
 where
@@ -184,15 +185,8 @@ where
             .unwrap_or_else(|error| panic!("sequential skip reference failed: {error:?}"));
 
     let state = ParallelState::new(db, true, true);
-    let scheduler = Scheduler::new_with_config(
-        cfg,
-        env,
-        txs,
-        state,
-        with_hints,
-        None,
-        revm_compatibility_config(),
-    );
+    let scheduler =
+        Scheduler::new_with_runtime_config(cfg, env, txs, state, None, revm_compatibility_config());
     scheduler.parallel_execute(Some(23)).expect("parallel execute failed");
     let (actual_outcomes, mut state) = scheduler.take_result_and_state();
     let actual_bundle = state.parallel_take_bundle(BundleRetention::Reverts);
@@ -226,7 +220,6 @@ pub enum ReplayOutcome {
 pub fn compare_evm_execute_with_env<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    with_hints: bool,
     cfg: CfgEnv,
     env: BlockEnv,
     parallel_metrics: HashMap<&str, usize>,
@@ -248,27 +241,24 @@ where
     let sequential = start.elapsed();
 
     // 2) Grevm parallel. The reference already succeeded, so an error here is a real grevm bug.
-    // Capture metrics when requested (`GREVM_PRINT_METRICS`, set by `replay_mainnet`) or when the
-    // caller asserts on them. The recorder is installed before execution so all of grevm's metrics
-    // land in it, then snapshotted right after so we read *this* block's values.
-    let want_metrics =
-        std::env::var_os("GREVM_PRINT_METRICS").is_some() || !parallel_metrics.is_empty();
-    let snapshotter = want_metrics.then(metrics_snapshotter).flatten();
-
+    // The global recorder is only for optional diagnostics. Assertions use the scheduler's own
+    // collector below, so concurrent tests cannot drain or contaminate one another's metrics.
+    let snapshotter =
+        std::env::var_os("GREVM_PRINT_METRICS").is_some().then(metrics_snapshotter).flatten();
     let start = Instant::now();
     let state = ParallelState::new(db.clone(), true, true);
-    let executor = Scheduler::new_with_config(
+    let executor = Scheduler::new_with_runtime_config(
         cfg.clone(),
         env.clone(),
         txs.clone(),
         state,
-        with_hints,
         None,
         revm_compatibility_config(),
     );
     // set determined partitions
     executor.parallel_execute(Some(23)).expect("parallel execute failed");
     let parallel = start.elapsed();
+    let observed_metrics = executor.metrics_snapshot();
     let (results, mut state) = executor.take_result_and_state();
     let parallel_result = (results, state.parallel_take_bundle(BundleRetention::Reverts));
 
@@ -279,12 +269,11 @@ where
                 DebugValue::Gauge(v) => v.0 as usize,
                 DebugValue::Histogram(v) => v.last().cloned().map_or(0, |ov| ov.0 as usize),
             };
-            println!("metrics: {} => value: {:?}", key.key().name(), value);
-            if let Some(metric) = parallel_metrics.get(key.key().name()) {
-                assert_eq!(*metric, value);
-            }
+            let name = key.key().name();
+            println!("metrics: {name} => value: {value:?}");
         }
     }
+    assert_expected_metrics(&observed_metrics, parallel_metrics);
 
     compare_execution_result(&reth_result.0, &parallel_result.0);
     compare_bundle_state(&reth_result.1, &parallel_result.1);
@@ -433,4 +422,24 @@ where
         }
     }
     kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "expected metric `grevm.missing` was not recorded")]
+    fn expected_metrics_reject_missing_keys() {
+        assert_expected_metrics(&BTreeMap::new(), [("grevm.missing", 1)].into_iter().collect());
+    }
+
+    #[test]
+    #[should_panic(expected = "metric `grevm.total_tx_cnt` mismatch")]
+    fn expected_metrics_reject_wrong_values() {
+        assert_expected_metrics(
+            &[("grevm.total_tx_cnt", 7)].into_iter().collect(),
+            [("grevm.total_tx_cnt", 8)].into_iter().collect(),
+        );
+    }
 }

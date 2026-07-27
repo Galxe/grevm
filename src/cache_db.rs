@@ -1,11 +1,11 @@
 use crate::{
-    AccountBasic, LocationAndType, MVMemory, MemoryEntry, MemoryValue, ReadVersion, TxId, TxVersion,
+    AccountBasic, LocationAndType, MVMemory, MemoryEntry, MemoryValue, ReadVersion, TxId,
+    TxVersion, scheduler::PublishedCursorReader,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use revm::{Database, DatabaseRef};
 use revm_primitives::{Address, B256, U256, hardfork::SpecId};
 use revm_state::{AccountInfo, Bytecode, EvmState};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug)]
 pub(crate) struct CacheDB<'a, DB>
@@ -16,7 +16,7 @@ where
     coinbase: Address,
     db: &'a DB,
     mv_memory: &'a MVMemory,
-    commit_idx: &'a AtomicUsize,
+    commit_idx: PublishedCursorReader<'a>,
 
     read_set: HashMap<LocationAndType, ReadVersion>,
     read_accounts: HashMap<Address, AccountBasic>,
@@ -34,7 +34,7 @@ where
         coinbase: Address,
         db: &'a DB,
         mv_memory: &'a MVMemory,
-        commit_idx: &'a AtomicUsize,
+        commit_idx: PublishedCursorReader<'a>,
     ) -> Self {
         Self {
             spec,
@@ -249,7 +249,7 @@ where
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let mut result = None;
         if address == self.coinbase {
-            self.accurate_origin = self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid;
+            self.accurate_origin = self.commit_idx.get() == self.current_tx.txid;
             result = self.db.basic_ref(address)?;
         } else {
             let mut read_version = ReadVersion::Storage;
@@ -280,7 +280,7 @@ where
                             ReadVersion::MvMemory(TxVersion::new(txid, entry.incarnation));
                     }
                     MemoryValue::SelfDestructed => {
-                        if self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid {
+                        if self.commit_idx.get() == self.current_tx.txid {
                             // make sure read after the latest self-destructed
                             clear_destructed_entry = true;
                         } else {

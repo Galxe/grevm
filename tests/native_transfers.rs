@@ -22,7 +22,7 @@ fn execute_outcomes(txs: Vec<TxEnv>) -> Vec<TxExecutionOutcome> {
 }
 
 fn execute_outcomes_with_db(db: InMemoryDB, txs: Vec<TxEnv>) -> Vec<TxExecutionOutcome> {
-    execute::compare_evm_execute_skipping_invalid_with_spec(db, txs, false, SpecId::SHANGHAI)
+    execute::compare_evm_execute_skipping_invalid_with_spec(db, txs, SpecId::SHANGHAI)
 }
 
 fn independent_transfer(index: usize) -> TxEnv {
@@ -139,7 +139,6 @@ fn intrinsic_gas_error_falls_back_and_continues_suffix() {
         BlockEnv::default(),
         Arc::new(txs),
         state,
-        false,
         None,
     );
     scheduler.parallel_execute(Some(23)).expect("transaction validation errors must be skipped");
@@ -165,14 +164,8 @@ fn basefee_error_falls_back_and_continues_suffix() {
 
     let state = ParallelState::new(db, true, false);
     let env = BlockEnv { basefee: 100, ..Default::default() };
-    let scheduler = Scheduler::new(
-        CfgEnv::new_with_spec(SpecId::SHANGHAI),
-        env,
-        Arc::new(txs),
-        state,
-        false,
-        None,
-    );
+    let scheduler =
+        Scheduler::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), env, Arc::new(txs), state, None);
     scheduler.parallel_execute(Some(23)).expect("basefee-invalid transaction must be skipped");
     let (outcomes, _) = scheduler.take_result_and_state();
 
@@ -199,7 +192,6 @@ fn nonce_overflow_from_parallel_commit_falls_back_and_continues_suffix() {
         BlockEnv::default(),
         Arc::new(txs),
         state,
-        false,
         None,
     );
     scheduler.parallel_execute(Some(23)).expect("nonce overflow must be skipped");
@@ -259,7 +251,7 @@ fn native_gigagas() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, true, false, Default::default());
+    execute::compare_evm_execute(db, txs, false, Default::default());
 }
 
 #[test]
@@ -281,7 +273,7 @@ fn native_transfers_independent() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, true, false, Default::default());
+    execute::compare_evm_execute(db, txs, false, Default::default());
 }
 
 #[test]
@@ -318,7 +310,7 @@ fn native_with_same_sender() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, false, true, Default::default());
+    execute::compare_evm_execute(db, txs, true, Default::default());
 }
 
 #[test]
@@ -343,7 +335,7 @@ fn native_with_all_related() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, false, true, Default::default());
+    execute::compare_evm_execute(db, txs, true, Default::default());
 }
 
 #[test]
@@ -372,7 +364,7 @@ fn native_with_unconfirmed_reuse() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, false, true, HashMap::default());
+    execute::compare_evm_execute(db, txs, true, HashMap::default());
 }
 
 #[test]
@@ -381,7 +373,7 @@ fn native_zero_or_one_tx() {
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
     let txs: Vec<TxEnv> = vec![];
     // empty block
-    execute::compare_evm_execute(db, txs, false, false, HashMap::default());
+    execute::compare_evm_execute(db, txs, false, HashMap::default());
 
     // one tx
     let txs = vec![TxEnv {
@@ -395,7 +387,7 @@ fn native_zero_or_one_tx() {
     }];
     let accounts = account::mock_block_accounts(1);
     let db = InMemoryDB::new(accounts, Default::default(), Default::default());
-    execute::compare_evm_execute(db, txs, false, false, HashMap::default());
+    execute::compare_evm_execute(db, txs, false, HashMap::default());
 }
 
 #[test]
@@ -421,7 +413,7 @@ fn native_loaded_not_existing_account() {
             }
         })
         .collect();
-    execute::compare_evm_execute(db, txs, true, false, HashMap::default());
+    execute::compare_evm_execute(db, txs, false, HashMap::default());
 }
 
 #[test]
@@ -484,7 +476,7 @@ fn native_transfer_with_beneficiary() {
         nonce: 3,
         ..TxEnv::default()
     });
-    execute::compare_evm_execute(db, txs, true, false, Default::default());
+    execute::compare_evm_execute(db, txs, false, Default::default());
 }
 
 #[test]
@@ -547,5 +539,5 @@ fn native_transfer_with_beneficiary_enough() {
         nonce: 3,
         ..TxEnv::default()
     });
-    execute::compare_evm_execute(db, txs, true, false, Default::default());
+    execute::compare_evm_execute(db, txs, false, Default::default());
 }
