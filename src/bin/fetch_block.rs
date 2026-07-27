@@ -27,7 +27,7 @@ mod rpc;
 use std::path::PathBuf;
 
 use grevm::test_utils::common::mainnet::{
-    self, BlockFixture, PreState, TxFixture, spec_for_timestamp, write_mainnet_block,
+    self, BlockFixture, PreState, TxFixture, spec_for_mainnet_block, write_mainnet_block,
 };
 use rpc::{Rpc, parse_block_number};
 use serde_json::{Value, json};
@@ -62,8 +62,11 @@ fn main() -> Result<(), Error> {
     }
     let spec_id = spec_override.unwrap_or_else(|| {
         let ts = block.get("timestamp").and_then(Value::as_str).unwrap_or("0x0");
-        spec_for_timestamp(u64::from_str_radix(ts.trim_start_matches("0x"), 16).unwrap_or(0))
-            .to_string()
+        spec_for_mainnet_block(
+            block_number,
+            u64::from_str_radix(ts.trim_start_matches("0x"), 16).unwrap_or(0),
+        )
+        .to_string()
     });
     let mut block_fixture = BlockFixture::from_rpc(block_number, chain_id, spec_id, &block)?;
     // prestateTracer can't report block hashes (not account state); fetch the last 256 for

@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 use grevm::test_utils::common::{
     execute,
-    mainnet::{self, BlockFixture, PreState, TxFixture, spec_for_timestamp, write_block},
+    mainnet::{self, BlockFixture, PreState, TxFixture, spec_for_mainnet_block, write_block},
 };
 use revm_context::TxEnv;
 use rpc::{Rpc, parse_block_number};
@@ -69,9 +69,11 @@ fn main() -> Result<(), Error> {
             return Err(format!("block {hex} not found").into());
         }
         let ts = block.get("timestamp").and_then(Value::as_str).unwrap_or("0x0");
-        let spec =
-            spec_for_timestamp(u64::from_str_radix(ts.trim_start_matches("0x"), 16).unwrap_or(0))
-                .to_string();
+        let spec = spec_for_mainnet_block(
+            bn,
+            u64::from_str_radix(ts.trim_start_matches("0x"), 16).unwrap_or(0),
+        )
+        .to_string();
         let bf = BlockFixture::from_rpc(bn, chain_id, spec, &block)?;
 
         let n_tx = if let Some(arr) = block.get("transactions").and_then(Value::as_array) {

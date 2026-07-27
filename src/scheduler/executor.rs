@@ -126,12 +126,44 @@ where
         .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
             PrecompileSpecId::from_spec_id(spec),
         )));
-    if forbid_delegated_create {
-        evm.instruction = gravity_instructions();
+    // Keep this local gate as a defensive invariant for callers of this construction helper;
+    // Scheduler also normalizes the complete delegated-safety policy for the selected spec.
+    if forbid_delegated_create && spec.is_enabled_in(revm_primitives::hardfork::SpecId::PRAGUE) {
+        evm.instruction = gravity_instructions(spec);
     }
     for (address, precompile) in custom_precompiles {
         let precompile = precompile.clone();
         evm.precompiles.apply_precompile(address, move |_| Some(precompile));
     }
     evm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm_database::EmptyDB;
+    use revm_primitives::hardfork::SpecId;
+
+    #[test]
+    fn delegated_create_guard_preserves_selected_spec_gas_table() {
+        for spec in [
+            SpecId::FRONTIER,
+            SpecId::SPURIOUS_DRAGON,
+            SpecId::BERLIN,
+            SpecId::PRAGUE,
+            SpecId::OSAKA,
+            SpecId::AMSTERDAM,
+        ] {
+            let cfg = CfgEnv::new_with_spec(spec);
+            let block = BlockEnv::default();
+            let standard = build_evm(EmptyDB::new(), cfg.clone(), block.clone(), &[], false);
+            let guarded = build_evm(EmptyDB::new(), cfg, block, &[], true);
+
+            assert_eq!(
+                guarded.instruction.gas_table(),
+                standard.instruction.gas_table(),
+                "gas table mismatch for {spec:?}"
+            );
+        }
+    }
 }

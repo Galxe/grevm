@@ -169,9 +169,12 @@ where
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
-        config: GrevmConfig,
+        mut config: GrevmConfig,
     ) -> Self {
         let num_txs = txs.len();
+        // The configuration may be shared across historical and current blocks. EIP-7702 safety
+        // policies become effective only once the selected EVM spec activates Prague.
+        config.delegated_safety = config.delegated_safety.for_spec(cfg.spec);
         // Reserve-planner construction is O(1): sender indexing and per-account maximum-cost
         // suffixes remain lazy until surviving delegated execution actually debits an account.
         let reserve_planner = config

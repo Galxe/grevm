@@ -6,8 +6,7 @@ use crate::{
     TxExecutionOutcome,
 };
 use revm::{
-    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext,
-    precompile::{PrecompileSpecId, Precompiles},
+    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
 };
 use revm_context::{
     BlockEnv, CfgEnv, TxEnv,
@@ -298,14 +297,18 @@ where
         .with_cfg(cfg)
         .with_block(env)
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-            PrecompileSpecId::from_spec_id(spec),
-        )));
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles));
     let mut evm = EthEvm::new(evm, false);
 
     let mut results = Vec::with_capacity(txs.len());
     for tx in txs {
-        let result_and_state = evm.transact_raw(tx.clone())?;
+        let result_and_state = evm.transact_raw(tx.clone()).map_err(|e| match e {
+            EVMError::Transaction(t) => EVMError::Transaction(t),
+            EVMError::Header(h) => EVMError::Header(h),
+            EVMError::Database(inner) => EVMError::Database(inner.into_external_error()),
+            EVMError::Custom(s) => EVMError::Custom(s),
+            EVMError::CustomAny(a) => EVMError::CustomAny(a),
+        })?;
         evm.db_mut().commit(result_and_state.state);
         results.push(result_and_state.result);
     }
@@ -337,9 +340,7 @@ where
         .with_cfg(cfg)
         .with_block(env)
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-            PrecompileSpecId::from_spec_id(spec),
-        )));
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles));
     let mut evm = EthEvm::new(evm, false);
 
     let mut outcomes = Vec::with_capacity(txs.len());
@@ -347,7 +348,9 @@ where
         if !disable_nonce_check && tx.nonce == u64::MAX {
             let state_nonce = match evm.db_mut().basic_ref(tx.caller) {
                 Ok(info) => info.map_or(0, |info| info.nonce),
-                Err(error) => return Err(EVMError::Database(error)),
+                Err(error) => {
+                    return Err(EVMError::Database(error.into_external_error()));
+                }
             };
             if state_nonce == u64::MAX {
                 outcomes.push(TxExecutionOutcome::Skipped(
@@ -364,7 +367,12 @@ where
             Err(EVMError::Transaction(error)) => {
                 outcomes.push(TxExecutionOutcome::Skipped(error));
             }
-            Err(error) => return Err(error),
+            Err(EVMError::Header(error)) => return Err(EVMError::Header(error)),
+            Err(EVMError::Database(error)) => {
+                return Err(EVMError::Database(error.into_external_error()));
+            }
+            Err(EVMError::Custom(error)) => return Err(EVMError::Custom(error)),
+            Err(EVMError::CustomAny(error)) => return Err(EVMError::CustomAny(error)),
         }
     }
     evm.db_mut().merge_transitions(BundleRetention::Reverts);
@@ -400,9 +408,7 @@ where
         .with_cfg(cfg)
         .with_block(env)
         .build_mainnet_with_inspector(NoOpInspector {})
-        .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
-            PrecompileSpecId::from_spec_id(spec),
-        )));
+        .with_precompiles(PrecompilesMap::from_static(EthPrecompiles::new(spec).precompiles));
     let mut evm = EthEvm::new(evm, false);
 
     let mut kept = Vec::new();
@@ -410,7 +416,7 @@ where
     for (i, tx) in txs.iter().enumerate() {
         match evm.transact_raw(tx.clone()) {
             Ok(result_and_state) => {
-                total_gas = total_gas.saturating_add(result_and_state.result.gas_used());
+                total_gas = total_gas.saturating_add(result_and_state.result.tx_gas_used());
                 evm.db_mut().commit(result_and_state.state);
                 kept.push(i);
                 if total_gas >= gas_cap {

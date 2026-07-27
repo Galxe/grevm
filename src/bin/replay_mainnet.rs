@@ -40,7 +40,8 @@ use std::{
 use grevm::test_utils::common::{
     execute,
     mainnet::{
-        self, AccountFixture, BlockFixture, MainnetBlock, PreState, TxFixture, spec_for_timestamp,
+        self, AccountFixture, BlockFixture, MainnetBlock, PreState, TxFixture,
+        spec_for_mainnet_block,
     },
 };
 use revm_primitives::{Address, B256};
@@ -265,9 +266,11 @@ fn build_block(
     caches: &mut Caches,
 ) -> Result<MainnetBlock, Error> {
     let ts = block.get("timestamp").and_then(Value::as_str).unwrap_or("0x0");
-    let spec =
-        spec_for_timestamp(u64::from_str_radix(ts.trim_start_matches("0x"), 16).unwrap_or(0))
-            .to_string();
+    let spec = spec_for_mainnet_block(
+        number,
+        u64::from_str_radix(ts.trim_start_matches("0x"), 16).unwrap_or(0),
+    )
+    .to_string();
     let mut bf = BlockFixture::from_rpc(number, chain_id, spec, block)?;
     // Block hashes for BLOCKHASH, reusing the cross-block cache (fetches only the few new entries).
     let (lo, hi) = (number.saturating_sub(256), number.saturating_sub(1));

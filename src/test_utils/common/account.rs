@@ -8,7 +8,13 @@ pub const MINER_ADDRESS: Address = address!("00000000000000000000000000000000000
 
 pub fn mock_miner_account() -> (Address, PlainAccount) {
     let account = PlainAccount {
-        info: AccountInfo { balance: U256::from(0), nonce: 1, code_hash: KECCAK_EMPTY, code: None },
+        info: AccountInfo {
+            balance: U256::from(0),
+            nonce: 1,
+            code_hash: KECCAK_EMPTY,
+            code: None,
+            ..Default::default()
+        },
         storage: Default::default(),
     };
     (MINER_ADDRESS, account)
@@ -28,6 +34,7 @@ pub fn mock_eoa_account(idx: usize) -> (Address, PlainAccount) {
             nonce: 1,
             code_hash: KECCAK_EMPTY,
             code: None,
+            ..Default::default()
         },
         storage: Default::default(),
     };

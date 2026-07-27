@@ -1,10 +1,8 @@
 use super::*;
-#[cfg(feature = "test-utils")]
-use crate::DelegatedSafetyConfig;
-use crate::InvalidTransaction;
+use crate::{DelegatedSafetyConfig, InvalidTransaction};
 use revm_context::{
     DBErrorMarker,
-    result::{ExecutionResult, Output, ResultAndState, SuccessReason},
+    result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
 };
 use revm_database::EmptyDB;
 use revm_primitives::{B256, Bytes, TxKind, U256, hardfork::SpecId};
@@ -88,6 +86,28 @@ fn empty_scheduler(num_txs: usize) -> Scheduler<EmptyDB> {
         ParallelState::new(EmptyDB::default(), true, false),
         None,
     )
+}
+
+#[test]
+fn scheduler_activates_delegated_safety_only_from_prague() {
+    let make_scheduler = |spec| {
+        Scheduler::new_with_runtime_config(
+            CfgEnv::new_with_spec(spec),
+            BlockEnv::default(),
+            Arc::new(Vec::new()),
+            ParallelState::new(EmptyDB::default(), true, false),
+            None,
+            GrevmConfig::default().with_delegated_safety(DelegatedSafetyConfig::enabled()),
+        )
+    };
+
+    let cancun = make_scheduler(SpecId::CANCUN);
+    assert_eq!(cancun.config.delegated_safety, DelegatedSafetyConfig::disabled());
+    assert!(cancun.reserve_planner.is_none());
+
+    let prague = make_scheduler(SpecId::PRAGUE);
+    assert_eq!(prague.config.delegated_safety, DelegatedSafetyConfig::enabled());
+    assert!(prague.reserve_planner.is_some());
 }
 
 #[test]
@@ -285,8 +305,7 @@ fn ordered_commit_database_error_aborts_and_returns_exact_error() {
         execute_result: Ok(ResultAndState {
             result: ExecutionResult::Success {
                 reason: SuccessReason::Stop,
-                gas_used: 21_000,
-                gas_refunded: 0,
+                gas: ResultGas::default().with_total_gas_spent(21_000),
                 logs: Vec::new(),
                 output: Output::Call(Bytes::new()),
             },
@@ -338,8 +357,7 @@ fn ordered_commit_error_retains_the_successful_prefix() {
             execute_result: Ok(ResultAndState {
                 result: ExecutionResult::Success {
                     reason: SuccessReason::Stop,
-                    gas_used: 21_000,
-                    gas_refunded: 0,
+                    gas: ResultGas::default().with_total_gas_spent(21_000),
                     logs: Vec::new(),
                     output: Output::Call(Bytes::new()),
                 },

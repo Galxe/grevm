@@ -284,7 +284,9 @@ fn balance_before_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm_context::{JournalTr, journal::entry::SelfdestructionRevertStatus};
+    use revm::{
+        context::JournalTr, context_interface::journaled_state::entry::SelfdestructionRevertStatus,
+    };
     use revm_database::EmptyDB;
     use revm_primitives::address;
     use revm_state::{Account, Bytecode};

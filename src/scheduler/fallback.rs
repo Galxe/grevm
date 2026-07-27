@@ -154,7 +154,7 @@ mod tests {
     use crate::ParallelState;
     use revm_context::{
         BlockEnv, CfgEnv,
-        result::{Output, SuccessReason},
+        result::{Output, ResultGas, SuccessReason},
     };
     use revm_database::EmptyDB;
     use revm_primitives::{Bytes, hardfork::SpecId};
@@ -163,8 +163,7 @@ mod tests {
     fn success() -> ExecutionResult {
         ExecutionResult::Success {
             reason: SuccessReason::Stop,
-            gas_used: 21_000,
-            gas_refunded: 0,
+            gas: ResultGas::default().with_total_gas_spent(21_000),
             logs: Vec::new(),
             output: Output::Call(Bytes::new()),
         }

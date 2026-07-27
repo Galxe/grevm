@@ -84,6 +84,7 @@ fn contract_account(code: &Bytecode) -> PlainAccount {
             nonce: 1,
             code_hash: code.hash_slow(),
             code: Some(code.clone()),
+            ..Default::default()
         },
         storage: Default::default(),
     }
@@ -96,6 +97,7 @@ fn eoa_account(balance: u128, nonce: u64) -> PlainAccount {
             nonce,
             code_hash: KECCAK_EMPTY,
             code: None,
+            ..Default::default()
         },
         storage: Default::default(),
     }
@@ -382,6 +384,7 @@ fn db_with_predelegated_a(nonce: u64, stored: u64) -> InMemoryDB {
             nonce,
             code_hash: base_designator.hash_slow(),
             code: Some(base_designator.clone()),
+            ..Default::default()
         },
         storage: [(U256::from(0), U256::from(stored))].into_iter().collect(),
     };
@@ -472,6 +475,7 @@ fn selfdestruct_then_recreate_clears_storage() {
             nonce: 1,
             code_hash: selfdestruct_code.hash_slow(),
             code: Some(selfdestruct_code.clone()),
+            ..Default::default()
         },
         storage: [(U256::from(0), U256::from(99))].into_iter().collect(),
     };
@@ -554,6 +558,7 @@ fn create2_target_redelegate_and_selfdestruct() {
                 nonce: 5,
                 code_hash: base_designator.hash_slow(),
                 code: Some(base_designator.clone()),
+                ..Default::default()
             },
             storage: [(U256::from(0), U256::from(42))].into_iter().collect(),
         },

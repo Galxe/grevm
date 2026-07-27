@@ -55,7 +55,7 @@ where
     for outcome in &results {
         match outcome {
             TxExecutionOutcome::Executed(result) => {
-                let _gas_used = result.gas_used();
+                let _gas_used = result.tx_gas_used();
             }
             TxExecutionOutcome::Skipped(reason) => {
                 eprintln!("transaction skipped: {reason:?}");
@@ -133,7 +133,9 @@ end-to-end harness (`src/test_utils/common/execute.rs`).
 ## Optional delegated-account policy
 
 `DelegatedSafetyConfig` contains two Grevm/Gravity-specific, opt-in EIP-7702 policies. Both are
-disabled by default to preserve stock revm/Ethereum execution semantics:
+disabled by default to preserve stock revm/Ethereum execution semantics. They are automatically
+inactive before Prague, so one block-scoped policy configuration can safely be reused while
+replaying historical blocks:
 
 - `forbid_delegated_create` makes `CREATE` and `CREATE2` halt as not activated while executing in a
   delegated account's context.

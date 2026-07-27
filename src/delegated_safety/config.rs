@@ -2,7 +2,8 @@
 ///
 /// The switches are independent because delegated CREATE changes an EOA's nonce, while the
 /// balance guard handles value movement that admission filtering cannot see without execution.
-/// Both are opt-in and disabled by [`Default`], preserving upstream revm behavior.
+/// Both are opt-in and disabled by [`Default`], preserving upstream revm behavior. Before Prague,
+/// where EIP-7702 is not active, both switches are treated as disabled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DelegatedSafetyConfig {
     /// Halts CREATE and CREATE2 in an EIP-7702 delegated account's execution context with
@@ -38,5 +39,39 @@ impl DelegatedSafetyConfig {
     /// Enables both protections.
     pub const fn enabled() -> Self {
         Self { forbid_delegated_create: true, reserve_delegated_balance: true }
+    }
+
+    /// Returns the effective policy for `spec`.
+    ///
+    /// EIP-7702 activates in Prague. Keeping a policy configured while replaying older blocks is
+    /// supported, but it must not alter their instruction table or transaction handler.
+    pub const fn for_spec(self, spec: revm_primitives::hardfork::SpecId) -> Self {
+        if spec.is_enabled_in(revm_primitives::hardfork::SpecId::PRAGUE) {
+            self
+        } else {
+            Self::disabled()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm_primitives::hardfork::SpecId;
+
+    #[test]
+    fn delegated_safety_is_inert_before_eip7702_activation() {
+        assert_eq!(
+            DelegatedSafetyConfig::enabled().for_spec(SpecId::CANCUN),
+            DelegatedSafetyConfig::disabled()
+        );
+        assert_eq!(
+            DelegatedSafetyConfig::enabled().for_spec(SpecId::PRAGUE),
+            DelegatedSafetyConfig::enabled()
+        );
+        assert_eq!(
+            DelegatedSafetyConfig::reserve_only().for_spec(SpecId::AMSTERDAM),
+            DelegatedSafetyConfig::reserve_only()
+        );
     }
 }
