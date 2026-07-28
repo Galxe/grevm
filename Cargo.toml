@@ -119,8 +119,9 @@ name = "fetch_continuous"
 path = "src/bin/fetch_continuous.rs"
 required-features = ["tools"]
 
-# Pipelined replay: discover mainnet blocks over RPC (filtered, e.g. `all` or `eip-7702`) and
-# replay each (parallel vs sequential), prefetching the next block while replaying the current one.
+# Pipelined replay: discover mainnet blocks over RPC (filtered, e.g. `all`, `eip-7702`, or
+# `delegated-safety`) and replay each (parallel vs sequential), prefetching the next block while
+# replaying the current one.
 [[bin]]
 name = "replay_mainnet"
 path = "src/bin/replay_mainnet.rs"
