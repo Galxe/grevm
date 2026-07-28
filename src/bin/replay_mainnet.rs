@@ -7,14 +7,15 @@
 //! ahead), so network I/O overlaps with execution without spawning a process per block.
 //!
 //! Discovery scans the chain directly via the RPC (no etherscan scraping / API key needed); a
-//! `debug`-namespace endpoint (for `prestateTracer`) is required.
+//! `debug`-namespace endpoint with the built-in `prestateTracer` and `callTracer` is required.
 //!
 //! Usage:
 //! ```text
 //! cargo run --bin replay_mainnet --features tools -- <rpc_url> [filter] [start_block] [count] [out_dir]
 //! ```
-//! - `filter`      — which blocks to replay: `all` (default) every non-empty block, or `eip-7702`
-//!   only blocks containing a type-4 transaction. More filters can be added later.
+//! - `filter`      — which blocks to replay: `all` (default) every non-empty block, `eip-7702` only
+//!   blocks containing a type-4 transaction, or `delegated-safety` blocks where delegated execution
+//!   attempts CREATE/CREATE2 or a balance-moving operation.
 //! - `start_block` — block to start scanning upward from. Default: the mainnet EIP-7702 activation
 //!   block ([`PECTRA_BLOCK`]).
 //! - `count`       — how many matching blocks to replay. Default: all of them up to the chain head.
@@ -29,7 +30,7 @@
 mod rpc;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -44,6 +45,7 @@ use grevm::test_utils::common::{
         spec_for_mainnet_block,
     },
 };
+use revm_context::transaction::AuthorizationTr;
 use revm_primitives::{Address, B256};
 use rpc::{Rpc, parse_block_number};
 use serde_json::{Value, json};
@@ -51,12 +53,18 @@ use serde_json::{Value, json};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Which blocks to replay. New variants can be added without touching the pipeline.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Filter {
     /// Every block with at least one transaction.
     All,
     /// Only blocks containing an EIP-7702 (type-4) transaction.
     Eip7702,
+    /// Candidate blocks exercising delegated CREATE/CREATE2 or delegated balance movement.
+    ///
+    /// The node's built-in `callTracer` finds relevant internal frames, then their source accounts
+    /// are checked for an EIP-7702 delegation designator. Reverted frames remain candidates; the
+    /// subsequent full replay resolves their final effect.
+    DelegatedSafety,
 }
 
 impl Filter {
@@ -64,7 +72,11 @@ impl Filter {
         match s.to_ascii_lowercase().as_str() {
             "all" => Ok(Filter::All),
             "eip-7702" | "eip7702" | "7702" => Ok(Filter::Eip7702),
-            other => Err(format!("unknown filter {other:?} (expected `all` or `eip-7702`)").into()),
+            "delegated-safety" => Ok(Filter::DelegatedSafety),
+            other => Err(format!(
+                "unknown filter {other:?} (expected `all`, `eip-7702`, or `delegated-safety`)"
+            )
+            .into()),
         }
     }
 
@@ -72,19 +84,195 @@ impl Filter {
         match self {
             Filter::All => "all",
             Filter::Eip7702 => "EIP-7702",
+            Filter::DelegatedSafety => "delegated safety",
         }
     }
 
     /// Whether a block (an `eth_getBlockByNumber` result with full txs) should be replayed.
-    fn matches(self, block: &Value) -> bool {
+    fn matches(self, rpc: &Rpc, block_number: u64, block: &Value) -> Result<bool, Error> {
         let txs = block.get("transactions").and_then(Value::as_array);
         match self {
-            Filter::All => txs.is_some_and(|t| !t.is_empty()),
-            Filter::Eip7702 => txs.is_some_and(|t| {
+            Filter::All => Ok(txs.is_some_and(|t| !t.is_empty())),
+            Filter::Eip7702 => Ok(txs.is_some_and(|t| {
                 t.iter().any(|x| x.get("type").and_then(Value::as_str) == Some("0x4"))
-            }),
+            })),
+            Filter::DelegatedSafety => {
+                if txs.is_none_or(Vec::is_empty) {
+                    return Ok(false);
+                }
+                let block_tag = format!("0x{block_number:x}");
+                let trace = rpc.call(
+                    "debug_traceBlockByNumber",
+                    json!([
+                        block_tag,
+                        {
+                            "tracer": "callTracer",
+                            "tracerConfig": { "onlyTopCall": false },
+                            "timeout": "60s"
+                        }
+                    ]),
+                )?;
+                delegated_safety_trace_matches(rpc, block_number, block, &trace)
+            }
         }
     }
+}
+
+/// One value-moving or contract-creation internal frame and its state-context source account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DelegatedSafetyCandidate {
+    tx_index: usize,
+    source: Address,
+}
+
+/// Decide whether a built-in `callTracer` result contains a delegated-safety candidate.
+///
+/// For CALL/CREATE/SELFDESTRUCT frames, `from` is the actual state-context account whose balance or
+/// nonce is affected. This stays the EIP-7702 authority even when its delegated code reaches the
+/// operation through DELEGATECALL. An authority is conservatively considered delegated when:
+/// - its parent-block code is an EIP-7702 designator; or
+/// - a recoverable, non-clearing authorization for it appears no later than the candidate tx.
+///
+/// Authorization nonce/chain validation and reverts are intentionally left to the full replay.
+/// That can add candidates but cannot hide an applicable delegated-safety operation.
+fn delegated_safety_trace_matches(
+    rpc: &Rpc,
+    block_number: u64,
+    block: &Value,
+    trace: &Value,
+) -> Result<bool, Error> {
+    let tx_values = block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or("full block response did not contain a transaction array")?;
+    let candidates = delegated_safety_candidates(trace, tx_values.len())?;
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let txs: Vec<TxFixture> =
+        tx_values.iter().map(TxFixture::from_rpc).collect::<Result<_, _>>()?;
+    let authorizations = earliest_non_clearing_authorizations(&txs);
+    if candidates.iter().any(|candidate| {
+        authorizations
+            .get(&candidate.source)
+            .is_some_and(|&tx_index| tx_index <= candidate.tx_index)
+    }) {
+        return Ok(true);
+    }
+
+    let sources: Vec<Address> = candidates
+        .iter()
+        .map(|candidate| candidate.source)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let parent = format!("0x{:x}", block_number.saturating_sub(1));
+    let codes = rpc.fetch_account_codes(&sources, &parent)?;
+    Ok(codes.values().any(|code| is_eip7702_designator(code)))
+}
+
+/// Extract relevant internal frames from a block-level built-in `callTracer` response.
+fn delegated_safety_candidates(
+    trace: &Value,
+    expected_transactions: usize,
+) -> Result<BTreeSet<DelegatedSafetyCandidate>, String> {
+    let transactions = trace
+        .as_array()
+        .ok_or_else(|| format!("callTracer returned a non-array result: {trace}"))?;
+    if transactions.len() != expected_transactions {
+        return Err(format!(
+            "callTracer returned {} transaction results for a block with {expected_transactions} \
+             transactions",
+            transactions.len()
+        ));
+    }
+
+    let mut candidates = BTreeSet::new();
+    for (tx_index, transaction) in transactions.iter().enumerate() {
+        if let Some(error) = transaction.get("error").filter(|error| !error.is_null()) {
+            return Err(format!("callTracer failed for transaction {tx_index}: {error}"));
+        }
+        let root = transaction.get("result").unwrap_or(transaction);
+        collect_delegated_safety_frames(root, tx_index, true, &mut candidates)?;
+    }
+    Ok(candidates)
+}
+
+fn collect_delegated_safety_frames(
+    frame: &Value,
+    tx_index: usize,
+    is_root: bool,
+    candidates: &mut BTreeSet<DelegatedSafetyCandidate>,
+) -> Result<(), String> {
+    let frame = frame
+        .as_object()
+        .ok_or_else(|| format!("callTracer transaction {tx_index} contained a non-object frame"))?;
+    let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or_default();
+    let is_candidate = if is_root {
+        false
+    } else {
+        match frame_type {
+            "CREATE" | "CREATE2" | "SELFDESTRUCT" => true,
+            "CALL" => {
+                let value = frame.get("value").and_then(Value::as_str).unwrap_or("0x0");
+                let value = value.parse::<revm_primitives::U256>().map_err(|error| {
+                    format!("callTracer transaction {tx_index} returned invalid value: {error:?}")
+                })?;
+                let from = frame.get("from").and_then(Value::as_str);
+                let to = frame.get("to").and_then(Value::as_str);
+                let different_accounts = match (from, to) {
+                    (Some(from), Some(to)) => !from.eq_ignore_ascii_case(to),
+                    _ => true,
+                };
+                !value.is_zero() && different_accounts
+            }
+            _ => false,
+        }
+    };
+    if is_candidate {
+        let source = frame
+            .get("from")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("callTracer transaction {tx_index} {frame_type} frame omitted `from`")
+            })?
+            .parse::<Address>()
+            .map_err(|error| {
+                format!(
+                    "callTracer transaction {tx_index} {frame_type} frame has invalid `from`: \
+                     {error:?}"
+                )
+            })?;
+        candidates.insert(DelegatedSafetyCandidate { tx_index, source });
+    }
+    if let Some(children) = frame.get("calls") {
+        let children = children.as_array().ok_or_else(|| {
+            format!("callTracer transaction {tx_index} returned a non-array `calls` field")
+        })?;
+        for child in children {
+            collect_delegated_safety_frames(child, tx_index, false, candidates)?;
+        }
+    }
+    Ok(())
+}
+
+fn earliest_non_clearing_authorizations(txs: &[TxFixture]) -> BTreeMap<Address, usize> {
+    let mut earliest = BTreeMap::new();
+    for (tx_index, tx) in txs.iter().enumerate() {
+        for authorization in tx.to_tx_env().authorization_list {
+            if authorization.address() != Address::ZERO &&
+                let Some(authority) = authorization.authority()
+            {
+                earliest.entry(authority).or_insert(tx_index);
+            }
+        }
+    }
+    earliest
+}
+
+fn is_eip7702_designator(code: &[u8]) -> bool {
+    code.len() == 23 && code.starts_with(&[0xef, 0x01, 0x00])
 }
 
 /// Per-run caches reused across the (sequentially scanned) blocks to avoid re-fetching state that
@@ -106,7 +294,7 @@ fn main() -> Result<(), Error> {
     if args.len() < 2 {
         eprintln!(
             "usage: cargo run --bin replay_mainnet --features tools -- \
-             <rpc_url> [all|eip-7702] [start_block] [count] [out_dir]"
+             <rpc_url> [all|eip-7702|delegated-safety] [start_block] [count] [out_dir]"
         );
         std::process::exit(1);
     }
@@ -247,7 +435,7 @@ fn next_match(
     while bn <= head {
         let hex = format!("0x{bn:x}");
         let block = rpc.call("eth_getBlockByNumber", json!([hex, true]))?;
-        if !block.is_null() && filter.matches(&block) {
+        if !block.is_null() && filter.matches(rpc, bn, &block)? {
             return Ok(Some(build_block(rpc, bn, chain_id, &block, save_dir, caches)?));
         }
         bn += 1;
@@ -296,4 +484,190 @@ fn build_block(
         mainnet::write_mainnet_block(dir, &bf, &txs, &pre_state)?;
     }
     Ok(MainnetBlock::from_fixtures(number.to_string(), &bf, &txs, &pre_state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_delegated_safety_filter() {
+        assert_eq!(Filter::parse("delegated-safety").unwrap(), Filter::DelegatedSafety);
+        assert!(Filter::parse("delegated_safety").is_err());
+    }
+
+    #[test]
+    fn extracts_delegated_safety_sources_from_internal_frames() {
+        let authority = "0x1111111111111111111111111111111111111111";
+        let creator = "0x2222222222222222222222222222222222222222";
+        let selfdestruct = "0x3333333333333333333333333333333333333333";
+        let target = "0x4444444444444444444444444444444444444444";
+        let trace = json!([
+            {
+                "txHash": "0x01",
+                "result": {
+                    "type": "CALL",
+                    "from": authority,
+                    "to": target,
+                    "value": "0x10",
+                    "calls": [
+                        {
+                            "type": "CALL",
+                            "from": authority,
+                            "to": target,
+                            "value": "0x1"
+                        },
+                        {
+                            "type": "CALL",
+                            "from": authority,
+                            "to": target,
+                            "value": "0x0"
+                        },
+                        {
+                            "type": "CALL",
+                            "from": authority,
+                            "to": authority.to_ascii_uppercase(),
+                            "value": "0x1"
+                        },
+                        {
+                            "type": "CREATE2",
+                            "from": creator,
+                            "to": target,
+                            "value": "0x0"
+                        },
+                        {
+                            "type": "DELEGATECALL",
+                            "from": authority,
+                            "to": target,
+                            "calls": [{
+                                "type": "CALL",
+                                "from": authority,
+                                "to": target,
+                                "value": "0x2"
+                            }]
+                        }
+                    ]
+                }
+            },
+            {
+                "txHash": "0x02",
+                "result": {
+                    "type": "CALL",
+                    "from": target,
+                    "to": authority,
+                    "calls": [{
+                        "type": "SELFDESTRUCT",
+                        "from": selfdestruct,
+                        "to": target,
+                        "value": "0x0"
+                    }]
+                }
+            }
+        ]);
+        let candidates = delegated_safety_candidates(&trace, 2).unwrap();
+        assert_eq!(
+            candidates,
+            BTreeSet::from([
+                DelegatedSafetyCandidate { tx_index: 0, source: authority.parse().unwrap() },
+                DelegatedSafetyCandidate { tx_index: 0, source: creator.parse().unwrap() },
+                DelegatedSafetyCandidate { tx_index: 1, source: selfdestruct.parse().unwrap() },
+            ])
+        );
+    }
+
+    #[test]
+    fn ignores_roots_and_irrelevant_call_types() {
+        let trace = json!([{
+            "result": {
+                "type": "CREATE",
+                "from": "0x1111111111111111111111111111111111111111",
+                "value": "0x1",
+                "calls": [
+                    {
+                        "type": "STATICCALL",
+                        "from": "0x1111111111111111111111111111111111111111",
+                        "to": "0x2222222222222222222222222222222222222222"
+                    },
+                    {
+                        "type": "CALLCODE",
+                        "from": "0x1111111111111111111111111111111111111111",
+                        "to": "0x2222222222222222222222222222222222222222",
+                        "value": "0x1"
+                    }
+                ]
+            }
+        }]);
+        assert!(delegated_safety_candidates(&trace, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reports_malformed_and_per_transaction_call_tracer_errors() {
+        assert!(delegated_safety_candidates(&Value::Null, 0).is_err());
+        assert!(delegated_safety_candidates(&json!([]), 1).is_err());
+        assert!(
+            delegated_safety_candidates(
+                &json!([
+                { "txHash": "0x01", "error": "tracer timed out" }
+                ]),
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            delegated_safety_candidates(
+                &json!([
+                    { "txHash": "0x01", "result": { "type": "CALL", "calls": {} } }
+                ]),
+                1
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recognizes_only_complete_eip7702_designators() {
+        let mut designator = vec![0xef, 0x01, 0x00];
+        designator.extend([0x11; 20]);
+        assert!(is_eip7702_designator(&designator));
+        assert!(!is_eip7702_designator(&designator[..22]));
+        designator.push(0);
+        assert!(!is_eip7702_designator(&designator));
+    }
+
+    #[test]
+    fn recovers_same_transaction_mainnet_delegation_authority() {
+        // Mainnet block 23_352_852, tx index 26. The authorization delegates this authority and
+        // its callTracer frame then executes CREATE2 from the same state context.
+        let tx = TxFixture {
+            tx_type: 4,
+            caller: Address::ZERO,
+            to: Some(Address::ZERO),
+            nonce: 0,
+            value: revm_primitives::U256::ZERO,
+            data: Default::default(),
+            gas_limit: 0,
+            gas_price: 0,
+            gas_priority_fee: None,
+            chain_id: Some(1),
+            access_list: Vec::new(),
+            blob_hashes: Vec::new(),
+            max_fee_per_blob_gas: 0,
+            authorization_list: vec![mainnet::AuthFixture {
+                chain_id: revm_primitives::U256::from(1),
+                address: "0x80296ff8d1ed46f8e3c7992664d13b833504c2bb".parse().unwrap(),
+                nonce: 0x58,
+                y_parity: 1,
+                r: "0x929f6cd0d7b45d3327876760190d01dc949ae1ad5d0118287c9fa303327199a2"
+                    .parse()
+                    .unwrap(),
+                s: "0x1ec1a55dc4d3312c58d3d6590eca1c03032763a5c5f438548df8d49d1e725bcd"
+                    .parse()
+                    .unwrap(),
+            }],
+        };
+        assert_eq!(
+            earliest_non_clearing_authorizations(&[tx]),
+            BTreeMap::from([("0x8fcf555a7a664654af595a72e4e48676db8136cf".parse().unwrap(), 0,)])
+        );
+    }
 }

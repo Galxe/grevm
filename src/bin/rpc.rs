@@ -16,6 +16,7 @@ const RETRY_ATTEMPTS: usize = 7;
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(400);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 const BLOCK_HASH_BATCH_SIZE: usize = 32;
+const ACCOUNT_CODE_BATCH_SIZE: usize = 64;
 
 fn backoff(delay: &mut Duration) {
     std::thread::sleep(*delay);
@@ -193,6 +194,68 @@ impl Rpc {
         let mut out = BTreeMap::new();
         self.fetch_block_hashes_into(&mut out, lo, hi)?;
         Ok(out)
+    }
+
+    /// Fetch account code at one historical block, using JSON-RPC batches and falling back to
+    /// individual retrying calls for any response omitted or rejected by the batch endpoint.
+    pub fn fetch_account_codes(
+        &self,
+        addresses: &[Address],
+        at: &str,
+    ) -> Result<BTreeMap<Address, Bytes>, Error> {
+        let mut codes = BTreeMap::new();
+        for (chunk_index, chunk) in addresses.chunks(ACCOUNT_CODE_BATCH_SIZE).enumerate() {
+            let id_base = chunk_index * ACCOUNT_CODE_BATCH_SIZE;
+            let batch: Vec<Value> = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, address)| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id_base + index,
+                        "method": "eth_getCode",
+                        "params": [address.to_string(), at]
+                    })
+                })
+                .collect();
+            let response = self.send(&Value::Array(batch))?;
+            let Some(items) = response.as_array() else {
+                continue;
+            };
+            for item in items {
+                if item.get("error").is_some() {
+                    continue;
+                }
+                let Some(id) = response_id(item).map(|id| id as usize) else {
+                    continue;
+                };
+                let Some(address) = addresses.get(id) else {
+                    continue;
+                };
+                let Some(code) = item.get("result").and_then(Value::as_str) else {
+                    continue;
+                };
+                let code: Bytes = code
+                    .parse()
+                    .map_err(|error| format!("invalid code for account {address}: {error:?}"))?;
+                codes.insert(*address, code);
+            }
+        }
+
+        for address in addresses {
+            if codes.contains_key(address) {
+                continue;
+            }
+            let code = self.call("eth_getCode", json!([address.to_string(), at]))?;
+            let code = code
+                .as_str()
+                .ok_or_else(|| format!("eth_getCode returned no code for account {address}"))?;
+            let code: Bytes = code
+                .parse()
+                .map_err(|error| format!("invalid code for account {address}: {error:?}"))?;
+            codes.insert(*address, code);
+        }
+        Ok(codes)
     }
 
     /// Add the EIP-7702 delegation **targets** of `txs`/`pre_state` to `pre_state` (at block `at`,

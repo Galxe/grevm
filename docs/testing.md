@@ -125,8 +125,13 @@ cargo run --bin replay_mainnet --features tools -- <rpc_url> [filter] [start_blo
 
 Blocks are scanned **upward** toward the chain head.
 
-- `filter`      — which blocks to replay: `all` (default; every non-empty block) or `eip-7702`
-  (only blocks with a type-4 transaction). Extensible — more filters can be added later.
+- `filter`      — which blocks to replay:
+  - `all` (default): every non-empty block;
+  - `eip-7702`: blocks with a type-4 transaction;
+  - `delegated-safety`: candidate blocks where an EIP-7702 delegated state context creates a
+    contract or moves balance through CALL/SELFDESTRUCT. This uses the built-in `callTracer` plus
+    batched historical `eth_getCode` calls, so it works with providers that reject custom
+    JavaScript tracers.
 - `start_block` — where to start scanning. Default: the mainnet EIP-7702 activation block
   (`22431084`, Pectra, 2025-05-07).
 - `count`       — how many matching blocks to replay. Default: **all** of them up to the chain head.
@@ -138,6 +143,10 @@ Blocks are scanned **upward** toward the chain head.
 # Replay every EIP-7702 block since activation (large job — dominated by one
 # debug_traceBlockByNumber per block; interrupt any time), in memory only:
 cargo run --bin replay_mainnet --features tools -- <rpc_url> eip-7702
+
+# Find and replay the first delegated CREATE/CREATE2/balance-movement candidate:
+cargo run --bin replay_mainnet --features tools -- \
+  <rpc_url> delegated-safety 22431084 1
 
 # Replay 20 (any) blocks from a height AND persist them under test_data/mainnet_blocks/:
 cargo run --bin replay_mainnet --features tools -- <rpc_url> all 25323281 20 test_data/mainnet_blocks
