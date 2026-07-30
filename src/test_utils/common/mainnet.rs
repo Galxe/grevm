@@ -627,7 +627,25 @@ fn parse_auth(a: &Value) -> Result<AuthFixture, String> {
 /// `merged`, applying "first-seen wins" at account and storage-slot granularity. Call once per
 /// block, in block order, to reconstruct the opening state of a single block or a contiguous
 /// range of blocks.
-pub fn accumulate_prestate(merged: &mut PreState, trace: &Value) -> Result<(), String> {
+///
+/// Geth does not necessarily report a newly-created top-level contract until a later transaction
+/// reads it. Such a later snapshot contains the deployed code/nonce and is not opening state.
+/// Seed every top-level CREATE destination as an empty account before merging the trace so later
+/// snapshots cannot turn a valid creation into a spurious `CreateCollision`.
+pub fn accumulate_prestate(
+    merged: &mut PreState,
+    trace: &Value,
+    txs: &[TxFixture],
+) -> Result<(), String> {
+    for tx in txs.iter().filter(|tx| tx.to.is_none()) {
+        merged.entry(tx.caller.create(tx.nonce)).or_insert_with(|| AccountFixture {
+            balance: U256::ZERO,
+            nonce: 0,
+            code: None,
+            storage: BTreeMap::new(),
+        });
+    }
+
     let entries = trace.as_array().ok_or("debug_traceBlockByNumber did not return an array")?;
     for entry in entries {
         // Each element is `{ "txHash": ..., "result": { "0xaddr": {..}, .. } }`, where `result`
@@ -731,5 +749,47 @@ mod tests {
         assert_eq!(fixture.spec_id(), SpecId::FRONTIER);
         fixture.spec_id = "not-a-hardfork".to_string();
         assert_eq!(fixture.spec_id(), SpecId::FRONTIER);
+    }
+
+    #[test]
+    fn top_level_create_is_seeded_empty_before_later_prestate_snapshot() {
+        let caller = "0x2301f65b3069f3c30daec6ccfd1969b541b627a7".parse::<Address>().unwrap();
+        let nonce = 22;
+        let created = caller.create(nonce);
+        let tx = TxFixture {
+            tx_type: 2,
+            caller,
+            to: None,
+            nonce,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            gas_limit: 100_000,
+            gas_price: 1,
+            gas_priority_fee: Some(0),
+            chain_id: Some(1),
+            access_list: Vec::new(),
+            blob_hashes: Vec::new(),
+            max_fee_per_blob_gas: 0,
+            authorization_list: Vec::new(),
+        };
+        let trace = serde_json::json!([{
+            "result": {
+                created.to_string(): {
+                    "balance": "0x0",
+                    "nonce": 1,
+                    "code": "0x6000",
+                    "storage": { "0x01": "0x02" }
+                }
+            }
+        }]);
+
+        let mut pre_state = PreState::new();
+        accumulate_prestate(&mut pre_state, &trace, &[tx]).unwrap();
+
+        let account = pre_state.get(&created).unwrap();
+        assert_eq!(account.balance, U256::ZERO);
+        assert_eq!(account.nonce, 0);
+        assert_eq!(account.code, None);
+        assert_eq!(account.storage.get(&U256::from(1)), Some(&U256::from(2)));
     }
 }

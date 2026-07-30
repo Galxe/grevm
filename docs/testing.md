@@ -40,7 +40,9 @@ parallel execution against Grevm's forced-sequential path.
 The shared revm-compatibility helpers explicitly use `DelegatedSafetyConfig::disabled()`: mainnet
 replay and upstream EIP-7702 regression tests therefore remain pure grevm-vs-revm equivalence
 checks even if the policy defaults change. Policy-enabled behavior is tested separately in
-`tests/delegated_safety.rs`.
+`tests/delegated_safety.rs`. Real-mainnet replay is strict: a sequential reference error, Grevm
+execution error, or skipped transaction fails immediately because every transaction included in a
+canonical mainnet block is consensus-valid.
 
 Plain `cargo test` runs the core library unit tests without optional features; the integration
 targets are skipped by their `required-features` declarations. Integration suites and all
@@ -154,10 +156,10 @@ cargo run --bin replay_mainnet --features tools -- <rpc_url> all 25323281 20 tes
 
 Each block is validated as it arrives, and its **execution-only** times (the inputs are already in
 memory, so neither figure includes RPC/file I/O) are printed per block and accumulated into a final
-aggregate parallel-vs-sequential speedup. On the **first** divergence (grevm parallel result !=
-sequential) it prints the offending block (the assertion above it shows the diverging
-account/value) and exits non-zero. Without `out_dir` nothing is written to disk — use `fetch_block`
-or pass `out_dir` to persist a fixture.
+aggregate parallel-vs-sequential speedup. On the **first** invalid replay input, sequential/Grevm
+execution error, skipped transaction, or result divergence, it prints the offending block and
+exits non-zero. Without `out_dir` nothing is written to disk — use `fetch_block` or pass `out_dir`
+to persist a fixture.
 
 > Note: with an in-memory fixture the database has ~zero read latency, so the measured speedup is
 > compute-bound and understates the win on a real node, where parallel execution also hides storage

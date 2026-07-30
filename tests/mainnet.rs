@@ -68,19 +68,12 @@ fn replay(blocks: Vec<mainnet::MainnetBlock>, root: &Path) {
     for block in blocks {
         let label = block.label.clone();
         println!("replaying {label} ({} txs, spec {:?})", block.txs.len(), block.spec);
-        match execute::compare_evm_execute_with_env(
+        execute::compare_evm_execute_with_env(
             block.db,
             block.txs,
             block.cfg,
             block.block_env,
             Default::default(),
-        ) {
-            execute::ReplayOutcome::Ok { .. } => {}
-            // The sequential reference itself couldn't execute the block (unreplayable fixture) —
-            // not a grevm divergence, so skip rather than fail the test.
-            execute::ReplayOutcome::SequentialFailed(e) => {
-                eprintln!("  skip {label}: sequential reference failed ({e})");
-            }
-        }
+        );
     }
 }

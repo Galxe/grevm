@@ -50,12 +50,13 @@ fn bench_continuous(c: &mut Criterion) {
         group.bench_function("Grevm Parallel", |b| {
             b.iter(|| {
                 let state = ParallelState::new(db.clone(), true, false);
-                let executor = Scheduler::new(
+                let executor = Scheduler::new_with_runtime_config(
                     black_box(cfg.clone()),
                     black_box(env.clone()),
                     black_box(txs.clone()),
                     state,
                     None,
+                    execute::revm_compatibility_config(),
                 );
                 executor.parallel_execute(None).unwrap();
                 let (_, mut inner) = executor.take_result_and_state();
