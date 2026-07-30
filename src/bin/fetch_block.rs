@@ -86,7 +86,7 @@ fn main() -> Result<(), Error> {
     let trace =
         rpc.call("debug_traceBlockByNumber", json!([block_hex, { "tracer": "prestateTracer" }]))?;
     let mut pre_state = PreState::new();
-    mainnet::accumulate_prestate(&mut pre_state, &trace)?;
+    mainnet::accumulate_prestate(&mut pre_state, &trace, &txs)?;
     // prestateTracer omits EIP-7702 delegation targets' code; fetch them at the parent block.
     let parent = format!("0x{:x}", block_number.saturating_sub(1));
     let n = rpc.supplement_delegations(&txs, &mut pre_state, &parent)?;

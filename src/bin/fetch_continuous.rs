@@ -76,18 +76,18 @@ fn main() -> Result<(), Error> {
         .to_string();
         let bf = BlockFixture::from_rpc(bn, chain_id, spec, &block)?;
 
-        let n_tx = if let Some(arr) = block.get("transactions").and_then(Value::as_array) {
-            for t in arr {
-                all_txs.push(TxFixture::from_rpc(t)?);
-            }
-            arr.len()
-        } else {
-            0
-        };
+        let block_txs: Vec<TxFixture> = block
+            .get("transactions")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().map(TxFixture::from_rpc).collect::<Result<_, _>>())
+            .transpose()?
+            .unwrap_or_default();
+        let n_tx = block_txs.len();
 
         let trace =
             rpc.call("debug_traceBlockByNumber", json!([hex, { "tracer": "prestateTracer" }]))?;
-        mainnet::accumulate_prestate(&mut pre_state, &trace)?;
+        mainnet::accumulate_prestate(&mut pre_state, &trace, &block_txs)?;
+        all_txs.extend(block_txs);
 
         if env_block.as_ref().is_none_or(|m| bf.basefee < m.basefee) {
             env_block = Some(bf);

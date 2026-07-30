@@ -23,9 +23,9 @@
 //!   `<out_dir>/<number>/` (same format as `fetch_block`). Omitted ⇒ fetched in memory only.
 //!
 //! Each block is validated as it arrives and its parallel/sequential **execution-only** times
-//! (no I/O) are accumulated; a final line reports the aggregate speedup. On the first divergence
-//! (grevm parallel result != sequential) the offending block is reported and the process exits
-//! non-zero.
+//! (no I/O) are accumulated; a final line reports the aggregate speedup. A sequential reference
+//! error, Grevm error/skipped transaction, or result divergence fails immediately with a non-zero
+//! exit.
 
 mod rpc;
 
@@ -365,15 +365,14 @@ fn main() -> Result<(), Error> {
     });
 
     let mut replayed = 0usize;
-    let mut skipped = 0usize;
     let (mut total_seq, mut total_par) = (Duration::ZERO, Duration::ZERO);
     for block in rx {
         let (label, ntx, spec) = (block.label.clone(), block.txs.len(), block.spec);
         println!("===== replay block {label} ({ntx} txs, spec {spec:?}) =====");
-        // The sequential reference runs first inside the comparison. A real parallel divergence
-        // `assert_eq!`-panics (the offending account/value is printed); `catch_unwind` turns that
-        // into a fail-fast exit. A `SequentialFailed` outcome means the block itself can't be
-        // replayed (not grevm's fault) — skip it and continue.
+        // The sequential reference runs first inside the comparison. Mainnet contains no invalid
+        // transactions: a reference error means the fixture/environment is wrong, while a Grevm
+        // error, skipped transaction, or divergence is a Grevm failure. Every case panics and is
+        // converted here into a fail-fast non-zero exit.
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             execute::compare_evm_execute_with_env(
                 block.db,
@@ -384,7 +383,7 @@ fn main() -> Result<(), Error> {
             )
         }));
         match outcome {
-            Ok(execute::ReplayOutcome::Ok { sequential, parallel }) => {
+            Ok(execute::ReplayTimings { sequential, parallel }) => {
                 replayed += 1;
                 total_seq += sequential;
                 total_par += parallel;
@@ -393,14 +392,11 @@ fn main() -> Result<(), Error> {
                      parallel {parallel:?})"
                 );
             }
-            Ok(execute::ReplayOutcome::SequentialFailed(e)) => {
-                skipped += 1;
-                eprintln!("  block {label}: SKIP (sequential reference failed: {e})");
-            }
             Err(_) => {
                 eprintln!(
-                    "\nFAILED at block {label}: grevm parallel result != sequential \
-                     (see the assertion above for the diverging account/value)"
+                    "\nFAILED at block {label}: invalid mainnet replay input, Grevm execution \
+                     error/skipped transaction, or parallel result divergence \
+                     (see the panic above for details)"
                 );
                 std::process::exit(1);
             }
@@ -409,7 +405,7 @@ fn main() -> Result<(), Error> {
 
     fetcher.join().map_err(|_| "prefetch thread panicked")??;
 
-    println!("Done: {replayed} blocks passed, {skipped} skipped (unreplayable fixtures)");
+    println!("Done: {replayed} blocks passed");
     if replayed > 0 && total_par > Duration::ZERO {
         let speedup = total_seq.as_secs_f64() / total_par.as_secs_f64();
         println!(
@@ -476,7 +472,7 @@ fn build_block(
         json!([format!("0x{number:x}"), { "tracer": "prestateTracer" }]),
     )?;
     let mut pre_state = PreState::new();
-    mainnet::accumulate_prestate(&mut pre_state, &trace)?;
+    mainnet::accumulate_prestate(&mut pre_state, &trace, &txs)?;
     // prestateTracer omits EIP-7702 delegation targets' code; fetch them (cached across blocks).
     let parent = format!("0x{:x}", number.saturating_sub(1));
     rpc.supplement_delegations_cached(&txs, &mut pre_state, &parent, &mut caches.delegates)?;

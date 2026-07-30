@@ -63,7 +63,7 @@ fn assert_expected_metrics(
 /// These tests use upstream revm as their oracle, so grevm-local delegated-account policies must
 /// stay disabled even if their defaults change later. Other scheduler settings still come from
 /// the environment for compatibility with the existing test and benchmark controls.
-fn revm_compatibility_config() -> GrevmConfig {
+pub fn revm_compatibility_config() -> GrevmConfig {
     GrevmConfig::from_env().with_delegated_safety(DelegatedSafetyConfig::disabled())
 }
 
@@ -152,11 +152,7 @@ pub fn compare_evm_execute_with_spec<DB>(
     let env = BlockEnv { beneficiary: super::account::MINER_ADDRESS, ..Default::default() };
     let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.disable_nonce_check = disable_nonce_check;
-    // Synthetic blocks are constructed to always execute, so a sequential failure is itself a bug.
-    match compare_evm_execute_with_env(db, txs, cfg, env, parallel_metrics) {
-        ReplayOutcome::Ok { .. } => {}
-        ReplayOutcome::SequentialFailed(e) => panic!("sequential reference execution failed: {e}"),
-    }
+    compare_evm_execute_with_env(db, txs, cfg, env, parallel_metrics);
 }
 
 /// Compare Grevm against an independent, strictly ordered revm execution that skips every
@@ -195,34 +191,30 @@ where
     actual_outcomes
 }
 
-/// Outcome of a parallel-vs-sequential comparison.
-#[derive(Debug)]
-pub enum ReplayOutcome {
-    /// Grevm parallel execution matched the sequential revm reference (per-tx results + bundle
-    /// state asserted equal). Carries the **execution-only** wall-clock time of each path (the
-    /// inputs are already in memory, so neither figure includes any file/RPC I/O) — useful for
-    /// comparing parallel vs sequential throughput.
-    Ok { sequential: Duration, parallel: Duration },
-    /// The **sequential** reference itself errored, so the inputs can't be executed at all (e.g. an
-    /// incomplete fixture). This is *not* a grevm divergence — callers replaying real blocks should
-    /// skip the block rather than blame the parallel scheduler. Carries the error description.
-    SequentialFailed(String),
+/// Execution-only timings from a successful parallel-vs-sequential comparison.
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayTimings {
+    /// Strictly ordered revm execution time.
+    pub sequential: Duration,
+    /// Grevm parallel execution time.
+    pub parallel: Duration,
 }
 
 /// Same as [`compare_evm_execute_with_spec`] but takes a fully-specified [`CfgEnv`] and
 /// [`BlockEnv`] (e.g. a real mainnet block).
 ///
-/// The sequential revm reference runs **first**: if it can't execute the block the inputs are
-/// unreplayable and [`ReplayOutcome::SequentialFailed`] is returned without touching grevm. Only
-/// when the reference succeeds does grevm's parallel scheduler run; any error or divergence there
-/// is a genuine grevm bug and panics.
+/// The sequential revm reference runs **first**. Every transaction in a real mainnet block is
+/// consensus-valid, so any sequential error is an invalid fixture/environment and panics. Once the
+/// reference succeeds, any Grevm error, skipped transaction, or state/result divergence also
+/// panics. Grevm-specific delegated-account policies are explicitly disabled via
+/// [`revm_compatibility_config`].
 pub fn compare_evm_execute_with_env<DB>(
     db: DB,
     txs: Vec<TxEnv>,
     cfg: CfgEnv,
     env: BlockEnv,
     parallel_metrics: HashMap<&str, usize>,
-) -> ReplayOutcome
+) -> ReplayTimings
 where
     DB: DatabaseRef + Send + Sync + Debug,
     DB::Error: Send + Sync + Clone + Debug + 'static,
@@ -230,13 +222,11 @@ where
     let db = Arc::new(db);
     let txs = Arc::new(txs);
 
-    // 1) Sequential reference FIRST — if it errors, the inputs are unreplayable (not a grevm
-    //    issue). Timed: the DB is already in memory, so this is pure execution, no I/O.
+    // 1) Sequential reference FIRST. A mainnet transaction cannot be invalid; an error means the
+    //    fixture or execution environment is wrong and must fail the replay.
     let start = Instant::now();
-    let reth_result = match execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &txs) {
-        Ok(result) => result,
-        Err(e) => return ReplayOutcome::SequentialFailed(format!("{e:?}")),
-    };
+    let reth_result = execute_revm_sequential(db.clone(), cfg.clone(), env.clone(), &txs)
+        .unwrap_or_else(|error| panic!("sequential reference execution failed: {error:?}"));
     let sequential = start.elapsed();
 
     // 2) Grevm parallel. The reference already succeeded, so an error here is a real grevm bug.
@@ -276,7 +266,7 @@ where
 
     compare_execution_result(&reth_result.0, &parallel_result.0);
     compare_bundle_state(&reth_result.1, &parallel_result.1);
-    ReplayOutcome::Ok { sequential, parallel }
+    ReplayTimings { sequential, parallel }
 }
 
 /// Simulate the sequential execution of transactions in reth
@@ -433,6 +423,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm_database::EmptyDB;
+    use revm_primitives::TxKind;
+
+    #[test]
+    fn revm_compatibility_always_disables_delegated_safety() {
+        assert_eq!(revm_compatibility_config().delegated_safety, DelegatedSafetyConfig::disabled());
+    }
+
+    #[test]
+    #[should_panic(expected = "sequential reference execution failed")]
+    fn strict_replay_rejects_invalid_reference_transaction() {
+        let caller = Address::from([0x11; 20]);
+        let tx = TxEnv {
+            caller,
+            kind: TxKind::Call(caller),
+            gas_limit: 21_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        };
+        let cfg = CfgEnv::new_with_spec(SpecId::SHANGHAI);
+        let env = BlockEnv { gas_limit: 30_000_000, ..BlockEnv::default() };
+
+        compare_evm_execute_with_env(EmptyDB::new(), vec![tx], cfg, env, Default::default());
+    }
 
     #[test]
     #[should_panic(expected = "expected metric `grevm.missing` was not recorded")]
