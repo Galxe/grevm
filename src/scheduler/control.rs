@@ -111,7 +111,7 @@ where
                 Some(AbortReason::ParallelError { txid, message }) => {
                     return self.fallback_after_parallel_error(committed, *txid, message);
                 }
-                Some(AbortReason::SelfDestructed | AbortReason::FallbackSequential) => {
+                Some(AbortReason::FallbackSequential) => {
                     return self.replay_uncommitted_suffix(committed);
                 }
                 None => {

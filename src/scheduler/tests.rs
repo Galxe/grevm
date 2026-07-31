@@ -1,5 +1,5 @@
 use super::*;
-use crate::{DelegatedSafetyConfig, InvalidTransaction};
+use crate::{DelegatedSafetyConfig, InvalidTransaction, beneficiary::SpeculativeResult};
 use revm_context::{
     DBErrorMarker,
     result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
@@ -26,14 +26,14 @@ impl DBErrorMarker for CommitDbError {}
 
 #[derive(Clone, Debug)]
 struct CommitFailDb {
-    coinbase: Address,
+    beneficiary: Address,
 }
 
 impl DatabaseRef for CommitFailDb {
     type Error = CommitDbError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if address == self.coinbase { Ok(None) } else { Err(CommitDbError) }
+        if address == self.beneficiary { Ok(None) } else { Err(CommitDbError) }
     }
 
     fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -51,14 +51,14 @@ impl DatabaseRef for CommitFailDb {
 
 #[derive(Clone, Debug)]
 struct WorkerPanicDb {
-    coinbase: Address,
+    beneficiary: Address,
 }
 
 impl DatabaseRef for WorkerPanicDb {
     type Error = CommitDbError;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        if address == self.coinbase {
+        if address == self.beneficiary {
             Ok(None)
         } else {
             panic!("injected speculative worker panic")
@@ -124,7 +124,7 @@ fn scheduler_returns_an_error_for_a_second_execution() {
 
 #[test]
 fn speculative_worker_panic_cancels_peers_without_becoming_an_abort_reason() {
-    let coinbase = Address::from([0xCB; 20]);
+    let beneficiary = Address::from([0xCB; 20]);
     let caller = Address::from([0xCA; 20]);
     let tx = TxEnv {
         caller,
@@ -137,9 +137,9 @@ fn speculative_worker_panic_cancels_peers_without_becoming_an_abort_reason() {
         GrevmConfig { concurrency_level: 1, min_parallel_txs: 0, ..GrevmConfig::default() };
     let scheduler = Scheduler::new_with_runtime_config(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
-        BlockEnv { beneficiary: coinbase, ..Default::default() },
+        BlockEnv { beneficiary, ..Default::default() },
         Arc::new(vec![tx]),
-        ParallelState::new(WorkerPanicDb { coinbase }, true, false),
+        ParallelState::new(WorkerPanicDb { beneficiary }, true, false),
         None,
         config,
     );
@@ -287,38 +287,40 @@ fn commit_abort_carries_error_without_using_tx_results() {
     assert!(scheduler.tx_results.iter().all(|result| result.lock().is_none()));
 }
 
+fn successful_speculative_result() -> SpeculativeResult {
+    SpeculativeResult::settled(ResultAndState {
+        result: ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas: ResultGas::default().with_total_gas_spent(21_000),
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        },
+        state: Default::default(),
+    })
+}
+
 #[test]
 fn ordered_commit_database_error_aborts_and_returns_exact_error() {
     let caller = Address::from([0xCA; 20]);
-    let coinbase = Address::from([0xCB; 20]);
+    let beneficiary = Address::from([0xCB; 20]);
     let tx = TxEnv { caller, ..Default::default() };
     let scheduler = Scheduler::new(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
-        BlockEnv { beneficiary: coinbase, ..Default::default() },
+        BlockEnv { beneficiary, ..Default::default() },
         Arc::new(vec![tx]),
-        ParallelState::new(CommitFailDb { coinbase }, true, false),
+        ParallelState::new(CommitFailDb { beneficiary }, true, false),
         None,
     );
     *scheduler.tx_results[0].lock() = Some(TransactionResult {
         read_set: Default::default(),
         write_set: Default::default(),
-        execute_result: Ok(ResultAndState {
-            result: ExecutionResult::Success {
-                reason: SuccessReason::Stop,
-                gas: ResultGas::default().with_total_gas_spent(21_000),
-                logs: Vec::new(),
-                output: Output::Call(Bytes::new()),
-            },
-            state: Default::default(),
-        }),
+        execute_result: Ok(successful_speculative_result()),
     });
     scheduler.scheduler_ctx.publish_finality(1);
 
     let mut state = scheduler.state.lock();
     let (_, commit_state) = state.split_for_parallel();
-    let mut committer =
-        OrderedCommitter::try_new(coinbase, SpecId::SHANGHAI, 0, commit_state, false)
-            .expect("coinbase preload must succeed");
+    let mut committer = OrderedCommitter::new(beneficiary, commit_state, false);
 
     let run = scheduler.run_commit_loop(&mut committer);
     let error = run.error.expect("commit must return DB error");
@@ -337,41 +339,31 @@ fn ordered_commit_database_error_aborts_and_returns_exact_error() {
 
 #[test]
 fn ordered_commit_error_retains_the_successful_prefix() {
-    let coinbase = Address::from([0xCB; 20]);
+    let beneficiary = Address::from([0xCB; 20]);
     let failing_caller = Address::from([0xCC; 20]);
     let txs = Arc::new(vec![
-        TxEnv { caller: coinbase, ..Default::default() },
+        TxEnv { caller: beneficiary, ..Default::default() },
         TxEnv { caller: failing_caller, ..Default::default() },
     ]);
     let scheduler = Scheduler::new(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
-        BlockEnv { beneficiary: coinbase, ..Default::default() },
+        BlockEnv { beneficiary, ..Default::default() },
         txs,
-        ParallelState::new(CommitFailDb { coinbase }, true, false),
+        ParallelState::new(CommitFailDb { beneficiary }, true, false),
         None,
     );
     for tx_result in &scheduler.tx_results {
         *tx_result.lock() = Some(TransactionResult {
             read_set: Default::default(),
             write_set: Default::default(),
-            execute_result: Ok(ResultAndState {
-                result: ExecutionResult::Success {
-                    reason: SuccessReason::Stop,
-                    gas: ResultGas::default().with_total_gas_spent(21_000),
-                    logs: Vec::new(),
-                    output: Output::Call(Bytes::new()),
-                },
-                state: Default::default(),
-            }),
+            execute_result: Ok(successful_speculative_result()),
         });
     }
     scheduler.scheduler_ctx.publish_finality(2);
 
     let mut state = scheduler.state.lock();
     let (_, commit_state) = state.split_for_parallel();
-    let mut committer =
-        OrderedCommitter::try_new(coinbase, SpecId::SHANGHAI, 0, commit_state, false)
-            .expect("coinbase preload");
+    let mut committer = OrderedCommitter::new(beneficiary, commit_state, false);
     let run = scheduler.run_commit_loop(&mut committer);
 
     assert_eq!(run.committed.end(), CommittedPrefixEnd::for_test(1));
@@ -417,7 +409,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv { beneficiary, ..Default::default() },
         Arc::new(vec![TxEnv::default()]),
-        ParallelState::new(CommitFailDb { coinbase: Address::ZERO }, true, false),
+        ParallelState::new(CommitFailDb { beneficiary: Address::ZERO }, true, false),
         None,
         GrevmConfig {
             concurrency_level: 1,
@@ -426,7 +418,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
             delegated_safety: DelegatedSafetyConfig::default(),
         },
     );
-    preload_error.execute().expect_err("coinbase preload must fail");
+    preload_error.execute().expect_err("beneficiary preload must fail");
     let snapshot = preload_error.metrics_snapshot();
     assert_eq!(snapshot["grevm.total_tx_cnt"], 1);
     assert!(snapshot["grevm.total_time"] > 0);

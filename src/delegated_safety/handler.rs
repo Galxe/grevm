@@ -1,4 +1,8 @@
 use super::{ReserveJournalExt, ReservePlanner};
+use crate::{
+    TxId,
+    beneficiary::{BeneficiaryMode, DeferredBeneficiaryReward, SpeculativeResult},
+};
 use metrics::counter;
 use revm::{
     context_interface::journaled_state::account::JournaledAccountTr,
@@ -11,34 +15,36 @@ use revm::{
 use revm_context::{
     BlockEnv, ContextTr, JournalTr, Transaction, TxEnv,
     journaled_state::JournalCheckpoint,
-    result::{ExecutionResult, HaltReason, InvalidTransaction, ResultGas},
+    result::{ExecutionResult, HaltReason, InvalidTransaction, ResultAndState, ResultGas},
 };
 use revm_primitives::Bytes;
 use revm_state::EvmState;
 
-use crate::TxId;
 use core::cell::Cell;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BeneficiaryMode {
-    /// Parallel execution leaves the beneficiary update to the ordered commit path.
-    Deferred,
-    /// Sequential execution applies the beneficiary update before committing the transaction.
-    Immediate,
+/// Handler output plus any non-zero beneficiary reward deferred to ordered commit.
+pub(crate) struct GrevmHandlerOutput {
+    result: ExecutionResult<HaltReason>,
+    deferred_reward: Option<DeferredBeneficiaryReward>,
 }
 
-impl BeneficiaryMode {
-    fn apply<EVM, ERROR>(self, evm: &mut EVM, exec_result: &mut FrameResult) -> Result<(), ERROR>
-    where
-        EVM: EvmTr<Context: ContextTr>,
-        ERROR: EvmTrError<EVM>,
-    {
-        match self {
-            Self::Deferred => Ok(()),
-            Self::Immediate => {
-                post_execution::reward_beneficiary(evm.ctx(), exec_result.gas()).map_err(From::from)
-            }
+impl GrevmHandlerOutput {
+    /// Combine the handler output with finalized EVM state for speculative scheduling.
+    pub(crate) fn into_speculative(self, state: EvmState) -> SpeculativeResult {
+        let result_and_state = ResultAndState { result: self.result, state };
+        match self.deferred_reward {
+            Some(reward) => SpeculativeResult::deferred(result_and_state, reward),
+            None => SpeculativeResult::settled(result_and_state),
         }
+    }
+
+    /// Consume an immediate-mode output after asserting that nothing was deferred.
+    pub(crate) fn into_immediate_result(self) -> ExecutionResult<HaltReason> {
+        assert!(
+            self.deferred_reward.is_none(),
+            "sequential beneficiary rewards must be applied immediately",
+        );
+        self.result
     }
 }
 
@@ -120,10 +126,7 @@ impl<'a> GrevmHandler<'a> {
         Self { reserve_mode, beneficiary_mode }
     }
 
-    pub(crate) fn run<EVM, ERROR, FRAME>(
-        self,
-        evm: &mut EVM,
-    ) -> Result<ExecutionResult<HaltReason>, ERROR>
+    pub(crate) fn run<EVM, ERROR, FRAME>(self, evm: &mut EVM) -> Result<GrevmHandlerOutput, ERROR>
     where
         EVM: EvmTr<
                 Context: ContextTr<
@@ -136,24 +139,40 @@ impl<'a> GrevmHandler<'a> {
         ERROR: EvmTrError<EVM>,
         FRAME: FrameTr<FrameResult = FrameResult, FrameInit = FrameInit>,
     {
-        match self.reserve_mode {
-            ReserveMode::NoReserve => NoReserveHandler::new(self.beneficiary_mode).run(evm),
-            ReserveMode::WithReserve { txid, planner } => {
-                WithReserveHandler::new(txid, planner, self.beneficiary_mode).run(evm)
+        let (result, deferred_reward) = match self.reserve_mode {
+            ReserveMode::NoReserve => {
+                let mut handler = NoReserveHandler::<EVM, ERROR, FRAME>::new(self.beneficiary_mode);
+                let result = Handler::run(&mut handler, evm)?;
+                (result, handler.deferred_reward.get())
             }
-        }
+            ReserveMode::WithReserve { txid, planner } => {
+                let mut handler = WithReserveHandler::<EVM, ERROR, FRAME>::new(
+                    txid,
+                    planner,
+                    self.beneficiary_mode,
+                );
+                let result = Handler::run(&mut handler, evm)?;
+                (result, handler.deferred_reward.get())
+            }
+        };
+        Ok(GrevmHandlerOutput { result, deferred_reward })
     }
 }
 
 /// `ReserveMode::NoReserve` implementation. Deliberately does not override `pre_execution`.
 struct NoReserveHandler<EVM, ERROR, FRAME> {
     beneficiary_mode: BeneficiaryMode,
+    deferred_reward: Cell<Option<DeferredBeneficiaryReward>>,
     _phantom: core::marker::PhantomData<(EVM, ERROR, FRAME)>,
 }
 
 impl<EVM, ERROR, FRAME> NoReserveHandler<EVM, ERROR, FRAME> {
     fn new(beneficiary_mode: BeneficiaryMode) -> Self {
-        Self { beneficiary_mode, _phantom: core::marker::PhantomData }
+        Self {
+            beneficiary_mode,
+            deferred_reward: Cell::new(None),
+            _phantom: core::marker::PhantomData,
+        }
     }
 }
 
@@ -172,7 +191,7 @@ where
         evm: &mut Self::Evm,
         exec_result: &mut FrameResult,
     ) -> Result<(), Self::Error> {
-        self.beneficiary_mode.apply(evm, exec_result)
+        self.beneficiary_mode.apply(evm, exec_result, &self.deferred_reward)
     }
 }
 
@@ -183,6 +202,7 @@ struct WithReserveHandler<'a, EVM, ERROR, FRAME> {
     /// Shared lazy costs for transactions strictly after `txid`.
     planner: &'a ReservePlanner,
     beneficiary_mode: BeneficiaryMode,
+    deferred_reward: Cell<Option<DeferredBeneficiaryReward>>,
     /// Transaction-execution checkpoint created by `pre_execution` and consumed exactly once by
     /// `reward_beneficiary`. `Cell` is needed because revm exposes both hooks through `&self`.
     execution_checkpoint: Cell<Option<JournalCheckpoint>>,
@@ -195,6 +215,7 @@ impl<'a, EVM, ERROR, FRAME> WithReserveHandler<'a, EVM, ERROR, FRAME> {
             txid,
             planner,
             beneficiary_mode,
+            deferred_reward: Cell::new(None),
             execution_checkpoint: Cell::new(None),
             _phantom: core::marker::PhantomData,
         }
@@ -268,7 +289,7 @@ where
         )? {
             result_gas = reserve_result_gas;
         }
-        self.beneficiary_mode.apply::<EVM, ERROR>(evm, exec_result)?;
+        self.beneficiary_mode.apply::<EVM, ERROR>(evm, exec_result, &self.deferred_reward)?;
         Ok(result_gas)
     }
 }

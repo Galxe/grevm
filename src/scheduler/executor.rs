@@ -2,11 +2,11 @@
 
 use crate::{
     TxVersion,
-    cache_db::CacheDB,
+    beneficiary::{BeneficiaryMode, SpeculativeResult},
     delegated_safety::{
-        BeneficiaryMode, DelegatedSafetyConfig, GrevmHandler, ReserveMode, ReservePlanner,
-        gravity_instructions,
+        DelegatedSafetyConfig, GrevmHandler, ReserveMode, ReservePlanner, gravity_instructions,
     },
+    incarnation_db::{IncarnationAccesses, IncarnationDb},
 };
 use alloy_evm::{
     Database as AlloyDatabase,
@@ -19,10 +19,7 @@ use revm::{
     interpreter::interpreter::EthInterpreter,
     precompile::{PrecompileSpecId, Precompiles},
 };
-use revm_context::{
-    BlockEnv, CfgEnv, ContextSetters, ContextTr, TxEnv,
-    result::{EVMError, ExecutionResult, ResultAndState},
-};
+use revm_context::{BlockEnv, CfgEnv, ContextSetters, ContextTr, TxEnv, result::EVMError};
 use revm_inspector::NoOpInspector;
 use revm_primitives::Address;
 use std::{fmt::Debug, sync::Arc};
@@ -38,17 +35,21 @@ pub(crate) type GrevmEvm<DB> = RevmEvm<
 >;
 
 /// The only EVM operations needed by the parallel scheduling state machine.
-pub(crate) trait ParallelTransactionExecutor<'db, DB>
+pub(crate) trait ParallelTransactionExecutor<DB>
 where
     DB: DatabaseRef,
 {
-    fn transact(
+    fn execute_incarnation(
         &mut self,
         version: TxVersion,
         tx: TxEnv,
-    ) -> Result<ResultAndState, EVMError<DB::Error>>;
+    ) -> IncarnationExecution<DB::Error>;
+}
 
-    fn db_mut(&mut self) -> &mut CacheDB<'db, DB>;
+/// EVM outcome and access metadata produced by one complete incarnation lifecycle.
+pub(crate) struct IncarnationExecution<DBError> {
+    pub(crate) result: Result<SpeculativeResult, EVMError<DBError>>,
+    pub(crate) accesses: IncarnationAccesses,
 }
 
 /// One executor for all four delegated-safety configurations.
@@ -59,7 +60,7 @@ pub(crate) struct GrevmExecutor<'a, DB>
 where
     DB: DatabaseRef,
 {
-    evm: GrevmEvm<CacheDB<'a, DB>>,
+    evm: GrevmEvm<IncarnationDb<'a, DB>>,
     /// `Some` enables delegated-balance reserve checks; `None` adds no checkpoint or scan.
     reserve_planner: Option<Arc<ReservePlanner>>,
 }
@@ -70,40 +71,51 @@ where
     DB::Error: Send + Sync + 'static,
 {
     pub(crate) fn new(
-        db: CacheDB<'a, DB>,
+        incarnation_db: IncarnationDb<'a, DB>,
         cfg: CfgEnv,
         block: BlockEnv,
         custom_precompiles: &[(Address, DynPrecompile)],
         safety: DelegatedSafetyConfig,
         reserve_planner: Option<Arc<ReservePlanner>>,
     ) -> Self {
-        let evm = build_evm(db, cfg, block, custom_precompiles, safety.forbid_delegated_create);
+        assert!(
+            incarnation_db.beneficiary_matches(block.beneficiary),
+            "executor and incarnation database must use the same block beneficiary",
+        );
+        let evm = build_evm(
+            incarnation_db,
+            cfg,
+            block,
+            custom_precompiles,
+            safety.forbid_delegated_create,
+        );
         debug_assert_eq!(safety.reserve_delegated_balance, reserve_planner.is_some());
         Self { evm, reserve_planner }
     }
 }
 
-impl<'a, DB> ParallelTransactionExecutor<'a, DB> for GrevmExecutor<'a, DB>
+impl<'a, DB> ParallelTransactionExecutor<DB> for GrevmExecutor<'a, DB>
 where
     DB: DatabaseRef + Debug,
     DB::Error: Send + Sync + 'static,
 {
-    fn transact(
+    fn execute_incarnation(
         &mut self,
         version: TxVersion,
         tx: TxEnv,
-    ) -> Result<ResultAndState, EVMError<DB::Error>> {
-        self.evm.db_mut().reset_state(version.clone());
+    ) -> IncarnationExecution<DB::Error> {
+        let txid = version.txid;
+        self.evm.db_mut().begin_incarnation(version);
         self.evm.ctx.set_tx(tx);
-        let reserve_mode = ReserveMode::from_planner(version.txid, self.reserve_planner.as_deref());
-        let output: Result<ExecutionResult, EVMError<DB::Error>> =
-            GrevmHandler::new(reserve_mode, BeneficiaryMode::Deferred).run(&mut self.evm);
+        let reserve_mode = ReserveMode::from_planner(txid, self.reserve_planner.as_deref());
+        let output = GrevmHandler::new(reserve_mode, BeneficiaryMode::Deferred).run(&mut self.evm);
         let state = self.evm.finalize();
-        output.map(|result| ResultAndState { result, state })
-    }
-
-    fn db_mut(&mut self) -> &mut CacheDB<'a, DB> {
-        self.evm.db_mut()
+        let result = output.map(|output| output.into_speculative(state));
+        let accesses = match &result {
+            Ok(result) => self.evm.db_mut().finish_incarnation(result.state()),
+            Err(_) => self.evm.db_mut().discard_incarnation(),
+        };
+        IncarnationExecution { result, accesses }
     }
 }
 
@@ -132,6 +144,11 @@ where
         evm.instruction = gravity_instructions(spec);
     }
     for (address, precompile) in custom_precompiles {
+        // AUDIT NOTE: this is intentionally a shallow `Arc` clone. Scheduler's public API requires
+        // custom precompiles to be concurrent and retry-safe: discarded speculative calls must not
+        // leave non-journaled, consensus-observable effects. Under that integration invariant,
+        // sharing the implementation between workers is correct; the clone alone is not evidence
+        // of a missing-rollback bug.
         let precompile = precompile.clone();
         evm.precompiles.apply_precompile(address, move |_| Some(precompile));
     }
@@ -141,6 +158,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MVMemory, beneficiary::Beneficiary};
     use revm_database::EmptyDB;
     use revm_primitives::hardfork::SpecId;
 
@@ -165,5 +183,26 @@ mod tests {
                 "gas table mismatch for {spec:?}"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "executor and incarnation database must use the same block beneficiary"
+    )]
+    fn executor_rejects_incarnation_db_for_another_beneficiary() {
+        let backing_db = EmptyDB::default();
+        let memory = MVMemory::default();
+        let beneficiary = Beneficiary::new(Address::with_last_byte(1), None, 1);
+        let incarnation_db = IncarnationDb::new(&backing_db, &memory, &beneficiary);
+        let block = BlockEnv { beneficiary: Address::with_last_byte(2), ..Default::default() };
+
+        let _ = GrevmExecutor::new(
+            incarnation_db,
+            CfgEnv::default(),
+            block,
+            &[],
+            DelegatedSafetyConfig::disabled(),
+            None,
+        );
     }
 }

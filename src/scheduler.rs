@@ -20,12 +20,15 @@ mod wait;
 use crate::{
     AbortReason, GrevmConfig, GrevmError, LocationAndType, MVMemory, ParallelState, ReadVersion,
     Task, TransactionResult, TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
-    cache_db::CacheDB, delegated_safety::ReservePlanner, tx_dependency::TxDependency,
+    beneficiary::Beneficiary,
+    delegated_safety::ReservePlanner,
+    incarnation_db::{IncarnationAccesses, IncarnationDb},
+    tx_dependency::TxDependency,
 };
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use ahash::AHashSet as HashSet;
 use alloy_evm::precompiles::DynPrecompile;
 use context::SchedulerContext;
-use executor::{GrevmExecutor, ParallelTransactionExecutor};
+use executor::{GrevmExecutor, IncarnationExecution, ParallelTransactionExecutor};
 use metrics::ExecuteMetricsCollector;
 use ordered_commit::{CommitOutcome, CommittedPrefixEnd, OrderedCommitOutput, OrderedCommitter};
 use parking_lot::{Mutex, MutexGuard};
@@ -73,6 +76,8 @@ where
 
     mv_memory: MVMemory,
     scheduler_ctx: SchedulerContext,
+    /// Block-scoped precompiles supplied under the retry-safety contract documented on
+    /// [`Scheduler::new`].
     custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>,
     config: GrevmConfig,
     reserve_planner: Option<Arc<ReservePlanner>>,
@@ -129,6 +134,24 @@ where
     DB::Error: Clone + Send + Sync + 'static,
 {
     /// Create a scheduler using the environment-based runtime configuration.
+    ///
+    /// # Custom precompile contract
+    ///
+    /// Every entry in `custom_precompiles` must be safe to invoke concurrently and more than once
+    /// for the same transaction. Speculative executions can be discarded and retried, while
+    /// [`DynPrecompile`] clones share the same underlying implementation. Consequently, a custom
+    /// precompile must not make non-journaled, consensus-observable mutations whose effects survive
+    /// a discarded attempt or affect a later call's output, gas, status, authorization, or
+    /// accounting. Consensus-visible writes must go through the journal, so account lifecycle
+    /// flags and rollback remain visible to Grevm. Reads through the supplied database participate
+    /// in MV-memory. A raw beneficiary-storage read is supported because the beneficiary is
+    /// preloaded at block start; raw storage reads for other accounts must first load that account
+    /// through the journal or database `basic` path. Read-only access to immutable block-scoped
+    /// data is also safe. A precompile must not keep mutable consensus state in its shared
+    /// closure or mutate account/storage state through any out-of-band handle.
+    ///
+    /// This is an integration invariant and is not enforced at runtime. Custom precompiles that do
+    /// not satisfy it must not be supplied to the parallel scheduler.
     pub fn new(
         cfg: CfgEnv,
         env: BlockEnv,
@@ -147,6 +170,8 @@ where
     }
 
     /// Create a scheduler with an explicit, block-scoped Grevm runtime configuration.
+    ///
+    /// `custom_precompiles` is subject to the retry-safety contract documented on [`Self::new`].
     ///
     /// # Panics
     ///
@@ -191,7 +216,7 @@ where
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
             tx_dependency: TxDependency::new(num_txs),
-            mv_memory: MVMemory::new(),
+            mv_memory: MVMemory::default(),
             scheduler_ctx: SchedulerContext::new(num_txs),
             custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
             config,
@@ -397,14 +422,16 @@ where
             // every borrow before sequential recovery can access the state again.
             let mut state = self.state.lock();
             let (state_view, commit_state) = state.split_for_parallel();
-            let mut committer = OrderedCommitter::try_new(
+            let beneficiary_anchor = state_view
+                .basic_ref(self.env.beneficiary)
+                .map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
+            let beneficiary =
+                Beneficiary::new(self.env.beneficiary, beneficiary_anchor, self.block_size);
+            let mut committer = OrderedCommitter::new(
                 self.env.beneficiary,
-                self.cfg.spec,
-                self.env.basefee,
                 commit_state,
                 self.cfg.disable_nonce_check,
-            )
-            .map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
+            );
             thread::scope(|scope| {
                 // If spawning or joining itself panics, cancel children before `scope` waits for
                 // them. Each child has the same guard for panics in its scheduler role.
@@ -422,13 +449,8 @@ where
                 for _ in 0..concurrency_level {
                     workers.push(scope.spawn(|| {
                         let _cancel = self.cancel_on_panic();
-                        let cache_db = CacheDB::new(
-                            self.cfg.spec,
-                            self.env.beneficiary,
-                            &state_view,
-                            &self.mv_memory,
-                            self.scheduler_ctx.commit_cursor(),
-                        );
+                        let incarnation_db =
+                            IncarnationDb::new(&state_view, &self.mv_memory, &beneficiary);
                         let mut cfg = self.cfg.clone();
                         // Disable nonce checks during speculative execution. The commit thread
                         // checks the nonce against committed state; a mismatch leaves the
@@ -436,14 +458,14 @@ where
                         // transaction.
                         cfg.disable_nonce_check = true;
                         let mut executor = GrevmExecutor::new(
-                            cache_db,
+                            incarnation_db,
                             cfg,
                             self.env.clone(),
                             self.custom_precompiles.as_ref(),
                             self.config.delegated_safety,
                             self.reserve_planner.clone(),
                         );
-                        self.run_worker(&mut executor);
+                        self.run_worker(&mut executor, &beneficiary);
                     }));
                 }
 
@@ -483,19 +505,20 @@ where
 
     /// Run execution and validation tasks until the scheduler finishes or aborts.
     ///
-    /// Estimate reads and reads requiring committed-origin state are rescheduled. EVM errors wait
-    /// for committed state when possible, or trigger fallback/abort at the commit head.
-    fn run_worker<'db, WorkerDB>(
+    /// Estimate reads are rescheduled. EVM errors wait for an unresolved predecessor when
+    /// possible, or trigger fallback/abort at the commit head.
+    fn run_worker<WorkerDB>(
         &self,
-        executor: &mut impl ParallelTransactionExecutor<'db, WorkerDB>,
+        executor: &mut impl ParallelTransactionExecutor<WorkerDB>,
+        beneficiary: &Beneficiary,
     ) where
-        WorkerDB: DatabaseRef<Error = DB::Error> + 'db,
+        WorkerDB: DatabaseRef<Error = DB::Error>,
     {
         let mut task = self.next();
         while let Some(current_task) = task {
             task = match current_task {
-                Task::Execution(version) => self.execute_task(executor, version),
-                Task::Validation(version) => self.validate(version),
+                Task::Execution(version) => self.execute_task(executor, beneficiary, version),
+                Task::Validation(version) => self.validate(beneficiary, version),
             };
             if task.is_none() && !self.is_aborted() {
                 task = self.next();
@@ -503,13 +526,14 @@ where
         }
     }
 
-    fn execute_task<'db, WorkerDB>(
+    fn execute_task<WorkerDB>(
         &self,
-        executor: &mut impl ParallelTransactionExecutor<'db, WorkerDB>,
+        executor: &mut impl ParallelTransactionExecutor<WorkerDB>,
+        beneficiary: &Beneficiary,
         tx_version: TxVersion,
     ) -> Option<Task>
     where
-        WorkerDB: DatabaseRef<Error = DB::Error> + 'db,
+        WorkerDB: DatabaseRef<Error = DB::Error>,
     {
         let TxVersion { txid, incarnation } = tx_version.clone();
         let mut tx_state = self.tx_states[txid].lock();
@@ -528,8 +552,8 @@ where
         self.metrics.record_execution_attempt();
 
         let tx_env = self.txs[txid].clone();
-        let commit_idx = self.scheduler_ctx.committed_idx();
-        let result = executor.transact(tx_version, tx_env);
+        let IncarnationExecution { result, accesses } =
+            executor.execute_incarnation(tx_version.clone(), tx_env);
 
         // If this incarnation expands its write set, already validated suffix transactions may
         // have missed a new predecessor and validation must rewind to this transaction. Existing
@@ -538,16 +562,14 @@ where
         let conflict;
         let mut next = None;
         match result {
-            Ok(result_and_state) => {
-                // Reads that must come from the committed state are accurate only when the
-                // committed prefix has reached this transaction.
-                let read_accurate_origin = executor.db_mut().read_accurate_origin();
-
-                let blocking_txs = executor.db_mut().take_estimate_txs();
-                conflict = !read_accurate_origin || !blocking_txs.is_empty();
-                let read_set = executor.db_mut().take_read_set();
-                let write_set =
-                    executor.db_mut().update_mv_memory(&result_and_state.state, conflict);
+            Ok(speculative_result) => {
+                conflict = accesses.is_blocked();
+                let IncarnationAccesses {
+                    read_set,
+                    write_set,
+                    blocking_txs,
+                    blocked_by_beneficiary,
+                } = accesses;
 
                 let mut last_result = self.tx_results[txid].lock();
                 if let Some(last_result) = last_result.as_ref() {
@@ -568,16 +590,26 @@ where
                     write_new_locations = true;
                 }
 
+                let history_published = if conflict {
+                    beneficiary.record_estimate(&tx_version)
+                } else {
+                    beneficiary.record_execution(&tx_version, &speculative_result)
+                };
+                if !history_published {
+                    self.abort(AbortReason::ParallelError {
+                        txid,
+                        message: "stale beneficiary history publication",
+                    });
+                    return None;
+                }
+
                 if conflict {
-                    if !read_accurate_origin {
-                        self.metrics.record_coinbase_conflict();
-                        // A self-barrier keeps this transaction off workers until the committed
-                        // prefix reaches it.
-                        self.tx_dependency.key_tx(txid, self.scheduler_ctx.commit_cursor());
+                    if blocked_by_beneficiary {
+                        self.metrics.record_beneficiary_conflict();
                     } else {
                         self.metrics.record_estimate_conflict();
-                        self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
+                    self.tx_dependency.add(txid, self.latest_unfinalized_blocker(&blocking_txs));
                 } else {
                     // Clearing reverse edges may hand the immediate successor directly to this
                     // worker, avoiding a cursor round trip on a linear dependency chain.
@@ -586,33 +618,53 @@ where
                 *last_result = Some(TransactionResult {
                     read_set,
                     write_set,
-                    execute_result: Ok(result_and_state),
+                    execute_result: Ok(speculative_result),
                 });
             }
             Err(e) => {
+                debug_assert!(accesses.write_set.is_empty());
+                let blocked_on_estimate = accesses.is_blocked();
+                let IncarnationAccesses { blocking_txs, blocked_by_beneficiary, .. } = accesses;
                 let invalid_transaction = matches!(e, EVMError::Transaction(_));
                 conflict = true;
-                self.metrics.record_evm_error_conflict();
                 let mut write_set = HashSet::new();
 
                 let mut last_result = self.tx_results[txid].lock();
                 if let Some(last_result) = last_result.as_mut() {
                     write_set = std::mem::take(&mut last_result.write_set);
-                    self.mark_estimate(txid, &write_set);
+                    self.mark_mv_estimate(txid, &write_set);
+                }
+                if !beneficiary.record_estimate(&tx_version) {
+                    self.abort(AbortReason::ParallelError {
+                        txid,
+                        message: "stale beneficiary estimate publication",
+                    });
+                    return None;
                 }
                 *last_result = Some(TransactionResult {
                     read_set: Default::default(),
                     write_set,
                     execute_result: Err(e),
                 });
-                if commit_idx == txid {
-                    if invalid_transaction {
-                        self.abort(AbortReason::FallbackSequential);
+
+                if blocked_on_estimate {
+                    if blocked_by_beneficiary {
+                        self.metrics.record_beneficiary_conflict();
                     } else {
-                        self.abort(AbortReason::FatalEvmError(txid));
+                        self.metrics.record_estimate_conflict();
                     }
+                    self.tx_dependency.add(txid, self.latest_unfinalized_blocker(&blocking_txs));
+                } else {
+                    self.metrics.record_evm_error_conflict();
+                    if self.scheduler_ctx.committed_idx() == txid {
+                        if invalid_transaction {
+                            self.abort(AbortReason::FallbackSequential);
+                        } else {
+                            self.abort(AbortReason::FatalEvmError(txid));
+                        }
+                    }
+                    self.tx_dependency.key_tx(txid, self.scheduler_ctx.commit_cursor());
                 }
-                self.tx_dependency.key_tx(txid, self.scheduler_ctx.commit_cursor());
             }
         }
 
@@ -638,8 +690,9 @@ where
         None
     }
 
-    fn validate(&self, tx_version: TxVersion) -> Option<Task> {
-        let TxVersion { txid, incarnation } = tx_version;
+    fn validate(&self, beneficiary: &Beneficiary, tx_version: TxVersion) -> Option<Task> {
+        let txid = tx_version.txid;
+        let incarnation = tx_version.incarnation;
         let mut tx_state = self.tx_states[txid].lock();
         let tx_result = self.tx_results[txid].lock();
         if tx_state.status != TransactionStatus::Validating {
@@ -677,6 +730,17 @@ where
         let mut conflict = false;
         let mut dependency: Option<TxId> = None;
         for (location, version) in result.read_set.iter() {
+            if let ReadVersion::Beneficiary(expected) = version {
+                let validation = beneficiary.validate(txid, expected);
+                if !validation.is_valid() {
+                    conflict = true;
+                }
+                if let Some(previous_id) = validation.dependency() {
+                    dependency = Some(dependency.map_or(previous_id, |d| max(d, previous_id)));
+                }
+                continue;
+            }
+
             if let Some(written_transactions) = self.mv_memory.get(location) {
                 if let Some((&previous_id, latest_version)) =
                     written_transactions.range(..txid).next_back()
@@ -703,7 +767,14 @@ where
         if conflict {
             self.metrics.record_version_conflict();
             // Readers must not validate against writes produced by an invalid incarnation.
-            self.mark_estimate(txid, &result.write_set);
+            self.mark_mv_estimate(txid, &result.write_set);
+            if !beneficiary.invalidate(&tx_version) {
+                self.abort(AbortReason::ParallelError {
+                    txid,
+                    message: "stale beneficiary history validation",
+                });
+                return None;
+            }
         }
 
         // update transaction status
@@ -729,7 +800,12 @@ where
         None
     }
 
-    fn mark_estimate(&self, txid: TxId, write_set: &HashSet<LocationAndType>) {
+    fn latest_unfinalized_blocker(&self, blockers: &HashSet<TxId>) -> Option<TxId> {
+        let finality_idx = self.scheduler_ctx.finality_idx();
+        blockers.iter().copied().filter(|&txid| txid >= finality_idx).max()
+    }
+
+    fn mark_mv_estimate(&self, txid: TxId, write_set: &HashSet<LocationAndType>) {
         for location in write_set {
             if let Some(mut written_transactions) = self.mv_memory.get_mut(location) &&
                 let Some(entry) = written_transactions.get_mut(&txid)
@@ -737,29 +813,6 @@ where
                 entry.estimate = true;
             }
         }
-    }
-
-    fn generate_dependent_tx(
-        &self,
-        txid: TxId,
-        read_set: &HashMap<LocationAndType, ReadVersion>,
-    ) -> Option<TxId> {
-        let mut max_dep_id = None;
-        for location in read_set.keys() {
-            if let Some(written_transactions) = self.mv_memory.get(location) &&
-                let Some((&dep_id, _)) = written_transactions.range(..txid).next_back() &&
-                max_dep_id.is_none_or(|current| dep_id > current) &&
-                dep_id >= self.scheduler_ctx.finality_idx()
-            {
-                // Keep only the latest predecessor as a scheduling hint. Read-set validation
-                // detects conflicts omitted from this edge set.
-                max_dep_id = Some(dep_id);
-                if dep_id == txid - 1 {
-                    return max_dep_id;
-                }
-            }
-        }
-        max_dep_id
     }
 
     fn execution_task(&self, execute_id: TxId) -> Option<Task> {

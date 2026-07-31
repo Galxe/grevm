@@ -96,9 +96,9 @@ define_execute_metrics! {
     reset_validation_idx_cnt;
     /// Dependency updates without work.
     useless_dependent_update;
-    /// Reads requiring committed origin state.
+    /// Beneficiary history reads blocked by an unresolved preceding writer.
     ///
-    /// The `conflict_by_miner` metric name is retained for compatibility.
+    /// The `miner` name is retained for metric-schema compatibility.
     conflict_by_miner;
     /// EVM error conflicts.
     conflict_by_error;
@@ -143,15 +143,15 @@ impl ExecuteMetricsCollector {
     }
 
     #[inline]
-    pub(super) fn record_coinbase_conflict(&self) {
-        self.conflict_cnt.fetch_add(1, Ordering::Relaxed);
-        self.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
     pub(super) fn record_estimate_conflict(&self) {
         self.conflict_cnt.fetch_add(1, Ordering::Relaxed);
         self.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn record_beneficiary_conflict(&self) {
+        self.conflict_cnt.fetch_add(1, Ordering::Relaxed);
+        self.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -210,7 +210,8 @@ impl ExecuteMetricsCollector {
 
 #[cfg(feature = "test-utils")]
 impl<DB: revm::DatabaseRef> super::Scheduler<DB> {
-    pub(crate) fn metrics_snapshot(&self) -> BTreeMap<&'static str, usize> {
+    /// Return this scheduler's per-execution metrics without going through a global recorder.
+    pub fn metrics_snapshot(&self) -> BTreeMap<&'static str, usize> {
         self.metrics.snapshot()
     }
 }
@@ -249,8 +250,8 @@ mod tests {
     #[test]
     fn conflict_methods_update_total_and_exactly_one_cause() {
         let collector = ExecuteMetricsCollector::default();
-        collector.record_coinbase_conflict();
         collector.record_estimate_conflict();
+        collector.record_beneficiary_conflict();
         collector.record_evm_error_conflict();
         collector.record_version_conflict();
 

@@ -290,7 +290,7 @@ fn delegated_balance_drain_makes_following_tx_invalid() {
 
 /// Positive control: a single delegation followed by a CALL. Exercises the whole 7702
 /// plumbing end-to-end and must agree with the sequential reference both before and after
-/// the CacheDB code-publication fix.
+/// the incarnation write-publication fix.
 #[test]
 fn single_delegation_then_call() {
     let mut txs: Vec<TxEnv> = (0..BLOCK_SIZE).map(padding_tx).collect();
@@ -301,7 +301,7 @@ fn single_delegation_then_call() {
     run(txs);
 }
 
-/// Regression test for the `new_contract` bug in `update_mv_memory`: within one block A is
+/// Regression test for the code-publication bug in `publish_writes`: within one block A is
 /// delegated to X (tx 10) and then re-delegated to Y (tx 20). A later CALL (tx 30) must
 /// resolve to Y (slot0 == 2). Before the fix, tx 20's new `Code` entry was dropped from
 /// multi-version memory (its read code_hash was already non-empty), so tx 30 resolved the
@@ -443,9 +443,9 @@ fn create_tx(caller_idx: usize, init_code: Vec<u8>) -> TxEnv {
 }
 
 /// The counterpart of [`redelegate_preserves_existing_storage`]: the *other* in-block way an
-/// account's `code_hash` changes is a genuine (re)creation, which **does** clear storage. This is
-/// the scenario the `new_ca` shortcut was originally added for; the fix must keep it working, since
-/// `storage_cleared_in_block` still returns `true` for created accounts (`is_created == true`).
+/// account's `code_hash` changes is a genuine (re)creation, which **does** clear storage. The old
+/// `new_ca` shortcut covered this case; the replacement `StorageReset` model must keep it working
+/// for created accounts (`is_created == true`).
 ///
 /// Under a pre-Cancun spec (Shanghai), `SELFDESTRUCT` fully deletes a pre-existing contract — its
 /// storage included — so a `CREATE` landing on the same address produces a fresh contract whose
@@ -530,8 +530,8 @@ fn create2_factory(init_code: &[u8]) -> Bytecode {
 /// re-delegates the stored EOA `A` (slot0 = 42) to `T` (`is_created == false` — storage must be
 /// preserved); tx 30 self-destructs `V`, forwarding its balance to `A`; tx 40 CALLs `A`, running
 /// `T`, which must read `A`'s preserved slot0 (so slot1 == 42, not 0). `A`'s slot0 read flows
-/// through grevm's `storage_cleared_in_block` gate, so this also fails under the pre-fix `new_ca`
-/// logic.
+/// through Grevm's slot/reset resolver, so this also guards against treating every code update as
+/// a storage reset.
 #[test]
 fn create2_target_redelegate_and_selfdestruct() {
     let factory = Address::from(U160::from(920_000));

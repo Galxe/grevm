@@ -178,7 +178,7 @@ not process-lifetime totals; `execution_time` is omitted on purely sequential pa
 | `grevm.conflict_cnt` | Number of conflict incarnations. |
 | `grevm.reset_validation_idx_cnt` | Number of validation resets. |
 | `grevm.useless_dependent_update` | Number of useless dependency updates. |
-| `grevm.conflict_by_miner` | Committed-origin conflicts caused by beneficiary or uncommitted self-destruct reads (name retained for compatibility). |
+| `grevm.conflict_by_miner` | Beneficiary-history reads blocked by an unresolved predecessor (name retained for compatibility). |
 | `grevm.conflict_by_error` | Conflicts caused by an EVM error. |
 | `grevm.conflict_by_estimate` | Conflicts caused by an estimate (speculative read). |
 | `grevm.conflict_by_version` | Conflicts caused by a version mismatch. |

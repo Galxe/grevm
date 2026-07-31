@@ -180,9 +180,11 @@ where
             .unwrap_or_else(|error| panic!("sequential skip reference failed: {error:?}"));
 
     let state = ParallelState::new(db, true, true);
-    let scheduler =
-        Scheduler::new_with_runtime_config(cfg, env, txs, state, None, revm_compatibility_config());
-    scheduler.parallel_execute(Some(23)).expect("parallel execute failed");
+    let mut runtime_config = revm_compatibility_config();
+    // Do not select the sequential path merely because an invalid fixture is small.
+    runtime_config.min_parallel_txs = 0;
+    let scheduler = Scheduler::new_with_runtime_config(cfg, env, txs, state, None, runtime_config);
+    scheduler.execute().expect("parallel execute failed");
     let (actual_outcomes, mut state) = scheduler.take_result_and_state();
     let actual_bundle = state.parallel_take_bundle(BundleRetention::Reverts);
 
@@ -191,13 +193,16 @@ where
     actual_outcomes
 }
 
-/// Execution-only timings from a successful parallel-vs-sequential comparison.
+/// End-to-end in-memory timings from a successful parallel-vs-sequential comparison.
+///
+/// Both paths include execution, ordered state application, and bundle extraction. Fixture
+/// loading, RPC, result comparison, and metric printing are excluded.
 #[derive(Clone, Copy, Debug)]
 pub struct ReplayTimings {
-    /// Strictly ordered revm execution time.
+    /// Strictly ordered revm execution and bundle extraction time.
     pub sequential: Duration,
-    /// Grevm parallel execution time.
-    pub parallel: Duration,
+    /// Grevm execution and bundle extraction time, including configured fallback when selected.
+    pub grevm: Duration,
 }
 
 /// Same as [`compare_evm_execute_with_spec`] but takes a fully-specified [`CfgEnv`] and
@@ -229,7 +234,7 @@ where
         .unwrap_or_else(|error| panic!("sequential reference execution failed: {error:?}"));
     let sequential = start.elapsed();
 
-    // 2) Grevm parallel. The reference already succeeded, so an error here is a real grevm bug.
+    // 2) Grevm. The reference already succeeded, so an error here is a real grevm bug.
     // The global recorder is only for optional diagnostics. Assertions use the scheduler's own
     // collector below, so concurrent tests cannot drain or contaminate one another's metrics.
     let snapshotter =
@@ -244,12 +249,12 @@ where
         None,
         revm_compatibility_config(),
     );
-    // set determined partitions
-    executor.parallel_execute(Some(23)).expect("parallel execute failed");
-    let parallel = start.elapsed();
-    let observed_metrics = executor.metrics_snapshot();
+    // Keep production worker and fallback configuration effective during replay.
+    executor.execute().expect("parallel execute failed");
+    let observed_metrics = (!parallel_metrics.is_empty()).then(|| executor.metrics_snapshot());
     let (results, mut state) = executor.take_result_and_state();
     let parallel_result = (results, state.parallel_take_bundle(BundleRetention::Reverts));
+    let grevm = start.elapsed();
 
     if let Some(snapshotter) = snapshotter {
         for (key, _, _, value) in snapshotter.snapshot().into_vec() {
@@ -262,11 +267,13 @@ where
             println!("metrics: {name} => value: {value:?}");
         }
     }
-    assert_expected_metrics(&observed_metrics, parallel_metrics);
+    if let Some(observed_metrics) = observed_metrics {
+        assert_expected_metrics(&observed_metrics, parallel_metrics);
+    }
 
     compare_execution_result(&reth_result.0, &parallel_result.0);
     compare_bundle_state(&reth_result.1, &parallel_result.1);
-    ReplayTimings { sequential, parallel }
+    ReplayTimings { sequential, grevm }
 }
 
 /// Simulate the sequential execution of transactions in reth

@@ -9,10 +9,7 @@ license = "MIT OR Apache-2.0"
 autobins = false
 
 [dependencies]
-# Upstream revm v40 (no fork). The miner reward is skipped during parallel execution via a
-# `GrevmHandler` in deferred-beneficiary mode and self-computed at commit time, so the
-# previous `Galxe/revm` fork (which only added a `lazy_reward` cfg flag + `ResultAndState` field)
-# is no longer needed.
+# Upstream revm; beneficiary reward deferral is implemented in Grevm's handler.
 revm = { version = "40.0.3", default-features = false }
 revm-database = { version = "15.0.0", default-features = false }
 revm-state = { version = "12.0.0", default-features = false }
@@ -52,6 +49,8 @@ serde_json = { version = "1.0.94", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 
 [dev-dependencies]
+# Cover fee-disabled execution without enabling it in normal builds.
+revm = { version = "40.0.3", default-features = false, features = ["optional_fee_charge"] }
 # revm-statetest-types = { package = "revm-statetest-types", git = "https://github.com/Galxe/revm", branch = "v29.0.1-gravity", default-features = false }
 # revme = { package = "revme", git = "https://github.com/Galxe/revm", branch = "v29.0.1-gravity", default-features = false }
 criterion = "0.5.1"
@@ -85,6 +84,10 @@ required-features = ["test-utils"]
 
 [[test]]
 name = "native_transfers"
+required-features = ["test-utils"]
+
+[[test]]
+name = "selfdestruct_spec"
 required-features = ["test-utils"]
 
 [[test]]
