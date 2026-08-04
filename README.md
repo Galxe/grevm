@@ -16,8 +16,8 @@ See [Use Grevm with reth](docs/use-with-reth.md) for the public API and integrat
 3. One finality loop publishes only the contiguous prefix whose validations remain newer than every
    relevant validation rewind.
 4. One ordered-commit loop validates each original transaction nonce against committed state when
-   nonce checking is enabled, applies EVM state and the deferred beneficiary reward, records the
-   outcome, and only then publishes the new committed-prefix boundary.
+   nonce checking is enabled, folds any deferred beneficiary reward into the EVM state, commits it
+   once, records the outcome, and only then publishes the new committed-prefix boundary.
 5. A nonce mismatch or recoverable scheduler abort replays only the uncommitted suffix
    sequentially. Invalid transactions become ordered `Skipped` outcomes; fatal errors retain the
    successfully committed prefix.

@@ -10,7 +10,6 @@ use grevm::{
         uniswap::{self, contract::SingleSwap},
     },
 };
-use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::Rng;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
 use revm_primitives::{HashMap, HashSet, TxKind, U256, hardfork::SpecId};
@@ -29,37 +28,31 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let txs = Arc::new(txs);
 
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
-    let mut iter_loop = 0;
-    let report_metrics = rand::rng().random_range(0..10);
+    // `metrics-derive` caches recorder handles, so rotating a recorder per Criterion iteration
+    // cannot observe later runs. Capture one completed scheduler directly instead.
+    let mut selected_metrics = None;
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
-            let recorder = DebuggingRecorder::new();
             let state = ParallelState::new(db.clone(), true, false);
-            metrics::with_local_recorder(&recorder, || {
-                let executor = Scheduler::new(
-                    black_box(cfg.clone()),
-                    black_box(env.clone()),
-                    black_box(txs.clone()),
-                    black_box(state),
-                    None,
-                );
-                executor.parallel_execute(None).unwrap();
-            });
-            if iter_loop == report_metrics {
-                let snapshot = recorder.snapshotter().snapshot();
-                println!("\n>>>> {} metrics: <<<<", name);
-                for (key, _, _, value) in snapshot.into_vec() {
-                    let value = match value {
-                        DebugValue::Counter(v) => v as usize,
-                        DebugValue::Gauge(v) => v.0 as usize,
-                        DebugValue::Histogram(v) => v.last().cloned().map_or(0, |ov| ov.0 as usize),
-                    };
-                    println!("{} => {:?}", key.key().name(), value);
-                }
+            let executor = Scheduler::new(
+                black_box(cfg.clone()),
+                black_box(env.clone()),
+                black_box(txs.clone()),
+                black_box(state),
+                None,
+            );
+            executor.parallel_execute(None).unwrap();
+            if selected_metrics.is_none() {
+                selected_metrics = Some(executor.metrics_snapshot());
             }
-            iter_loop += 1;
         })
     });
+    if let Some(metrics) = selected_metrics {
+        println!("\n>>>> {} metrics: <<<<", name);
+        for (name, value) in metrics {
+            println!("{name} => {value:?}");
+        }
+    }
 
     group.bench_function("Origin Sequential", |b| {
         b.iter(|| {

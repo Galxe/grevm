@@ -628,19 +628,6 @@ pub(crate) struct ParallelStateCommit<'a, DB> {
     transition_state: &'a mut Option<TransitionState>,
 }
 
-impl<DB: DatabaseRef> ParallelStateCommit<'_, DB> {
-    pub(crate) fn increment_balances(
-        &mut self,
-        balances: impl IntoIterator<Item = (Address, u128)>,
-    ) -> Result<(), DB::Error> {
-        let transitions = self.shared.increment_balance_transitions(balances)?;
-        if let Some(state) = self.transition_state.as_mut() {
-            state.add_transitions(transitions);
-        }
-        Ok(())
-    }
-}
-
 impl<DB: DatabaseRef> DatabaseRef for ParallelStateCommit<'_, DB> {
     type Error = DB::Error;
 

@@ -11,6 +11,6 @@ mod instructions;
 mod reserve;
 
 pub use config::DelegatedSafetyConfig;
-pub(crate) use handler::{BeneficiaryMode, GrevmHandler, ReserveMode};
+pub(crate) use handler::{GrevmHandler, ReserveMode};
 pub(crate) use instructions::gravity_instructions;
 pub(crate) use reserve::{ReserveJournalExt, ReservePlanner};

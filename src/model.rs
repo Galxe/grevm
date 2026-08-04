@@ -1,13 +1,17 @@
-use crate::GrevmError;
-use ahash::{AHashMap as HashMap, AHashSet as HashSet};
+use crate::{
+    GrevmError,
+    beneficiary::{BeneficiaryReadVersion, SpeculativeResult},
+};
+use ahash::{AHashMap as HashMap, AHashSet as HashSet, RandomState as AHashRandomState};
 use dashmap::DashMap;
-use revm_context::result::{EVMError, ResultAndState};
+use revm_context::result::EVMError;
 use revm_primitives::{Address, B256, U256};
 use revm_state::{AccountInfo, Bytecode};
 use std::collections::BTreeMap;
 
 pub(crate) type TxId = usize;
-pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
+/// Randomized AHash reduces lookup cost on the scheduler's validation-heavy internal hot path.
+pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>, AHashRandomState>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub(crate) enum TransactionStatus {
@@ -43,6 +47,7 @@ impl TxVersion {
 #[derive(Debug, PartialEq)]
 pub(crate) enum ReadVersion {
     MvMemory(TxVersion),
+    Beneficiary(BeneficiaryReadVersion),
     Storage,
 }
 
@@ -53,13 +58,24 @@ pub(crate) struct AccountBasic {
     pub(crate) code_hash: Option<B256>,
 }
 
+impl From<&AccountInfo> for AccountBasic {
+    fn from(info: &AccountInfo) -> Self {
+        Self {
+            balance: info.balance,
+            nonce: info.nonce,
+            code_hash: (!info.is_empty_code_hash()).then_some(info.code_hash),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum MemoryValue {
-    Basic(AccountInfo),
-    /// Code plus whether the transaction created the account and therefore cleared its storage.
-    Code(Bytecode, bool),
+    /// Absolute account value; `None` means the account does not exist.
+    Basic(Option<AccountInfo>),
+    Code(Bytecode),
     Storage(U256),
-    SelfDestructed,
+    /// Account deletion or creation masks every older storage slot for this address.
+    StorageReset,
 }
 
 #[derive(Debug, Clone)]
@@ -79,13 +95,14 @@ impl MemoryEntry {
 pub(crate) enum LocationAndType {
     Basic(Address),
     Storage(Address, U256),
+    StorageReset(Address),
     Code(Address),
 }
 
 pub(crate) struct TransactionResult<DBError> {
     pub(crate) read_set: HashMap<LocationAndType, ReadVersion>,
     pub(crate) write_set: HashSet<LocationAndType>,
-    pub(crate) execute_result: Result<ResultAndState, EVMError<DBError>>,
+    pub(crate) execute_result: Result<SpeculativeResult, EVMError<DBError>>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,11 +120,6 @@ impl Default for Task {
 pub(crate) enum AbortReason<DBError> {
     FatalEvmError(TxId),
     CommitError(GrevmError<DBError>),
-    ParallelError {
-        txid: TxId,
-        message: &'static str,
-    },
-    #[allow(dead_code)]
-    SelfDestructed,
+    ParallelError { txid: TxId, message: &'static str },
     FallbackSequential,
 }

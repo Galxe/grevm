@@ -7,7 +7,8 @@
 use super::{Scheduler, executor::build_evm, ordered_commit::CommittedPrefixEnd};
 use crate::{
     GrevmError, InvalidTransaction, TxExecutionOutcome, TxId,
-    delegated_safety::{BeneficiaryMode, GrevmHandler, ReserveMode},
+    beneficiary::BeneficiaryMode,
+    delegated_safety::{GrevmHandler, ReserveMode},
 };
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm};
 use revm_context::{
@@ -88,10 +89,14 @@ where
                 reject_nonce_overflow(evm.db_mut(), self.cfg.disable_nonce_check, tx)?;
                 evm.ctx.set_tx(tx.clone());
                 let reserve_mode = ReserveMode::from_planner(txid, self.reserve_planner.as_deref());
-                let output: Result<ExecutionResult, EVMError<DB::Error>> =
+                let output =
                     GrevmHandler::new(reserve_mode, BeneficiaryMode::Immediate).run(&mut evm);
                 let state = evm.finalize();
-                output.inspect(|_| evm.db_mut().commit(state))
+                output.map(|output| {
+                    let result = output.into_immediate_result();
+                    evm.db_mut().commit(state);
+                    result
+                })
             })
         };
         let SequentialReplayOutput { outcomes, error } = replay;

@@ -101,8 +101,8 @@ impl TxDependency {
 
     /// Hold `txid` behind its own ordered-commit boundary.
     ///
-    /// This is used after an EVM error or a read that requires committed origin state. Once the
-    /// committed prefix reaches `txid`, no barrier is installed and the cursor is rewound
+    /// This is used after an EVM error with no unresolved speculative predecessor to wait for.
+    /// Once the committed prefix reaches `txid`, no barrier is installed and the cursor is rewound
     /// immediately; otherwise committing `txid - 1` releases it through [`Self::commit`].
     pub(crate) fn key_tx(&self, txid: TxId, commit_idx: PublishedCursorReader<'_>) {
         let mut state = self.dependent_state[txid].lock();

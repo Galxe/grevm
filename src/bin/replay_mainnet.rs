@@ -365,7 +365,7 @@ fn main() -> Result<(), Error> {
     });
 
     let mut replayed = 0usize;
-    let (mut total_seq, mut total_par) = (Duration::ZERO, Duration::ZERO);
+    let (mut total_seq, mut total_grevm) = (Duration::ZERO, Duration::ZERO);
     for block in rx {
         let (label, ntx, spec) = (block.label.clone(), block.txs.len(), block.spec);
         println!("===== replay block {label} ({ntx} txs, spec {spec:?}) =====");
@@ -383,19 +383,20 @@ fn main() -> Result<(), Error> {
             )
         }));
         match outcome {
-            Ok(execute::ReplayTimings { sequential, parallel }) => {
+            Ok(execute::ReplayTimings { sequential, grevm }) => {
                 replayed += 1;
                 total_seq += sequential;
-                total_par += parallel;
+                total_grevm += grevm;
+                let speedup = sequential.as_secs_f64() / grevm.as_secs_f64();
                 println!(
-                    "  block {label}: OK (execution only: sequential {sequential:?}, \
-                     parallel {parallel:?})"
+                    "  block {label}: OK (in-memory end-to-end: sequential {sequential:?}, \
+                     grevm {grevm:?}, speedup {speedup:.2}x)"
                 );
             }
             Err(_) => {
                 eprintln!(
                     "\nFAILED at block {label}: invalid mainnet replay input, Grevm execution \
-                     error/skipped transaction, or parallel result divergence \
+                     error/skipped transaction, or result divergence \
                      (see the panic above for details)"
                 );
                 std::process::exit(1);
@@ -406,11 +407,11 @@ fn main() -> Result<(), Error> {
     fetcher.join().map_err(|_| "prefetch thread panicked")??;
 
     println!("Done: {replayed} blocks passed");
-    if replayed > 0 && total_par > Duration::ZERO {
-        let speedup = total_seq.as_secs_f64() / total_par.as_secs_f64();
+    if replayed > 0 && total_grevm > Duration::ZERO {
+        let speedup = total_seq.as_secs_f64() / total_grevm.as_secs_f64();
         println!(
-            "Aggregate execution time (no I/O) over {replayed} blocks: sequential {total_seq:?}, \
-             parallel {total_par:?}  →  {speedup:.2}x"
+            "Aggregate in-memory time (no I/O or comparison) over {replayed} blocks: \
+             sequential {total_seq:?}, grevm {total_grevm:?}  →  {speedup:.2}x"
         );
     }
     Ok(())
