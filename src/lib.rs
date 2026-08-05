@@ -30,7 +30,6 @@ mod scheduler;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 mod tx_dependency;
-mod utils;
 
 pub(crate) use model::{
     AbortReason, AccountBasic, LocationAndType, MVMemory, MemoryEntry, MemoryValue, ReadVersion,
@@ -48,4 +47,3 @@ pub use precompile::{
 };
 pub use revm_context::result::InvalidTransaction;
 pub use scheduler::Scheduler;
-pub use utils::fork_join_util;

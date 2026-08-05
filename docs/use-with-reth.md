@@ -123,8 +123,7 @@ Public items re-exported from the crate root include `Scheduler`, `GrevmConfig`,
 `ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and
 `ParallelPrecompileError`.
 `ParallelBundleState` is the lower-level extension for applying transitions directly to revm's
-`BundleState`; `ParallelTakeBundle` finalizes and extracts a block bundle. The crate also
-re-exports `fork_join_util` for integrations that use Grevm's range-partition helper.
+`BundleState`; `ParallelTakeBundle` finalizes and extracts a block bundle.
 
 The canonical `new_with_runtime_config` path uses only the supplied `GrevmConfig`.
 `Scheduler::new` and explicit `GrevmConfig::from_env()` opt into environment variables
