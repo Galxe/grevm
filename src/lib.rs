@@ -25,6 +25,7 @@ mod incarnation_db;
 mod model;
 mod outcome;
 mod parallel_state;
+mod precompile;
 mod scheduler;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
@@ -41,6 +42,10 @@ pub use config::GrevmConfig;
 pub use delegated_safety::DelegatedSafetyConfig;
 pub use outcome::{GrevmError, TxExecutionOutcome};
 pub use parallel_state::{ParallelCacheState, ParallelState};
+pub use precompile::{
+    DynParallelPrecompile, ParallelPrecompile, ParallelPrecompileError, ParallelPrecompileInput,
+    ParallelPrecompileResult, ParallelPrecompileState,
+};
 pub use revm_context::result::InvalidTransaction;
 pub use scheduler::Scheduler;
 pub use utils::fork_join_util;

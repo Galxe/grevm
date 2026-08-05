@@ -87,6 +87,10 @@ name = "native_transfers"
 required-features = ["test-utils"]
 
 [[test]]
+name = "parallel_precompile"
+required-features = ["test-utils"]
+
+[[test]]
 name = "selfdestruct_spec"
 required-features = ["test-utils"]
 

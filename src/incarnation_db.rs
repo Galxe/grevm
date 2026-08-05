@@ -9,9 +9,11 @@ use revm_state::{AccountInfo, Bytecode, EvmState};
 
 /// Reusable revm database adapter for the currently executing transaction incarnation.
 ///
-/// Reads resolve against preceding MV-memory versions, the block beneficiary history, and then
-/// the backing database. The adapter also records the incarnation's validation inputs and
-/// publishes its writes when execution finishes.
+/// Account reads resolve against preceding MV-memory versions or the block beneficiary history;
+/// raw storage reads resolve independently through storage/reset MV-memory versions and then the
+/// backing database. Journal-aware callers can still load an account before requesting its storage.
+/// The adapter also records the incarnation's validation inputs and publishes its writes when
+/// execution finishes.
 #[derive(Debug)]
 pub(crate) struct IncarnationDb<'a, DB>
 where
@@ -363,7 +365,7 @@ mod tests {
     use super::*;
     use crate::ParallelState;
     use revm_database::EmptyDB;
-    use revm_state::Account;
+    use revm_state::{Account, EvmStorageSlot};
 
     fn address(last: u8) -> Address {
         Address::with_last_byte(last)
@@ -374,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn beneficiary_storage_is_independent_from_unresolved_balance_rewards() {
+    fn raw_beneficiary_storage_resolution_does_not_require_reward_history() {
         let beneficiary = address(1);
         let memory = MVMemory::default();
         publish(
@@ -383,8 +385,10 @@ mod tests {
             0,
             MemoryValue::Storage(U256::from(7)),
         );
-        // Beneficiary history for tx 0 deliberately remains unresolved. A storage-only read must
-        // not inspect it.
+        // Beneficiary history for tx 0 deliberately remains unresolved. This directly exercises
+        // the Database::storage fallback: it must still track the slot through MV-memory rather
+        // than accidentally coupling raw storage resolution to balance history. Journal-aware
+        // callers may first load the account and therefore legitimately consult that history.
         let beneficiary_state = Beneficiary::new(beneficiary, None, 2);
         let backing_db = EmptyDB::default();
         let mut db = IncarnationDb::new(&backing_db, &memory, &beneficiary_state);
@@ -394,6 +398,36 @@ mod tests {
         let accesses = db.finish_incarnation(&EvmState::default());
         assert!(!accesses.is_blocked());
         assert!(!accesses.blocked_by_beneficiary);
+    }
+
+    #[test]
+    fn beneficiary_changed_storage_is_published_without_a_basic_mv_write() {
+        let beneficiary = address(1);
+        let info = AccountInfo { nonce: 1, ..Default::default() };
+        let memory = MVMemory::default();
+        let beneficiary_state = Beneficiary::new(beneficiary, Some(info.clone()), 1);
+        let backing_db = EmptyDB::default();
+        let mut db = IncarnationDb::new(&backing_db, &memory, &beneficiary_state);
+        db.begin_incarnation(TxVersion::new(0, 1));
+
+        let mut account = Account::from(info);
+        account.mark_touch();
+        account.storage.insert(
+            U256::ZERO,
+            EvmStorageSlot::new_changed(U256::ZERO, U256::from(7), Default::default()),
+        );
+        let mut changes = EvmState::default();
+        changes.insert(beneficiary, account);
+
+        let accesses = db.finish_incarnation(&changes);
+        let storage = LocationAndType::Storage(beneficiary, U256::ZERO);
+        assert!(accesses.write_set.contains(&storage));
+        assert!(!accesses.write_set.contains(&LocationAndType::Basic(beneficiary)));
+        let writes = memory.get(&storage).expect("beneficiary storage location must be published");
+        assert!(matches!(
+            writes.get(&0).map(|entry| &entry.data),
+            Some(MemoryValue::Storage(value)) if *value == U256::from(7)
+        ));
     }
 
     #[test]

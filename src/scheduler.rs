@@ -26,7 +26,6 @@ use crate::{
     tx_dependency::TxDependency,
 };
 use ahash::AHashSet as HashSet;
-use alloy_evm::precompiles::DynPrecompile;
 use context::SchedulerContext;
 use executor::{GrevmExecutor, IncarnationExecution, ParallelTransactionExecutor};
 use metrics::ExecuteMetricsCollector;
@@ -76,9 +75,9 @@ where
 
     mv_memory: MVMemory,
     scheduler_ctx: SchedulerContext,
-    /// Block-scoped precompiles supplied under the retry-safety contract documented on
-    /// [`Scheduler::new`].
-    custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>,
+    /// Capability-restricted, block-scoped precompiles supplied under the retry-safety contract
+    /// documented on [`Scheduler::new`].
+    custom_precompiles: Arc<Vec<(Address, crate::DynParallelPrecompile)>>,
     config: GrevmConfig,
     reserve_planner: Option<Arc<ReservePlanner>>,
 
@@ -139,16 +138,14 @@ where
     ///
     /// Every entry in `custom_precompiles` must be safe to invoke concurrently and more than once
     /// for the same transaction. Speculative executions can be discarded and retried, while
-    /// [`DynPrecompile`] clones share the same underlying implementation. Consequently, a custom
-    /// precompile must not make non-journaled, consensus-observable mutations whose effects survive
-    /// a discarded attempt or affect a later call's output, gas, status, authorization, or
-    /// accounting. Consensus-visible writes must go through the journal, so account lifecycle
-    /// flags and rollback remain visible to Grevm. Reads through the supplied database participate
-    /// in MV-memory. A raw beneficiary-storage read is supported because the beneficiary is
-    /// preloaded at block start; raw storage reads for other accounts must first load that account
-    /// through the journal or database `basic` path. Read-only access to immutable block-scoped
-    /// data is also safe. A precompile must not keep mutable consensus state in its shared
-    /// closure or mutate account/storage state through any out-of-band handle.
+    /// [`crate::DynParallelPrecompile`] clones share the same underlying implementation.
+    /// Consequently, a custom precompile must not make non-journaled, consensus-observable
+    /// mutations whose effects survive a discarded attempt or affect a later call's output, gas,
+    /// status, authorization, or accounting. The restricted input exposes consensus-visible state
+    /// only through journal-aware operations, so account lifecycle flags, read-your-writes,
+    /// conflict tracking, and rollback remain visible to Grevm. Read-only access to immutable
+    /// block-scoped data is also safe. A precompile must not keep mutable consensus state in its
+    /// shared closure or mutate account/storage state through any out-of-band handle.
     ///
     /// This is an integration invariant and is not enforced at runtime. Custom precompiles that do
     /// not satisfy it must not be supplied to the parallel scheduler.
@@ -157,7 +154,7 @@ where
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
     ) -> Self {
         Self::new_with_runtime_config(
             cfg,
@@ -181,7 +178,7 @@ where
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
         config: GrevmConfig,
     ) -> Self {
         assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
@@ -193,7 +190,7 @@ where
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
         mut config: GrevmConfig,
     ) -> Self {
         let num_txs = txs.len();
