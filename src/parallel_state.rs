@@ -563,13 +563,12 @@ impl<'a, DB: DatabaseRef> ParallelStateView<'a, DB> {
         {
             return Ok(*value.value());
         }
-        // Account is guaranteed to be loaded. Storage for destroyed and newly-created accounts is
-        // known to be zero without consulting the backing database.
-        let is_storage_known = if let Some(account) = self.cache.accounts.get(&address) {
-            account.status.is_storage_known() || account.account.is_none()
-        } else {
-            unreachable!("For accessing any storage account is guaranteed to be loaded beforehand")
-        };
+        // As in revm State::storage_ref, the account is not guaranteed to be cached. In that case,
+        // the backing database remains the source of truth.
+        let is_storage_known =
+            self.cache.accounts.get(&address).is_some_and(|account| {
+                account.status.is_storage_known() || account.account.is_none()
+            });
 
         let value = if is_storage_known {
             U256::ZERO
@@ -891,10 +890,36 @@ impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm_database::{CacheDB, EmptyDB};
 
     #[test]
     fn duration_micros_preserves_sub_microsecond_precision() {
         assert_eq!(duration_micros(Duration::from_nanos(1_500)), 1.5);
         assert_eq!(duration_micros(Duration::from_secs(2)), 2_000_000.0);
+    }
+
+    #[test]
+    fn storage_ref_reads_uncached_existing_account() {
+        let address = Address::with_last_byte(1);
+        let index = U256::from(2);
+        let expected = U256::from(3);
+        let mut database = CacheDB::<EmptyDB>::default();
+        let account = AccountInfo { nonce: 1, ..Default::default() };
+        database.insert_account_info(address, account);
+        database.insert_account_storage(address, index, expected).unwrap();
+        let state = ParallelState::new(database, false, false);
+
+        assert_eq!(state.storage_ref(address, index).unwrap(), expected);
+        assert!(!state.cache.accounts.contains_key(&address));
+        assert_eq!(*state.cache.storage.get(&address).unwrap().get(&index).unwrap(), expected);
+    }
+
+    #[test]
+    fn storage_ref_reads_uncached_nonexistent_account() {
+        let address = Address::with_last_byte(1);
+        let state = ParallelState::new(EmptyDB::default(), false, false);
+
+        assert_eq!(state.storage_ref(address, U256::ZERO).unwrap(), U256::ZERO);
+        assert!(!state.cache.accounts.contains_key(&address));
     }
 }
