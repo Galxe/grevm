@@ -463,3 +463,188 @@ fn parallel_error_replays_suffix_from_committed_prefix() {
     assert_eq!(results.len(), 2);
     assert!(matches!(results[1], TxExecutionOutcome::Executed(_)));
 }
+
+/// A restricted precompile read must stay anchored to its transaction journal even if an earlier
+/// transaction publishes and commits a new MV-memory version between two calls to `sload`.
+/// Validation must then reject the stale incarnation and execute the whole reader again.
+#[cfg(feature = "test-utils")]
+#[test]
+fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
+    use crate::{
+        DynParallelPrecompile, ParallelTakeBundle,
+        test_utils::common::{account, storage::InMemoryDB},
+    };
+    use revm::precompile::{PrecompileId, PrecompileOutput};
+    use revm_database::{PlainAccount, states::bundle_state::BundleRetention};
+    use revm_primitives::{HashMap, KECCAK_EMPTY, alloy_primitives::U160};
+    use std::{
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    const READER_STARTED: usize = 1;
+    const SECOND_READ_ALLOWED: usize = 2;
+    const OLD_VALUE: u64 = 7;
+    const NEW_VALUE: u64 = 42;
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn test_address(index: usize) -> Address {
+        Address::from(U160::from(960_000 + index))
+    }
+
+    fn spin_until(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
+        while !condition() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    fn wait_for_phase(phase: &AtomicUsize, expected: usize, context: &str) {
+        assert!(
+            spin_until(Instant::now() + WAIT_TIMEOUT, || {
+                phase.load(Ordering::Acquire) >= expected
+            }),
+            "timed out waiting for {context}"
+        );
+    }
+
+    let writer_precompile = test_address(0);
+    let reader_precompile = test_address(1);
+    let holder = test_address(2);
+    let input_slot = U256::ZERO;
+    let output_slot = U256::from(1);
+
+    let phase = Arc::new(AtomicUsize::new(0));
+    let reader_calls = Arc::new(AtomicUsize::new(0));
+    let observations = Arc::new(StdMutex::new(Vec::<(U256, U256)>::new()));
+
+    let writer_phase = phase.clone();
+    let writer = DynParallelPrecompile::new(
+        PrecompileId::Custom("grevm-test-coordinated-writer".into()),
+        move |input| {
+            // Keep tx 0 open until tx 1 has anchored its first read to the old database value.
+            wait_for_phase(&writer_phase, READER_STARTED, "the reader's first sload");
+            let reservoir = input.reservoir();
+            input.state().sstore(holder, input_slot, U256::from(NEW_VALUE))?;
+            Ok(PrecompileOutput::new(0, Bytes::new(), reservoir))
+        },
+    );
+
+    let reader_phase = phase.clone();
+    let reader_call_counter = reader_calls.clone();
+    let reader_observations = observations.clone();
+    let reader = DynParallelPrecompile::new(
+        PrecompileId::Custom("grevm-test-coordinated-reader".into()),
+        move |input| {
+            let invocation = reader_call_counter.fetch_add(1, Ordering::AcqRel);
+            let reservoir = input.reservoir();
+            let first = input.state().sload(holder, input_slot)?.data;
+            if invocation == 0 {
+                reader_phase.store(READER_STARTED, Ordering::Release);
+                // The test thread releases this only after Scheduler's committed cursor proves
+                // tx 0 has finished publication and ordered commit.
+                wait_for_phase(&reader_phase, SECOND_READ_ALLOWED, "tx 0 to publish and commit");
+            }
+            let second = input.state().sload(holder, input_slot)?.data;
+            reader_observations.lock().unwrap().push((first, second));
+            input.state().sstore(holder, output_slot, second)?;
+            Ok(PrecompileOutput::new(0, Bytes::new(), reservoir))
+        },
+    );
+
+    let mut accounts = account::mock_block_accounts(2);
+    accounts.insert(
+        holder,
+        PlainAccount {
+            info: AccountInfo {
+                nonce: 1,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            },
+            storage: [(input_slot, U256::from(OLD_VALUE)), (output_slot, U256::from(OLD_VALUE))]
+                .into_iter()
+                .collect(),
+        },
+    );
+    let db = InMemoryDB::new(accounts, HashMap::default(), HashMap::default());
+    let tx = |index, target| TxEnv {
+        caller: account::mock_eoa_address(index),
+        kind: TxKind::Call(target),
+        gas_limit: 200_000,
+        gas_price: 0,
+        nonce: 1,
+        ..Default::default()
+    };
+    let scheduler = Scheduler::new_with_runtime_config(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() },
+        Arc::new(vec![tx(0, writer_precompile), tx(1, reader_precompile)]),
+        ParallelState::new(Arc::new(db), true, true),
+        Some(Arc::new(vec![(writer_precompile, writer), (reader_precompile, reader)])),
+        GrevmConfig {
+            concurrency_level: 2,
+            force_sequential: false,
+            min_parallel_txs: 0,
+            delegated_safety: DelegatedSafetyConfig::disabled(),
+        },
+    );
+
+    let (reader_started, writer_committed, execution) = std::thread::scope(|scope| {
+        let execution = scope.spawn(|| scheduler.execute());
+        let reader_started = spin_until(Instant::now() + WAIT_TIMEOUT, || {
+            phase.load(Ordering::Acquire) >= READER_STARTED
+        });
+        let writer_committed = reader_started &&
+            spin_until(Instant::now() + WAIT_TIMEOUT, || {
+                scheduler.scheduler_ctx.committed_idx() >= 1
+            });
+
+        // Always release both precompile workers before joining, including on timeout, so a failed
+        // assertion cannot strand a scoped thread in the test process.
+        phase.store(SECOND_READ_ALLOWED, Ordering::Release);
+        if !reader_started || !writer_committed {
+            scheduler.cancel();
+        }
+        (reader_started, writer_committed, execution.join())
+    });
+    assert!(reader_started, "tx 1 never reached its first precompile sload");
+    assert!(
+        writer_committed,
+        "tx 0 did not publish and commit while tx 1's first incarnation was open"
+    );
+    execution.expect("scheduler execution thread panicked").expect("parallel execution failed");
+
+    let observations = observations.lock().unwrap().clone();
+    assert!(observations.len() >= 2, "the stale reader incarnation must be retried");
+    assert_eq!(observations[0], (U256::from(OLD_VALUE), U256::from(OLD_VALUE)));
+    assert!(
+        observations.iter().all(|(first, second)| first == second),
+        "one incarnation observed two different versions: {observations:?}"
+    );
+    assert_eq!(
+        observations.last(),
+        Some(&(U256::from(NEW_VALUE), U256::from(NEW_VALUE))),
+        "the replacement incarnation must observe tx 0's committed value"
+    );
+    assert!(reader_calls.load(Ordering::Acquire) >= 2);
+    let metrics = scheduler.metrics_snapshot();
+    assert!(metrics["grevm.conflict_by_version"] >= 1);
+
+    let (outcomes, mut state) = scheduler.take_result_and_state();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|outcome| matches!(
+        outcome,
+        TxExecutionOutcome::Executed(ExecutionResult::Success { .. })
+    )));
+    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let holder = bundle.state.get(&holder).expect("state holder must be updated");
+    assert_eq!(holder.storage_slot(input_slot), Some(U256::from(NEW_VALUE)));
+    assert_eq!(holder.storage_slot(output_slot), Some(U256::from(NEW_VALUE)));
+}

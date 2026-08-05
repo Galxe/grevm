@@ -1,17 +1,14 @@
 //! EVM construction and transaction driving for the scheduler.
 
 use crate::{
-    TxVersion,
+    DynParallelPrecompile, TxVersion,
     beneficiary::{BeneficiaryMode, SpeculativeResult},
     delegated_safety::{
         DelegatedSafetyConfig, GrevmHandler, ReserveMode, ReservePlanner, gravity_instructions,
     },
     incarnation_db::{IncarnationAccesses, IncarnationDb},
 };
-use alloy_evm::{
-    Database as AlloyDatabase,
-    precompiles::{DynPrecompile, PrecompilesMap},
-};
+use alloy_evm::{Database as AlloyDatabase, precompiles::PrecompilesMap};
 use revm::{
     Context, DatabaseRef, ExecuteEvm, MainBuilder, MainContext,
     context::Evm as RevmEvm,
@@ -74,7 +71,7 @@ where
         incarnation_db: IncarnationDb<'a, DB>,
         cfg: CfgEnv,
         block: BlockEnv,
-        custom_precompiles: &[(Address, DynPrecompile)],
+        custom_precompiles: &[(Address, DynParallelPrecompile)],
         safety: DelegatedSafetyConfig,
         reserve_planner: Option<Arc<ReservePlanner>>,
     ) -> Self {
@@ -123,7 +120,7 @@ pub(crate) fn build_evm<DB>(
     db: DB,
     cfg: CfgEnv,
     block: BlockEnv,
-    custom_precompiles: &[(Address, DynPrecompile)],
+    custom_precompiles: &[(Address, DynParallelPrecompile)],
     forbid_delegated_create: bool,
 ) -> GrevmEvm<DB>
 where
@@ -144,12 +141,7 @@ where
         evm.instruction = gravity_instructions(spec);
     }
     for (address, precompile) in custom_precompiles {
-        // AUDIT NOTE: this is intentionally a shallow `Arc` clone. Scheduler's public API requires
-        // custom precompiles to be concurrent and retry-safe: discarded speculative calls must not
-        // leave non-journaled, consensus-observable effects. Under that integration invariant,
-        // sharing the implementation between workers is correct; the clone alone is not evidence
-        // of a missing-rollback bug.
-        let precompile = precompile.clone();
+        let precompile = precompile.to_alloy();
         evm.precompiles.apply_precompile(address, move |_| Some(precompile));
     }
     evm

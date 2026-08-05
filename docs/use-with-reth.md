@@ -72,9 +72,9 @@ Key signatures:
 ```rust
 use std::sync::Arc;
 
-use alloy_evm::precompiles::DynPrecompile;
 use grevm::{
-    GrevmConfig, GrevmError, ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome,
+    DynParallelPrecompile, GrevmConfig, GrevmError, ParallelState, ParallelTakeBundle, Scheduler,
+    TxExecutionOutcome,
 };
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
@@ -91,7 +91,7 @@ where
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
     ) -> Self;
 
     pub fn new_with_runtime_config(
@@ -99,7 +99,7 @@ where
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
         config: GrevmConfig,
     ) -> Self;
 
@@ -119,7 +119,9 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
 
 Public items re-exported from the crate root include `Scheduler`, `GrevmConfig`,
 `DelegatedSafetyConfig`, `ParallelState`, `ParallelCacheState`, `TxExecutionOutcome`,
-`InvalidTransaction`, and `GrevmError`.
+`InvalidTransaction`, `GrevmError`, `ParallelPrecompile`, `DynParallelPrecompile`,
+`ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and
+`ParallelPrecompileError`.
 `ParallelBundleState` is the lower-level extension for applying transitions directly to revm's
 `BundleState`; `ParallelTakeBundle` finalizes and extracts a block bundle. The crate also
 re-exports `fork_join_util` for integrations that use Grevm's range-partition helper.

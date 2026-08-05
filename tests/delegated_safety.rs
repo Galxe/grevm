@@ -2,10 +2,9 @@
 
 //! End-to-end tests for grevm's opt-in EIP-7702 delegated-account safety policy.
 
-use alloy_evm::precompiles::DynPrecompile;
 use grevm::{
-    DelegatedSafetyConfig, GrevmConfig, InvalidTransaction, ParallelState, ParallelTakeBundle,
-    Scheduler, TxExecutionOutcome,
+    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction, ParallelState,
+    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -263,7 +262,7 @@ fn execute_block_with_precompiles(
     safety: DelegatedSafetyConfig,
     force_sequential: bool,
     concurrency_level: usize,
-    custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+    custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
 ) -> (Vec<TxExecutionOutcome>, revm_database::BundleState) {
     let txs = Arc::new(txs);
     let block = BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() };
@@ -352,9 +351,9 @@ fn retry_probe_precompiles(
     blocker: Address,
     probe: Address,
     coordinate_parallel_attempt: bool,
-) -> Arc<Vec<(Address, DynPrecompile)>> {
+) -> Arc<Vec<(Address, DynParallelPrecompile)>> {
     let blocker_executions = executions.clone();
-    let blocker_precompile = DynPrecompile::new_stateful(
+    let blocker_precompile = DynParallelPrecompile::new(
         PrecompileId::Custom("grevm-test-retry-blocker".into()),
         move |input| {
             if coordinate_parallel_attempt {
@@ -365,14 +364,14 @@ fn retry_probe_precompiles(
                 // for tx 1 to publish its stale speculative result before tx 0 publishes its write.
                 thread::sleep(Duration::from_millis(50));
             }
-            Ok(PrecompileOutput::new(0, Bytes::new(), input.reservoir))
+            Ok(PrecompileOutput::new(0, Bytes::new(), input.reservoir()))
         },
     );
-    let probe_precompile = DynPrecompile::new_stateful(
+    let probe_precompile = DynParallelPrecompile::new(
         PrecompileId::Custom("grevm-test-retry-probe".into()),
         move |input| {
             executions.fetch_add(1, Ordering::AcqRel);
-            Ok(PrecompileOutput::new(0, Bytes::new(), input.reservoir))
+            Ok(PrecompileOutput::new(0, Bytes::new(), input.reservoir()))
         },
     );
     Arc::new(vec![(blocker, blocker_precompile), (probe, probe_precompile)])
