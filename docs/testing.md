@@ -223,14 +223,18 @@ cargo bench --features test-utils --bench continuous
 
 The fixtures live in a separate repository,
 [`grevm-test-data`](https://github.com/Galxe/grevm-test-data), wired in as a **git submodule** at
-`test_data/`. Fetch it with standard git:
+`test_data/`. It is marked with `update = none` in `.gitmodules` so Cargo does not download the
+large test-only repository when Grevm is used as a Git dependency. Grevm developers and CI jobs
+that run the fixture-backed suites must opt in explicitly:
 
 ```bash
-# Fresh clone, including submodules:
-git clone --recurse-submodules <grevm-url>
+# Fresh clone:
+git clone <grevm-url>
+cd grevm
 
-# Or, in an existing checkout:
-git submodule update --init test_data
+# Fetch the fixtures at the commit pinned by Grevm. This one-command override does not persist.
+git -c submodule.test_data.update=checkout \
+  submodule update --init test_data
 ```
 
 When the submodule is not checked out, the mainnet replay test and the `continuous` benchmark skip

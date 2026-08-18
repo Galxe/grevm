@@ -1,3 +1,6 @@
 [submodule "test_data"]
 	path = test_data
 	url = https://github.com/Galxe/grevm-test-data
+	# Cargo recursively fetches submodules of Git dependencies by default. The fixtures are only
+	# needed by Grevm's tests and benchmarks, so downstream library builds must skip them.
+	update = none

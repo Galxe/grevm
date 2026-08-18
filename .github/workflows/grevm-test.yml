@@ -12,11 +12,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # check out (with the `test_data` submodule, which the mainnet replay test reads)
+      # Check out the library without recursively fetching test-only submodules. Cargo consumers
+      # follow the same path and must not download the large fixture repository.
       - name: Checkout repository
         uses: actions/checkout@v3
-        with:
-          submodules: recursive
+
+      # `.gitmodules` marks the fixtures with `update = none` so Cargo skips them when Grevm is a
+      # Git dependency. This test job opts in explicitly because the replay suites need them.
+      - name: Checkout test fixtures
+        run: >-
+          git -c submodule.test_data.update=checkout
+          submodule update --init test_data
 
       # install rust tools
       - name: Set up Rust
